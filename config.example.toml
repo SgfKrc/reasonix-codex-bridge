@@ -1,0 +1,11 @@
+# Copy this block into the Codex config used by the target device.
+[mcp_servers.reasonix_local]
+command = "node"
+args = ["C:\\path\\to\\reasonix-codex-bridge\\src\\server.mjs"]
+startup_timeout_sec = 30
+
+[mcp_servers.reasonix_local.env]
+REASONIX_EXE = "C:\\path\\to\\reasonix-cli.exe"
+REASONIX_ROOT = "C:\\path\\to\\workspace"
+REASONIX_SUBAGENT = "deepseek-worker"
+REASONIX_MODEL_REF = "your-inventory-name/deepseek-flash"
