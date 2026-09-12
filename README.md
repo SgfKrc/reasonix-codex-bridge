@@ -88,11 +88,16 @@ Create the named profile once in the global Reasonix profile directory. The brid
 
 ```powershell
 reasonix subagent create deepseek-worker --scope global --model "<ref shown by: node src/configure.mjs list>" --prompt-file .\prompts\deepseek-worker-prompt.md
-reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index"
+reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index,git_log,git_diff"
 # `node src/configure.mjs profile --sync --write` can enforce read-only: true and re-check the profile.
 ```
 
 `configure profile` resolves the profile at `%APPDATA%/reasonix/skills/<name>/SKILL.md` on Windows (or `~/.config/reasonix/skills/<name>/SKILL.md` on POSIX). It compares the frontmatter `model` with the bridge model reference and requires `read-only: true`. The command is preview-only unless `--write` is explicit; after a write it re-reads the file and adds the read-only guard if the Reasonix CLI did not emit it. Set `REASONIX_SKILLS_DIR` to a temporary skills root for offline tests or isolated setup.
+
+The canonical read-only profile tool set is `read_file, grep, glob, ls, code_index, git_log, git_diff`.
+`git_log` and `git_diff` are inspection-only viewers; no write, commit, checkout, reset, network, or
+shell tool is allowed. `configure verify` prints the installed `allowed-tools` list and fails when
+it differs from this documented set.
 
 ## Environment variables
 

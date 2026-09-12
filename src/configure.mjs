@@ -28,6 +28,7 @@ import {
   readSubagentProfile,
   readBridgeConfig,
   readDoctor,
+  READ_ONLY_PROFILE_TOOLS,
   readPresets,
   resolveCliPath,
   resolveModelRef,
@@ -398,11 +399,11 @@ function profileCommand(args) {
   if (profile.error && !profile.exists && profile.path === '') fail(profile.error);
   const modelRef = context.resolution.ref;
   const promptFile = path.join(BRIDGE_ROOT, 'prompts', `${name}-prompt.md`);
-  const defaultTools = ['read_file', 'grep', 'glob', 'ls', 'code_index'];
+  const defaultTools = READ_ONLY_PROFILE_TOOLS;
   if (sync && profile.frontmatter?.exists && profile.frontmatter.toolsKnown === false) {
     fail(`cannot sync profile with an unparseable allowed-tools field at ${profile.path}; repair it manually first`);
   }
-  const tools = profile.frontmatter?.exists && profile.frontmatter.toolsKnown ? profile.frontmatter.tools : defaultTools;
+  const tools = defaultTools;
   const description = profile.frontmatter?.fields?.description || 'Read-only reconnaissance and failure analysis subagent.';
   const commandArgs = create
     ? ['subagent', 'create', name, '--description', description, '--scope', 'global', '--model', modelRef || '<provider>/<model>', '--prompt-file', promptFile, '--tools', tools.join(',')]
@@ -412,6 +413,7 @@ function profileCommand(args) {
   process.stdout.write(`profile name : ${name}\nprofile path : ${profile.path}\nmodel ref    : ${modelRef || '(unresolved)'}\n`);
   if (profile.exists && profile.frontmatter?.exists) {
     process.stdout.write(`profile model: ${profile.frontmatter.model || '(missing)'}\nread-only    : ${profile.frontmatter.readOnly === true ? 'true' : profile.frontmatter.readOnly === false ? 'false' : 'missing'}\n`);
+    process.stdout.write(`tools       : ${profile.frontmatter.toolsKnown ? profile.frontmatter.tools.join(',') : '(unknown)'}\n`);
   }
   if (!create && !sync) {
     process.stdout.write(`${issues.length ? `DRIFT       : ${issues.join('; ')}\n` : 'consistency  : OK\n'}`);
@@ -498,7 +500,7 @@ function verifyCommand(args = []) {
     results.push(!present ? ['fail', `subagent profile: ${name} missing - create it with: reasonix subagent create ${name} --scope global --model "${context.resolution.ref || '<ref>'}" --prompt-file prompts/${name}-prompt.md`]
       : !profile.exists ? ['fail', `subagent profile: ${name} is listed but SKILL.md is missing at ${profile.path || REASONIX_SKILLS_PATH}`]
         : issues.length ? ['fail', `subagent profile drift: ${issues.join('; ')} (${profile.path})`]
-          : ['ok', `subagent profile: ${name} is installed and consistent (model + read-only)`]);
+          : ['ok', `subagent profile: ${name} is installed and consistent (model + read-only + tools: ${profile.frontmatter.tools.join(',')})`]);
   }
 
   for (const [state, message] of results) process.stdout.write(`${state === 'ok' ? 'OK  ' : state === 'warn' ? 'WARN' : 'FAIL'} ${message}\n`);

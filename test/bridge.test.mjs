@@ -15,6 +15,7 @@ import {
   doctorRefs,
   parseProfileFrontmatter,
   parseVersion,
+  READ_ONLY_PROFILE_TOOLS,
   readDoctor,
   resolveModelRef,
   upsertReasonixBlock,
@@ -66,7 +67,7 @@ const args = process.argv.slice(2);
 if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) {
   const modelIndex = args.indexOf('--model');
   const model = modelIndex >= 0 ? args[modelIndex + 1] : (process.env.PROFILE_MODEL || 'fixture/provider');
-  const lines = ['---', 'name: deepseek-worker', 'description: Fixture worker', 'model: ' + model, 'allowed-tools: [read_file, grep, glob, ls, code_index]'];
+  const lines = ['---', 'name: deepseek-worker', 'description: Fixture worker', 'model: ' + model, 'allowed-tools: [read_file, grep, glob, ls, code_index, git_log, git_diff]'];
   if (process.env.PROFILE_READ_ONLY !== '0') lines.push('read-only: true');
   lines.push('---', '', '# fixture');
   fs.writeFileSync(process.env.PROFILE_TARGET, lines.join('\\n'));
@@ -79,7 +80,7 @@ if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) 
 function writeProfile(root, model = 'fixture/provider', readOnly = true) {
   const dir = path.join(root, 'skills', 'deepseek-worker');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, 'allowed-tools: [read_file, grep, glob, ls, code_index]', `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
+  writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, 'allowed-tools: [read_file, grep, glob, ls, code_index, git_log, git_diff]', `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
   return path.join(dir, 'SKILL.md');
 }
 
@@ -255,6 +256,7 @@ describe('configuration pure functions', () => {
     assert.deepEqual(profile.tools, ['read_file', 'grep']);
     assert.equal(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').fields.description, 'workers #1');
     assert.deepEqual(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').tools, ['read_file', 'grep']);
+    assert.deepEqual(READ_ONLY_PROFILE_TOOLS, ['read_file', 'grep', 'glob', 'ls', 'code_index', 'git_log', 'git_diff']);
   });
 
   test('upserts bridge blocks at append, first and last boundaries', () => {
@@ -420,6 +422,17 @@ describe('offline command contracts', () => {
     const after = runNode([CONFIGURE_PATH, 'verify'], root, profileEnv);
     assert.equal(after.status, 0, after.stderr);
     assert.match(after.stdout, /installed and consistent/);
+    assert.match(after.stdout, /tools: read_file,grep,glob,ls,code_index,git_log,git_diff/);
+  });
+
+  test('verify fails when the profile tool set drifts from the read-only contract', () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const profileFile = writeProfile(root);
+    writeFileSync(profileFile, readFileSync(profileFile, 'utf8').replace(', git_log, git_diff', ''), 'utf8');
+    const result = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /subagent profile drift: allowed-tools=.*expected .*git_diff,git_log/);
   });
 
   test('profile --create --write adds the read-only guard after CLI creation', () => {
