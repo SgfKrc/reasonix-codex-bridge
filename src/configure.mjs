@@ -19,6 +19,7 @@ import {
   buildCodexBlock,
   atomicWriteFile,
   checkCliVersion,
+  cliSpawnCommand,
   cliSpawnOptions,
   doctorRefs,
   isFile,
@@ -461,14 +462,16 @@ function profileCommand(args) {
     return;
   }
   if (!context.cliPath) fail(`cannot execute profile command: ${context.cliError}`);
-  const result = spawnSync(context.cliPath, commandArgs, cliSpawnOptions(context.cliPath, {
+  const invocation = cliSpawnCommand(context.cliPath, commandArgs, {
     cwd: context.root,
     env: process.env,
     encoding: 'utf8',
     timeout: 30_000,
     windowsHide: true,
     maxBuffer: 8 * 1024 * 1024,
-  }));
+  });
+  if (invocation.error) fail(invocation.error);
+  const result = spawnSync(invocation.file, invocation.args, invocation.options);
   if (result.error) fail(`profile command failed to start: ${result.error.message}`);
   if (result.status !== 0) fail(`profile command failed with code ${result.status}\n${String(result.stderr ?? '').trim()}`);
   let updated = readSubagentProfile(name);
@@ -526,7 +529,10 @@ function verifyCommand(args = []) {
   }
 
   if (context.cliPath) {
-    const listed = spawnSync(context.cliPath, ['subagent', 'list'], cliSpawnOptions(context.cliPath, { encoding: 'utf8', timeout: 30_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }));
+    const invocation = cliSpawnCommand(context.cliPath, ['subagent', 'list'], { encoding: 'utf8', timeout: 30_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+    const listed = invocation.error
+      ? { status: 1, stdout: '', stderr: invocation.error }
+      : spawnSync(invocation.file, invocation.args, invocation.options);
     const text = `${listed.stdout ?? ''}\n${listed.stderr ?? ''}`;
     const name = target.name;
     const present = listed.status === 0 && text.split('\n').some((line) => line.trim().split(/\s+/)[0] === name);

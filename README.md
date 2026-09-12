@@ -174,11 +174,16 @@ Before a write call the bridge requires a verifiable Git workspace and no existi
 After the worker exits it compares Git status with the pre-call snapshot. Any path outside
 the whitelist, or any failed worker, causes the changes from that call to be rolled back. A successful write returns
 only a `qlh.reasonix.changes.v1` change set with repository-relative paths, add/delete counts,
-`git diff --stat`, SHA-256 hashes, and a one-shot `rollback_id`; worker stdout and file contents are
+`git diff --stat`, SHA-256 hashes, `hash_status` (`readable`, `missing`, or `unreadable`), and a one-shot `rollback_id`; worker stdout and file contents are
 never returned. Call `reasonix_rollback` explicitly with that id to restore the call's changes.
-Rollback refuses to overwrite a file that changed after the implement call, and rollback records
-live only in the current bridge process. The dedicated write profile is separate from the default
-read profile; profile creation and bridge write authorization remain independent gates.
+Rollback is serialized with implement calls, rechecks the target Git/hash state after restore, and
+refuses changed, missing, or unreadable targets. Rollback records live only in the current bridge
+process. The dedicated write profile is separate from the default read profile; profile creation and
+bridge write authorization remain independent gates.
+
+When `REASONIX_EXE` points to a Windows `.cmd` or `.bat` shim, the bridge invokes `cmd.exe` explicitly
+with `shell:false`. Arguments containing cmd metacharacters are rejected before process creation;
+this keeps task text out of shell interpretation while preserving normal shim startup.
 
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
