@@ -82,7 +82,11 @@ The offline regression suite has no model or network dependency:
 ```bash
 npm test       # node --test: config, configure, MCP session and version stubs
 npm run check  # syntax checks for all bridge modules
+npm run check:links # local README links only; no network access
 ```
+
+The repository CI repeats these three offline checks on Node 20; see the [CI workflow](.github/workflows/ci.yml).
+The link check resolves only relative paths in this repository and skips external URLs, anchors, and mail links.
 
 Create the named profile once in the global Reasonix profile directory. The bridge passes the target workspace with `--dir`, so a project-only profile will not be found when the bridge is copied to another repository:
 
