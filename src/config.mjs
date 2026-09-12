@@ -259,7 +259,7 @@ export function readDoctor(cliPath, timeoutMs = 30_000, options = {}) {
   if (result.status !== 0) return { ok: false, error: `reasonix doctor exited with code ${result.status}`, data: null, cache: 'live' };
   try {
     const data = JSON.parse(result.stdout);
-    writeDoctorCache(cliPath, cachePath, data);
+    if (options.writeCache !== false) writeDoctorCache(cliPath, cachePath, data);
     return { ok: true, error: '', data, cache: options.refresh ? 'refreshed' : 'miss', cachePath, fetchedAt: Date.now() };
   } catch (error) {
     return { ok: false, error: `cannot parse reasonix doctor output: ${error.message}`, data: null, cache: 'live' };
@@ -285,6 +285,7 @@ export function doctorRefs(doctor) {
         keyPresent: provider.key_present === true,
         baseHost: typeof provider.base_url_host === 'string' ? provider.base_url_host : '',
         contextWindow: typeof provider.context_window === 'number' ? provider.context_window : null,
+        vision: typeof provider.vision === 'boolean' ? provider.vision : null,
         isReasonixDefault: ref === defaultRef,
       });
     }
