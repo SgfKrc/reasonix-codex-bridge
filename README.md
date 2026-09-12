@@ -17,6 +17,9 @@ Every machine may use a different provider, so no model reference is hard-coded.
 node src/configure.mjs list      # every <provider>/<model> ref this machine reports (key present, Reasonix default, current)
 node src/configure.mjs use <ref> # write it to bridge.config.json (a preset name works too)
 node src/configure.mjs show      # effective configuration and where each value comes from
+node src/configure.mjs profile   # inspect the selected profile and report drift
+node src/configure.mjs profile --sync        # print the exact edit command (no write)
+node src/configure.mjs profile --sync --write # execute edit, enforce read-only, then re-check
 node src/configure.mjs verify    # check CLI + model ref + subagent profile
 ```
 
@@ -67,8 +70,10 @@ Create the named profile once in the global Reasonix profile directory. The brid
 ```powershell
 reasonix subagent create deepseek-worker --scope global --model "<ref shown by: node src/configure.mjs list>" --prompt-file .\prompts\deepseek-worker-prompt.md
 reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index"
-# Add read-only: true to the profile frontmatter after the CLI edit; `node src/configure.mjs verify` confirms it.
+# `node src/configure.mjs profile --sync --write` can enforce read-only: true and re-check the profile.
 ```
+
+`configure profile` resolves the profile at `%APPDATA%/reasonix/skills/<name>/SKILL.md` on Windows (or `~/.config/reasonix/skills/<name>/SKILL.md` on POSIX). It compares the frontmatter `model` with the bridge model reference and requires `read-only: true`. The command is preview-only unless `--write` is explicit; after a write it re-reads the file and adds the read-only guard if the Reasonix CLI did not emit it. Set `REASONIX_SKILLS_DIR` to a temporary skills root for offline tests or isolated setup.
 
 ## Environment variables
 
