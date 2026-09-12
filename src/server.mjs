@@ -1,6 +1,6 @@
 /** Local stdio MCP facade for the read-only Reasonix worker. */
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, realpathSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import {
@@ -14,6 +14,7 @@ import {
   resolveCliPath,
   resolveModelRef,
   resolveSubagent,
+  resolveWritePolicy,
   resolveWorkspaceRoot,
   validateModelRef,
 } from './config.mjs';
@@ -31,7 +32,7 @@ const TASK_CHAR_CAP = 8000;
 const HARD_OUTPUT_CHAR_CAP = 24000;
 const HARD_QUEUE_CAP = 5;
 const HISTORY_HARD_CAP_BYTES = 128 * 1024 * 1024;
-const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSteps: 16, timeoutSeconds: 240 }, plan: { maxSteps: 16, timeoutSeconds: 240 } };
+const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSteps: 16, timeoutSeconds: 240 }, plan: { maxSteps: 16, timeoutSeconds: 240 }, implement: { maxSteps: 16, timeoutSeconds: 240 } };
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
@@ -111,6 +112,7 @@ if (MODEL_REF_PROBLEM) {
 const SUBAGENT_NAME = SUBAGENT.name;
 const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
 const MODEL_CAPABILITIES = resolveModelCapabilities();
+const WRITE_POLICY = resolveWritePolicy(bridgeConfig);
 
 function resolveModelCapabilities() {
   const doctor = MODEL_RESOLUTION.doctor?.ok
@@ -144,6 +146,63 @@ function resolveCwd(raw) {
   if (!statSync(real).isDirectory()) throw new Error(`cwd is not a directory: ${real}`);
   if (!roots.some((root) => isInside(root, real))) throw new Error(`cwd outside allowed workspace: ${real}`);
   return real;
+}
+
+function gitStatus(root) {
+  const result = spawn('git', ['-C', root, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], cliSpawnOptions('git', { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }));
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    result.stdout.setEncoding('utf8');
+    result.stderr.setEncoding('utf8');
+    result.stdout.on('data', (chunk) => { stdout += chunk; });
+    result.stderr.on('data', (chunk) => { stderr += chunk; });
+    result.once('error', (error) => resolve({ ok: false, entries: [], error: `cannot run git status: ${error.message}` }));
+    result.once('close', (code) => {
+      if (code !== 0) return resolve({ ok: false, entries: [], error: `git status exited with code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}` });
+      const entries = [];
+      const fields = stdout.split('\0').filter(Boolean);
+      for (let index = 0; index < fields.length; index += 1) {
+        const field = fields[index];
+        if (field.length < 4) continue;
+        const status = field.slice(0, 2);
+        const firstPath = field.slice(3).replaceAll('\\', '/');
+        entries.push({ status, path: firstPath });
+        if (status.includes('R') || status.includes('C')) {
+          const oldPath = fields[index + 1];
+          if (oldPath) entries.push({ status: 'D', path: oldPath.replaceAll('\\', '/') });
+          index += 1;
+        }
+      }
+      resolve({ ok: true, entries, error: '' });
+    });
+  });
+}
+function changedEntries(before, after) {
+  const beforeMap = new Map(before.map((entry) => [entry.path, entry.status]));
+  return after.filter((entry) => beforeMap.get(entry.path) !== entry.status);
+}
+function pathMatchesAllowed(relativePath) {
+  const candidate = relativePath.replaceAll('\\', '/').replace(/^\.\//, '');
+  return WRITE_POLICY.allowedPaths.some((allowed) => candidate === allowed || candidate.startsWith(`${allowed}/`));
+}
+async function rollbackEntries(root, entries) {
+  const unique = [...new Map(entries.filter((entry) => entry?.path).map((entry) => [entry.path, entry])).values()];
+  if (!unique.length) return { ok: true, error: '' };
+  const tracked = unique.filter((entry) => !entry.status.includes('?')).map((entry) => entry.path);
+  const untracked = unique.filter((entry) => entry.status.includes('?')).map((entry) => entry.path);
+  const errors = [];
+  if (tracked.length) {
+    await new Promise((resolve) => {
+      const restore = spawn('git', ['-C', root, 'restore', '--worktree', '--staged', '--', ...tracked], cliSpawnOptions('git', { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }));
+      restore.once('error', (error) => { errors.push(`git restore: ${error.message}`); resolve(); });
+      restore.once('close', (code) => { if (code !== 0) errors.push(`git restore exited with code ${code}`); resolve(); });
+    });
+  }
+  for (const relativePath of untracked) {
+    try { rmSync(path.join(root, relativePath), { recursive: true, force: true }); } catch (error) { errors.push(`remove ${relativePath}: ${error.message}`); }
+  }
+  return { ok: errors.length === 0, error: errors.join('; ') };
 }
 function clampInteger(value, fallback, cap) {
   const safeFallback = Math.min(cap, Math.max(1, Math.trunc(fallback)));
@@ -194,7 +253,7 @@ function terminate(child) {
   child.kill('SIGKILL');
   return Promise.resolve();
 }
-function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }) {
+function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true } = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
@@ -205,7 +264,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode })
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
+      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
       resolve({ ...result, meta: { outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
     };
     const timer = setTimeout(async () => {
@@ -223,6 +282,49 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode })
       else finish({ isError: false, text: mode === 'plan' ? body : `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
   });
+}
+async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task }) {
+  const reject = (text, startedAt = Date.now()) => {
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text, meta: { outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+  };
+  const startedAt = Date.now();
+  if (!WRITE_POLICY.allowWrite) return reject('mode=implement is disabled; set allowWrite=true in bridge.config.json and pass mode=implement explicitly.', startedAt);
+  if (WRITE_POLICY.errors.length) return reject(`mode=implement is disabled; invalid write policy: ${WRITE_POLICY.errors.join('; ')}`, startedAt);
+  if (!WRITE_POLICY.allowedPaths.length) return reject('mode=implement is disabled; allowedPaths must contain at least one repository-relative path.', startedAt);
+  const beforeStatus = await gitStatus(WORKSPACE_ROOT);
+  if (!beforeStatus.ok) return reject(`mode=implement requires a verifiable Git workspace: ${beforeStatus.error}`, startedAt);
+  if (WRITE_POLICY.requireCleanTree && beforeStatus.entries.length) {
+    return reject(`mode=implement requires a clean Git workspace (${beforeStatus.entries.length} existing change(s)); commit or stash them first.`, startedAt);
+  }
+  if (!WRITE_POLICY.requireCleanTree && beforeStatus.entries.some((entry) => pathMatchesAllowed(entry.path))) {
+    return reject('mode=implement refuses to write an allowed path that is already dirty; restore or commit it first.', startedAt);
+  }
+  const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement' }, { record: false });
+  const afterStatus = await gitStatus(WORKSPACE_ROOT);
+  if (!afterStatus.ok) {
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    return { isError: true, text: `mode=implement could not verify post-write Git state: ${afterStatus.error}`, meta: { ...result.meta, outcome: 'write_rejected' } };
+  }
+  const changed = changedEntries(beforeStatus.entries, afterStatus.entries);
+  const disallowed = changed.filter((entry) => !pathMatchesAllowed(entry.path));
+  const mustRollback = disallowed.length > 0 || result.isError;
+  if (mustRollback && changed.length) {
+    const rollback = await rollbackEntries(WORKSPACE_ROOT, changed);
+    const reason = disallowed.length
+      ? `write touched paths outside allowedPaths: ${disallowed.map((entry) => entry.path).join(', ')}`
+      : `worker failed: ${result.text}`;
+    const rollbackText = rollback.ok ? 'rollback completed' : `rollback failed: ${rollback.error}`;
+    const outcome = disallowed.length ? 'write_rejected' : (result.meta?.outcome ?? 'worker_exit');
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    return { isError: true, text: `${reason}; ${rollbackText}`, meta: { ...result.meta, outcome } };
+  }
+  if (result.isError) {
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: result.meta?.outcome ?? 'worker_exit', exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    return result;
+  }
+  recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+  return result;
 }
 function estimateTaskTokens(task) {
   return Math.max(1, Math.ceil(Buffer.byteLength(task, 'utf8') / 4));
@@ -247,7 +349,7 @@ function enqueue(job, meta) {
   return run.finally(() => { queueDepth -= 1; });
 }
 async function callTool(name, args) {
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
@@ -255,7 +357,7 @@ async function callTool(name, args) {
   const task = typeof args?.task === 'string' ? args.task.trim() : '';
   if (!task) { logRejected('task_required'); throw new Error('task is required'); }
   if (task.length > TASK_CHAR_CAP) { logRejected('task_too_long'); throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`); }
-  if (mode === 'implement') { logRejected('implement_disabled'); return { isError: true, text: 'mode=implement is disabled; Codex applies all changes.' }; }
+  if (mode === 'implement' && !WRITE_POLICY.allowWrite) { logRejected('implement_disabled'); return { isError: true, text: 'mode=implement is disabled; set allowWrite=true in bridge.config.json and pass mode=implement explicitly.' }; }
   if (MODEL_CAPABILITIES.contextWindow !== null) {
     const estimatedTokens = estimateTaskTokens(task);
     if (estimatedTokens > MODEL_CAPABILITIES.contextWindow) {
@@ -264,12 +366,14 @@ async function callTool(name, args) {
     }
   }
   const preset = MODES[mode];
-  if (!preset) { logRejected('mode_invalid'); throw new Error('mode must be inspect or review'); }
+  if (!preset) { logRejected('mode_invalid'); throw new Error(`mode must be one of ${Object.keys(MODES).join(', ')}`); }
   let cwd;
   try { cwd = resolveCwd(args?.cwd); } catch (error) { logRejected('cwd_invalid'); throw error; }
   const maxSteps = clampInteger(args?.max_steps, preset.maxSteps, LIMITS.maxStepsCap); const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, LIMITS.timeoutSecondsCap);
   const meta = { mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
-  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }), meta);
+  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => mode === 'implement'
+    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task })
+    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }), meta);
 }
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 const handlers = { initialize: () => ({ capabilities: { tools: {} }, protocolVersion: '2024-11-05', serverInfo: { name: SERVER_NAME, version: '1.0.0' } }), ping: () => ({}), 'tools/list': () => ({ tools: TOOLS }), 'tools/call': async (params) => { const result = await callTool(params?.name, params?.arguments ?? {}); return { content: [{ type: 'text', text: result.text }], isError: result.isError }; } };
