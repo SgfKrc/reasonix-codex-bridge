@@ -769,6 +769,21 @@ fs.writeFileSync(process.env.WORKER_MARKER, 'called');
     assert.equal(existsSync(marker), false);
   });
 
+  test('implement rejects the unsafe requireCleanTree opt-out before spawning the worker', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'], requireCleanTree: false }), 'utf8');
+    const marker = path.join(root, 'worker-called');
+    writeFileSync(path.join(root, 'subagent'), `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'must not run');`, 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write' }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'unsafe opt-out', mode: 'implement' } } }]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, true);
+    assert.match(responses[0].result.content[0].text, /requireCleanTree=false is unsupported/);
+    assert.equal(existsSync(marker), false);
+  });
+
   test('rollback refuses to overwrite a later manual edit', async () => {
     const root = tempRoot();
     writeCliFiles(root);

@@ -407,6 +407,7 @@ export function resolveWritePolicy(bridgeConfig) {
   }
   if (allowWriteTypeError) errors.push('allowWrite must be boolean true or false');
   if (requireCleanTreeTypeError) errors.push('requireCleanTree must be boolean true or false');
+  if (data.requireCleanTree === false) errors.push('requireCleanTree=false is unsupported; set requireCleanTree=true');
   return Object.freeze({
     allowWrite,
     allowedPaths: Object.freeze(allowedPaths),
