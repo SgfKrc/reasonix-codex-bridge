@@ -348,6 +348,46 @@ export function resolveWorkspaceRoot(bridgeConfig) {
   return process.cwd();
 }
 
+function normalizeAllowedPath(value) {
+  if (typeof value !== 'string' || !value.trim()) return { path: '', error: 'allowedPaths entries must be non-empty strings' };
+  const original = value.trim().replaceAll('\\', '/');
+  if (original.startsWith('/') || /^[A-Za-z]:\//.test(original)) return { path: '', error: `allowed path must be relative: ${value}` };
+  const normalized = path.posix.normalize(original);
+  if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../')) {
+    return { path: '', error: `allowed path escapes the workspace: ${value}` };
+  }
+  return { path: normalized.replace(/\/$/, ''), error: '' };
+}
+
+/** Resolve the opt-in write policy. Every write setting is fail-closed by default. */
+export function resolveWritePolicy(bridgeConfig) {
+  const data = bridgeConfig?.data && typeof bridgeConfig.data === 'object' ? bridgeConfig.data : {};
+  const allowWrite = data.allowWrite === true;
+  const allowWriteTypeError = Object.hasOwn(data, 'allowWrite') && typeof data.allowWrite !== 'boolean';
+  const requireCleanTree = Object.hasOwn(data, 'requireCleanTree') ? data.requireCleanTree === true : true;
+  const requireCleanTreeTypeError = Object.hasOwn(data, 'requireCleanTree') && typeof data.requireCleanTree !== 'boolean';
+  const rawPaths = data.allowedPaths;
+  const allowedPaths = [];
+  const errors = [];
+  if (rawPaths !== undefined && !Array.isArray(rawPaths)) errors.push('allowedPaths must be an array');
+  if (Array.isArray(rawPaths)) {
+    for (const value of rawPaths) {
+      const normalized = normalizeAllowedPath(value);
+      if (normalized.error) errors.push(normalized.error);
+      else if (!allowedPaths.includes(normalized.path)) allowedPaths.push(normalized.path);
+    }
+  }
+  if (allowWriteTypeError) errors.push('allowWrite must be boolean true or false');
+  if (requireCleanTreeTypeError) errors.push('requireCleanTree must be boolean true or false');
+  return Object.freeze({
+    allowWrite,
+    allowedPaths: Object.freeze(allowedPaths),
+    requireCleanTree,
+    errors: Object.freeze(errors),
+    enabled: allowWrite && errors.length === 0 && allowedPaths.length > 0,
+  });
+}
+
 export function readPresets(presetsPath = PRESETS_PATH) {
   if (!isFile(presetsPath)) return { path: presetsPath, exists: false, presets: [] };
   let data;

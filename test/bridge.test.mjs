@@ -87,6 +87,19 @@ function writeProfile(root, model = 'fixture/provider', readOnly = true) {
   return path.join(dir, 'SKILL.md');
 }
 
+function commitFixture(root) {
+  const init = spawnSync('git', ['-C', root, 'init', '-q'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(init.status, 0, init.stderr);
+  for (const [key, value] of [['user.email', 'fixture@example.invalid'], ['user.name', 'fixture']]) {
+    const config = spawnSync('git', ['-C', root, 'config', key, value], { encoding: 'utf8', windowsHide: true });
+    assert.equal(config.status, 0, config.stderr);
+  }
+  const add = spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(add.status, 0, add.stderr);
+  const commit = spawnSync('git', ['-C', root, 'commit', '-qm', 'fixture'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(commit.status, 0, commit.stderr);
+}
+
 function writeVersionStub(root, version) {
   if (process.platform === 'win32') {
     const file = path.join(root, 'reasonix-stub.cmd');
@@ -555,6 +568,85 @@ describe('offline command contracts', () => {
     assert.equal(responses[0].result.isError, true);
     assert.match(responses[0].result.content[0].text, /estimated \d+ tokens; limit 4 tokens/);
     assert.equal(existsSync(marker), false);
+  });
+
+  test('implement stays disabled until the bridge config opts in', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [
+      { id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
+      { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'must not write', mode: 'implement' } } },
+    ]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    const status = JSON.parse(responses[0].result.content[0].text);
+    assert.equal(status.writePolicy.allowWrite, false);
+    assert.equal(status.writePolicy.enabled, false);
+    assert.equal(responses[1].result.isError, true);
+    assert.match(responses[1].result.content[0].text, /allowWrite=true/);
+  });
+
+  test('implement allows a whitelisted change only after a clean-tree check', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'allowed.txt'), 'before', 'utf8');
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.WRITE_TARGET, 'after');
+process.stdout.write('implemented');
+`, 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'write allowed file', mode: 'implement' } } }]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, false);
+    assert.equal(readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'after');
+  });
+
+  test('implement refuses an existing dirty tree by default', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'allowed.txt'), 'before', 'utf8');
+    const marker = path.join(root, 'worker-called');
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.WORKER_MARKER, 'called');
+`, 'utf8');
+    commitFixture(root);
+    writeFileSync(path.join(root, 'unrelated.txt'), 'dirty', 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WORKER_MARKER: marker }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'must wait for clean tree', mode: 'implement' } } }]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, true);
+    assert.match(responses[0].result.content[0].text, /clean Git workspace/);
+    assert.equal(existsSync(marker), false);
+  });
+
+  test('implement rolls back a change outside the whitelist', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.WRITE_TARGET, 'must be removed');
+process.stdout.write('implemented');
+`, 'utf8');
+    commitFixture(root);
+    const target = path.join(root, 'outside.txt');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WRITE_TARGET: target }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'write outside file', mode: 'implement' } } }]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, true);
+    assert.match(responses[0].result.content[0].text, /outside allowedPaths/);
+    assert.equal(existsSync(target), false);
+    const status = spawnSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8', windowsHide: true });
+    assert.equal(status.stdout.trim(), '');
   });
 });
 

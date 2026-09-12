@@ -1,6 +1,6 @@
 # Reasonix ↔ Codex MCP Bridge
 
-Zero-dependency stdio MCP server for Codex. It exposes a narrow `reasonix_run` tool that starts the configured read-only Reasonix subagent and a `reasonix_status` diagnostic tool.
+Zero-dependency stdio MCP server for Codex. It exposes a narrow `reasonix_run` tool that starts the configured Reasonix subagent and a `reasonix_status` diagnostic tool. The worker remains read-only by default; controlled writes require an explicit policy.
 
 Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited release contents.
 
@@ -137,14 +137,40 @@ unchanged so callers can consume a machine-readable change list, for example:
 {"schema":"qlh.reasonix.plan.v1","changes":[{"file":"src/server.mjs","location":"line 1","reason":"...","patch":"..."}]}
 ```
 
-The plan is advisory only: the bridge does not parse or apply it, and `mode=implement` remains
-disabled. Use repository-relative file names and omit file contents from plan entries.
+The plan is advisory only: the bridge does not parse or apply it. Use repository-relative file names
+and omit file contents from plan entries.
+
+### Controlled implement mode
+
+`mode=implement` is disabled unless the per-machine `bridge.config.json` explicitly opts in. The
+minimum policy is an exact boolean `allowWrite: true`, a non-empty `allowedPaths` array, and the
+default `requireCleanTree: true`:
+
+```json
+{
+  "modelRef": "<provider>/<model>",
+  "allowWrite": true,
+  "allowedPaths": ["src/example.mjs", "tests/"],
+  "requireCleanTree": true
+}
+```
+
+The caller must also pass `mode=implement`; inspect/review/plan never write. `allowedPaths` entries
+are repository-relative exact files or directory prefixes, never absolute paths or `..` escapes.
+Before a write call the bridge requires a verifiable Git workspace and, by default, no existing
+changes. After the worker exits it compares Git status with the pre-call snapshot. Any path outside
+the whitelist, or any failed worker, causes the changes from that call to be rolled back. A dirty
+allowed path is rejected even when `requireCleanTree` is explicitly false. W2 will add structured
+change evidence and a principal-controlled rollback entry; W3 will add a dedicated write profile.
 
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
 stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
 paths are never written. With `BRIDGE_LOG` unset, the bridge performs no log writes.
 
-The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots, rejects `implement`, limits task/budget/output sizes, and terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's hard 128 MB history limit.
+The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots,
+rejects `implement` unless the write policy is enabled, limits task/budget/output sizes, and
+terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's
+hard 128 MB history limit.
 
 Persistent ACP transport remains design-only; see `ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The offline prototype in `src/acp-prototype.mjs` triggers transactional compaction at 75% of the fixed 128 MiB Reasonix history cap, rotates when a compacted session still cannot fit, and falls back to per-call without mutating persistent history when compaction fails. `src/server.mjs` remains stateless and does not import the prototype.
