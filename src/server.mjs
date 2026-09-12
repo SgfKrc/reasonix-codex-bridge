@@ -1,15 +1,26 @@
-/** Local stdio MCP facade for the read-only Reasonix DeepSeek worker. */
+/** Local stdio MCP facade for the read-only Reasonix worker. */
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import {
+  ConfigError,
+  SERVER_NAME,
+  readBridgeConfig,
+  resolveCliPath,
+  resolveModelRef,
+  resolveSubagent,
+  resolveWorkspaceRoot,
+  validateModelRef,
+} from './config.mjs';
 
-const SERVER_NAME = 'reasonix-local-bridge';
-const REQUIRED_MODEL_REF = 'example-inventory-name/deepseek-flash';
-const CLI_PATH = resolveCliPath();
-const WORKSPACE_ROOT = path.resolve(process.env.REASONIX_ROOT ?? process.cwd());
-const SUBAGENT_NAME = process.env.REASONIX_SUBAGENT ?? 'deepseek-worker';
-const MODEL_REF = process.env.REASONIX_MODEL_REF ?? REQUIRED_MODEL_REF;
+function log(message) { process.stderr.write(`[${SERVER_NAME}] ${message}\n`); }
+function refuse(reason, hint) {
+  log(`refusing to start: ${reason}`);
+  if (hint) log(hint);
+  process.exit(2);
+}
+
 const MAX_STEPS_CAP = 40;
 const TIMEOUT_SECONDS_CAP = 600;
 const TASK_CHAR_CAP = 8000;
@@ -22,57 +33,40 @@ const TOOLS = [
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
 
-function log(message) { process.stderr.write(`[${SERVER_NAME}] ${message}\n`); }
-/** Explicit REASONIX_EXE wins; otherwise probe standard install locations and PATH. No machine path is hard-coded. */
-function resolveCliPath() {
-  const configured = (process.env.REASONIX_EXE ?? '').trim();
-  if (configured) {
-    const explicit = path.resolve(configured);
-    if (isFile(explicit)) return explicit;
-    log(`refusing to start: REASONIX_EXE is set but is not a readable file: ${explicit}`);
-    process.exit(2);
-  }
-  const candidates = cliCandidates();
-  for (const candidate of candidates) if (isFile(candidate)) return candidate;
-  log(`refusing to start: reasonix CLI not found and REASONIX_EXE is unset (probed ${candidates.length} standard location(s))`);
-  process.exit(2);
+let bridgeConfig = { path: '', exists: false, data: {} };
+try {
+  bridgeConfig = readBridgeConfig();
+} catch (error) {
+  refuse(error instanceof ConfigError ? error.message : String(error?.message ?? error));
 }
-function isFile(candidate) {
-  try { return statSync(candidate).isFile(); } catch { return false; }
+
+let CLI_PATH = '';
+try {
+  CLI_PATH = resolveCliPath();
+} catch (error) {
+  refuse(
+    error instanceof ConfigError ? error.message : String(error?.message ?? error),
+    'set REASONIX_EXE, or install Reasonix so the standard locations are populated.',
+  );
 }
-function cliCandidates() {
-  if (process.platform !== 'win32') {
-    return ['/usr/local/bin/reasonix-cli', '/usr/bin/reasonix-cli', '/opt/reasonix/reasonix-cli', ...pathCandidates(['reasonix-cli'])];
-  }
-  const programs = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Reasonix') : '';
-  const candidates = [];
-  if (programs) {
-    candidates.push(path.join(programs, 'reasonix-cli.exe'));
-    const versionsRoot = path.join(programs, 'versions');
-    let entries = [];
-    try { entries = readdirSync(versionsRoot, { withFileTypes: true }); } catch { entries = []; }
-    const versions = entries
-      .filter((entry) => entry.isDirectory() && /^v?\d+(?:\.\d+)*$/.test(entry.name))
-      .map((entry) => entry.name)
-      .sort(compareVersions)
-      .reverse();
-    for (const version of versions) candidates.push(path.join(versionsRoot, version, 'reasonix-cli.exe'));
-  }
-  return [...candidates, ...pathCandidates(['reasonix-cli.exe'])];
+
+const WORKSPACE_ROOT = resolveWorkspaceRoot(bridgeConfig);
+const SUBAGENT = resolveSubagent(bridgeConfig);
+const MODEL_RESOLUTION = resolveModelRef({ cliPath: CLI_PATH, bridgeConfig });
+const MODEL_REF = MODEL_RESOLUTION.ref;
+if (!MODEL_REF) {
+  refuse(
+    `no subagent model reference configured (${MODEL_RESOLUTION.error ?? 'no source'})`,
+    'pick one with: node src/configure.mjs list  ->  node src/configure.mjs use <provider>/<model>',
+  );
 }
-function pathCandidates(names) {
-  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
-  return dirs.flatMap((dir) => names.map((name) => path.join(dir, name)));
+const MODEL_REF_PROBLEM = validateModelRef(MODEL_REF);
+if (MODEL_REF_PROBLEM) {
+  refuse(`${MODEL_REF_PROBLEM}: ${MODEL_REF}`, 'fix with: node src/configure.mjs use <provider>/<model>');
 }
-function compareVersions(left, right) {
-  const a = left.replace(/^v/i, '').split('.').map(Number);
-  const b = right.replace(/^v/i, '').split('.').map(Number);
-  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-    const delta = (a[index] ?? 0) - (b[index] ?? 0);
-    if (delta !== 0) return delta;
-  }
-  return 0;
-}
+const SUBAGENT_NAME = SUBAGENT.name;
+const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
+
 function allowedRoots() {
   const extra = (process.env.REASONIX_ADD_DIRS ?? '').split(path.delimiter).map((x) => x.trim()).filter(Boolean);
   return [WORKSPACE_ROOT, ...extra].map((entry) => { const absolute = path.resolve(entry); try { return realpathSync.native(absolute); } catch { return absolute; } });
@@ -122,7 +116,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, task }) {
 let queue = Promise.resolve(); let queueDepth = 0;
 function enqueue(job) { if (queueDepth >= 5) return Promise.resolve({ isError: true, text: 'too many queued requests; retry later' }); queueDepth += 1; const run = queue.then(job, job); queue = run.then(() => undefined, () => undefined); return run.finally(() => { queueDepth -= 1; }); }
 async function callTool(name, args) {
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, modelRef: MODEL_REF, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: MAX_STEPS_CAP, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: TIMEOUT_SECONDS_CAP, queueCap: 5 } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: MAX_STEPS_CAP, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: TIMEOUT_SECONDS_CAP, queueCap: 5 } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const task = typeof args?.task === 'string' ? args.task.trim() : '';
   if (!task) throw new Error('task is required'); if (task.length > TASK_CHAR_CAP) throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`);
@@ -139,8 +133,7 @@ async function handleMessage(message) {
   const handler = handlers[method]; if (!handler) return send({ jsonrpc: '2.0', id, error: { code: -32601, message: `unknown method: ${method}` } });
   try { send({ jsonrpc: '2.0', id, result: await handler(params) }); } catch (error) { const text = error instanceof Error ? error.message : String(error); if (method === 'tools/call') send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: true } }); else send({ jsonrpc: '2.0', id, error: { code: -32603, message: text } }); }
 }
-if (MODEL_REF !== REQUIRED_MODEL_REF) { log(`refusing to start: REASONIX_MODEL_REF must equal ${REQUIRED_MODEL_REF}`); process.exit(2); }
-log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} model=${MODEL_REF} readOnly=true`);
+log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} model=${MODEL_REF} source=${MODEL_REF_SOURCE} readOnly=true`);
 const reader = createInterface({ input: process.stdin, terminal: false }); const inFlight = new Set();
 reader.on('line', (line) => { if (!line.trim()) return; let message; try { message = JSON.parse(line); } catch { log(`ignored invalid JSON input: ${line.slice(0, 200)}`); return; } const task = handleMessage(message).catch((error) => log(`message failed: ${error?.message ?? error}`)); inFlight.add(task); void task.finally(() => inFlight.delete(task)); });
 reader.on('close', () => { void Promise.allSettled([...inFlight]).then(() => process.exit(0)); });

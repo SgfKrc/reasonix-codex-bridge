@@ -9,35 +9,60 @@ Zero-dependency stdio MCP server for Codex. It exposes a narrow `reasonix_run` t
 - Lower Reasonix versions are intentionally unsupported.
 - The CLI path is resolved at startup and never hard-coded: `REASONIX_EXE` wins when set, otherwise the bridge probes `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`, the newest `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`, `/usr/local/bin|/usr/bin/reasonix-cli`, then `reasonix-cli(.exe)` on `PATH`. If nothing is found (or `REASONIX_EXE` points to a missing file) the server logs the reason and exits with code 2.
 
+## Pick the subagent model
+
+Every machine may use a different provider, so no model reference is hard-coded. `node src/configure.mjs` reads this machine's redacted inventory from `reasonix doctor --json`:
+
+```bash
+node src/configure.mjs list      # every <provider>/<model> ref this machine reports (key present, Reasonix default, current)
+node src/configure.mjs use <ref> # write it to bridge.config.json (a preset name works too)
+node src/configure.mjs show      # effective configuration and where each value comes from
+node src/configure.mjs verify    # check CLI + model ref + subagent profile
+```
+
+`presets.example.json` ships three editable examples (OpenCode Go, Shizi gateway, DeepSeek official) and `node src/configure.mjs presets` lists them once you copy it to `presets.json`. Provider ids are account-specific — always take the refs from `configure list` on the machine you are setting up instead of copying someone else's value.
+
+Resolution order for the model reference (first hit wins):
+
+1. `REASONIX_MODEL_REF` from the environment (for example the Codex MCP block)
+2. `modelRef` in `bridge.config.json`
+3. `config.default_model` reported by `reasonix doctor --json` (auto fallback; `reasonix_status` shows it as the source)
+4. nothing available → the bridge refuses to start with exit code 2 and points at `configure use`.
+
 ## Configure Codex
 
-Add this to the Codex configuration that the local client loads:
+Generate the block instead of typing paths by hand:
+
+```bash
+node src/configure.mjs codex          # print the TOML block
+node src/configure.mjs codex --write  # upsert it into the Codex config (timestamped backup first)
+```
 
 ```toml
 [mcp_servers.reasonix_local]
 command = "node"
-args = ["C:\\path\\to\\reasonix-codex-bridge\\src\\server.mjs"]
+args = ["C:/path/to/reasonix-codex-bridge/src/server.mjs"]
 startup_timeout_sec = 30
 
 [mcp_servers.reasonix_local.env]
-REASONIX_EXE = "C:\\path\\to\\reasonix-cli.exe"
-REASONIX_ROOT = "C:\\path\\to\\workspace"
+REASONIX_EXE = "C:/path/to/reasonix-cli.exe"   # optional; omit to use the probe order
+REASONIX_ROOT = "C:/path/to/workspace"
 REASONIX_SUBAGENT = "deepseek-worker"
-REASONIX_MODEL_REF = "example-inventory-name/deepseek-flash"
+REASONIX_MODEL_REF = "<the ref you selected with: node src/configure.mjs list>"
 ```
 
-Restart Codex after changing MCP configuration. Run `npm run check` (or `node --check src/server.mjs`) before connecting a new machine.
+Restart Codex after changing MCP configuration. Run `npm run check` (or `node --check src/server.mjs src/config.mjs src/configure.mjs`) before connecting a new machine.
 
 Create the named profile once in the global Reasonix profile directory. The bridge passes the target workspace with `--dir`, so a project-only profile will not be found when the bridge is copied to another repository:
 
 ```powershell
-reasonix subagent create deepseek-worker --scope global --model "example-inventory-name/deepseek-flash" --prompt-file .\prompts\deepseek-worker-prompt.md
+reasonix subagent create deepseek-worker --scope global --model "<ref shown by: node src/configure.mjs list>" --prompt-file .\prompts\deepseek-worker-prompt.md
 reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index"
-# Add read-only: true to the profile frontmatter after the CLI edit.
+# Add read-only: true to the profile frontmatter after the CLI edit; `node src/configure.mjs verify` confirms it.
 ```
 
 ## Environment variables
 
-`REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. The model reference is hard-locked to `example-inventory-name/deepseek-flash`; changing it makes the server exit with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter.
+`REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable and always win over `bridge.config.json`. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. Any `<provider>/<model>` ref this machine reports is accepted for `REASONIX_MODEL_REF`; an empty value, whitespace, or a ref without `/` exits with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter. `BRIDGE_CONFIG`, `BRIDGE_PRESETS`, `CODEX_CONFIG`, and `CODEX_HOME` relocate the files the helper scripts read and write.
 
 The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots, rejects `implement`, limits task/budget/output sizes, and terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's hard 128 MB history limit. A persistent ACP transport is a later extension; it must compact or rotate the session before 128 MB and never treat that limit as configurable.

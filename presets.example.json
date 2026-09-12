@@ -1,0 +1,20 @@
+{
+  "$comment": "Copy this file to presets.json and adjust the refs for your own Reasonix install (run `node src/configure.mjs list` to see the exact provider ids on your machine), then pick one with `node src/configure.mjs use <name>`.",
+  "presets": [
+    {
+      "name": "opencode-go",
+      "modelRef": "example-inventory-name/deepseek-flash",
+      "note": "OpenCode Go (Zen) subscription — https://opencode.ai/zen/go/v1"
+    },
+    {
+      "name": "shiziagent",
+      "modelRef": "your-inventory-name/deepseek-flash",
+      "note": "Shizi agent gateway — deepseek-flash"
+    },
+    {
+      "name": "deepseek-official",
+      "modelRef": "deepseek/deepseek-flash",
+      "note": "DeepSeek official API key path"
+    }
+  ]
+}
