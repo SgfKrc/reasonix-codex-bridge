@@ -41,6 +41,11 @@ node src/configure.mjs codex          # print the TOML block
 node src/configure.mjs codex --write  # upsert it into the Codex config (timestamped backup first)
 ```
 
+`codex --write` validates the required bridge and environment keys before writing, merges duplicate
+`mcp_servers.reasonix_local*` sections, preserves unrelated TOML sections and the existing LF/CRLF
+style, and replaces the file through a same-directory temporary. The timestamped backup remains the
+rollback point if the destination cannot be replaced.
+
 ```toml
 [mcp_servers.reasonix_local]
 command = "node"

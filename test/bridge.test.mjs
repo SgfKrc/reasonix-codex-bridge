@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, describe, test } from 'node:test';
 import {
   DEFAULT_MIN_REASONIX_VERSION,
+  atomicWriteFile,
   checkCliVersion,
   compareVersions,
   doctorRefs,
@@ -14,6 +15,7 @@ import {
   parseVersion,
   resolveModelRef,
   upsertReasonixBlock,
+  validateCodexBlock,
   validateModelRef,
 } from '../src/config.mjs';
 
@@ -185,10 +187,37 @@ describe('configuration pure functions', () => {
   });
 
   test('upserts bridge blocks at append, first and last boundaries', () => {
-    const block = '[mcp_servers.reasonix_local]\ncommand = "node"\n';
+    const block = '[mcp_servers.reasonix_local]\ncommand = "node"\nargs = ["server.mjs"]\nstartup_timeout_sec = 30\n\n[mcp_servers.reasonix_local.env]\nREASONIX_ROOT = "root"\nREASONIX_SUBAGENT = "worker"\nREASONIX_MODEL_REF = "fixture/provider"\n';
     assert.match(upsertReasonixBlock('title = "x"\n', block), /title = "x"[\s\S]*\[mcp_servers\.reasonix_local\]/);
     assert.match(upsertReasonixBlock('[mcp_servers.reasonix_local]\nold = true\n\n[other]\nvalue = 1\n', block), /command = "node"[\s\S]*\[other\]/);
     assert.match(upsertReasonixBlock('[other]\nvalue = 1\n\n[mcp_servers.reasonix_local]\nold = true\n', block), /\[other\][\s\S]*command = "node"/);
+  });
+
+  test('validates required Codex keys and merges duplicate bridge sections', () => {
+    const block = '[mcp_servers.reasonix_local]\ncommand = "node"\nargs = ["server.mjs"]\nstartup_timeout_sec = 30\n\n[mcp_servers.reasonix_local.env]\nREASONIX_ROOT = "root"\nREASONIX_SUBAGENT = "worker"\nREASONIX_MODEL_REF = "fixture/provider"\n';
+    assert.equal(validateCodexBlock(block), '');
+    assert.match(validateCodexBlock('[mcp_servers.reasonix_local]\ncommand = "node"\n'), /missing \[mcp_servers\.reasonix_local\.env\] section/);
+    const merged = upsertReasonixBlock([
+      '[mcp_servers.reasonix_local]', 'old = 1', '[other]', 'value = 1',
+      '[mcp_servers.reasonix_local.env]', 'REASONIX_ROOT = "old"',
+      '[mcp_servers.reasonix_local]', 'old = 2', '[tail]', 'value = 2',
+    ].join('\n'), block);
+    assert.equal((merged.match(/^\[mcp_servers\.reasonix_local\]$/gm) ?? []).length, 1);
+    assert.equal((merged.match(/^\[mcp_servers\.reasonix_local\.env\]$/gm) ?? []).length, 1);
+    assert.match(merged, /\[other\][\s\S]*\[tail\]/);
+  });
+
+  test('preserves CRLF output for mixed-line-ending input and atomically replaces files', () => {
+    const block = '[mcp_servers.reasonix_local]\ncommand = "node"\nargs = ["server.mjs"]\nstartup_timeout_sec = 30\n\n[mcp_servers.reasonix_local.env]\nREASONIX_ROOT = "root"\nREASONIX_SUBAGENT = "worker"\nREASONIX_MODEL_REF = "fixture/provider"\n';
+    const updated = upsertReasonixBlock('[tool]\r\nvalue = 1\n[mcp_servers.reasonix_local]\r\nold = true\r\n', block);
+    assert.match(updated, /\r\n/);
+    assert.match(updated, /\[tool\]\r\nvalue = 1/);
+    const root = tempRoot();
+    const target = path.join(root, 'config.toml');
+    writeFileSync(target, 'old', 'utf8');
+    atomicWriteFile(target, 'new');
+    assert.equal(readFileSync(target, 'utf8'), 'new');
+    assert.equal(readdirSync(root).filter((name) => name.includes('.tmp-') || name.includes('.old-')).length, 0);
   });
 });
 
@@ -199,12 +228,19 @@ describe('offline command contracts', () => {
     const use = runNode([CONFIGURE_PATH, 'use', 'fixture/provider'], root);
     assert.equal(use.status, 0, use.stderr);
     assert.equal(JSON.parse(readFileSync(path.join(root, 'bridge.config.json'), 'utf8')).modelRef, 'fixture/provider');
-    writeFileSync(path.join(root, 'codex.config.toml'), '[tool]\nvalue = 1\n', 'utf8');
+    writeFileSync(path.join(root, 'codex.config.toml'), [
+      '[tool]', 'value = 1', '[mcp_servers.reasonix_local]', 'old = 1',
+      '[mcp_servers.reasonix_local.env]', 'REASONIX_ROOT = "old"',
+      '[mcp_servers.reasonix_local]', 'old = 2', '[tail]', 'value = 2',
+    ].join('\n'), 'utf8');
     const codex = runNode([CONFIGURE_PATH, 'codex', '--write'], root);
     assert.equal(codex.status, 0, codex.stderr);
     const written = readFileSync(path.join(root, 'codex.config.toml'), 'utf8');
     assert.match(written, /\[mcp_servers\.reasonix_local\]/);
     assert.match(written, /REASONIX_MODEL_REF = "fixture\/provider"/);
+    assert.equal((written.match(/^\[mcp_servers\.reasonix_local\]$/gm) ?? []).length, 1);
+    assert.equal((written.match(/^\[mcp_servers\.reasonix_local\.env\]$/gm) ?? []).length, 1);
+    assert.equal(readdirSync(root).filter((name) => name.includes('codex.config.toml.bak-')).length, 1);
   });
 
   test('verify fails below the default version and downgrades only with an explicit override', () => {

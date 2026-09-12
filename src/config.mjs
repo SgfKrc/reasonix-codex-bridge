@@ -7,7 +7,7 @@
  * The CLI path is probed (see README) and can be pinned with REASONIX_EXE.
  */
 import { spawnSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -391,22 +391,90 @@ export function buildCodexBlock({ modelRef, subagent, root, cliPath }) {
   return `${lines.join('\n')}\n`;
 }
 
-/** Replace the existing `[mcp_servers.reasonix_local*]` block, or append it. */
+export function validateCodexBlock(block) {
+  const lines = String(block ?? '').split(/\r?\n/).map((line) => line.trim());
+  const sections = new Map();
+  let section = '';
+  for (const line of lines) {
+    if (!line || line.startsWith('#')) continue;
+    const header = line.match(/^\[([^\]]+)\]$/);
+    if (header) {
+      section = header[1];
+      if (!sections.has(section)) sections.set(section, new Set());
+      continue;
+    }
+    const key = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+    if (key && section) sections.get(section).add(key[1]);
+  }
+  if (!sections.has('mcp_servers.reasonix_local')) return 'missing [mcp_servers.reasonix_local] section';
+  if (!sections.has('mcp_servers.reasonix_local.env')) return 'missing [mcp_servers.reasonix_local.env] section';
+  for (const key of ['command', 'args', 'startup_timeout_sec']) {
+    if (!sections.get('mcp_servers.reasonix_local').has(key)) return `missing ${key} in [mcp_servers.reasonix_local]`;
+  }
+  for (const key of ['REASONIX_ROOT', 'REASONIX_SUBAGENT', 'REASONIX_MODEL_REF']) {
+    if (!sections.get('mcp_servers.reasonix_local.env').has(key)) return `missing ${key} in [mcp_servers.reasonix_local.env]`;
+  }
+  return '';
+}
+
+function isReasonixSection(line) {
+  const match = String(line).trim().match(/^\[([^\]]+)\]$/);
+  return match && (match[1] === 'mcp_servers.reasonix_local' || match[1].startsWith('mcp_servers.reasonix_local.'));
+}
+
+function isSectionHeader(line) {
+  return /^\s*\[[^\]]+\]\s*$/.test(String(line));
+}
+
+/** Replace all existing `[mcp_servers.reasonix_local*]` sections, or append one canonical block. */
 export function upsertReasonixBlock(text, block) {
-  const lines = String(text ?? '').split(/\r?\n/);
+  const validation = validateCodexBlock(block);
+  if (validation) throw new ConfigError(`invalid Codex bridge block: ${validation}`);
+  const original = String(text ?? '');
+  const newline = original.includes('\r\n') ? '\r\n' : '\n';
+  const lines = original.split(/\r?\n/);
   const start = lines.findIndex((line) => line.trim() === '[mcp_servers.reasonix_local]');
-  const blockLines = block.replace(/\s*$/, '').split('\n');
+  const blockLines = block.replace(/\s*$/, '').split(/\r?\n/);
   if (start === -1) {
     const base = lines.join('\n').replace(/\s*$/, '');
-    return base ? `${base}\n\n${blockLines.join('\n')}\n` : `${blockLines.join('\n')}\n`;
+    const result = base ? `${base}\n\n${blockLines.join('\n')}\n` : `${blockLines.join('\n')}\n`;
+    return result.replace(/\n/g, newline);
   }
-  let end = lines.length;
-  for (let index = start + 1; index < lines.length; index += 1) {
-    const trimmed = lines[index].trim();
-    if (trimmed.startsWith('[') && !trimmed.startsWith('[mcp_servers.reasonix_local')) { end = index; break; }
+  const targetRanges = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!isReasonixSection(lines[index])) continue;
+    let end = index + 1;
+    while (end < lines.length && !isSectionHeader(lines[end])) end += 1;
+    targetRanges.push([index, end]);
   }
-  const before = lines.slice(0, start).join('\n').replace(/\s*$/, '');
-  const after = lines.slice(end).join('\n').replace(/^\s*\n/, '');
-  const parts = [before, blockLines.join('\n'), after].filter((part) => part.trim() !== '');
-  return `${parts.join('\n\n')}\n`;
+  const first = targetRanges[0]?.[0] ?? start;
+  const remove = new Set(targetRanges.flatMap(([from, to]) => Array.from({ length: to - from }, (_, offset) => from + offset)));
+  const retained = lines.filter((_, index) => !remove.has(index));
+  let insertion = 0;
+  for (let index = 0; index < first; index += 1) if (!remove.has(index)) insertion += 1;
+  retained.splice(insertion, 0, ...blockLines);
+  const result = retained.join('\n').replace(/^\s*\n/, '').replace(/\s*$/, '');
+  return `${result}\n`.replace(/\n/g, newline);
+}
+
+/** Write through a same-directory temporary and replace the destination, restoring it on failure. */
+export function atomicWriteFile(filePath, content) {
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  const displacedPath = `${filePath}.old-${process.pid}-${Date.now()}`;
+  writeFileSync(tempPath, content, 'utf8');
+  let displaced = false;
+  try {
+    if (process.platform === 'win32' && existsSync(filePath)) {
+      renameSync(filePath, displacedPath);
+      displaced = true;
+    }
+    renameSync(tempPath, filePath);
+    if (displaced && existsSync(displacedPath)) unlinkSync(displacedPath);
+  } catch (error) {
+    if (existsSync(tempPath)) unlinkSync(tempPath);
+    if (displaced && !existsSync(filePath) && existsSync(displacedPath)) renameSync(displacedPath, filePath);
+    throw new ConfigError(`cannot atomically replace ${filePath}: ${error.message}`);
+  } finally {
+    if (existsSync(tempPath)) unlinkSync(tempPath);
+  }
 }
