@@ -98,6 +98,16 @@ reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_inde
 
 `REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable and always win over `bridge.config.json`. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. Any `<provider>/<model>` ref this machine reports is accepted for `REASONIX_MODEL_REF`; an empty value, whitespace, or a ref without `/` exits with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter. `BRIDGE_CONFIG`, `BRIDGE_PRESETS`, `CODEX_CONFIG`, and `CODEX_HOME` relocate the files the helper scripts read and write.
 
+Resource limits can be lowered per machine in `bridge.config.json`:
+
+```json
+{"limits":{"MAX_STEPS_CAP":20,"TIMEOUT_SECONDS_CAP":300,"OUTPUT_CHAR_CAP":12000,"queueCap":2}}
+```
+
+Each value must be a positive integer. Invalid values fall back to the defaults with one startup
+warning; values above the code hard caps are clamped with one warning. `reasonix_status.limits`
+always reports the effective values used for calls.
+
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
 stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
