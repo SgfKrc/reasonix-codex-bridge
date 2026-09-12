@@ -23,10 +23,11 @@ function refuse(reason, hint) {
   process.exit(2);
 }
 
-const MAX_STEPS_CAP = 40;
-const TIMEOUT_SECONDS_CAP = 600;
+const HARD_MAX_STEPS_CAP = 40;
+const HARD_TIMEOUT_SECONDS_CAP = 600;
 const TASK_CHAR_CAP = 8000;
-const OUTPUT_CHAR_CAP = 24000;
+const HARD_OUTPUT_CHAR_CAP = 24000;
+const HARD_QUEUE_CAP = 5;
 const HISTORY_HARD_CAP_BYTES = 128 * 1024 * 1024;
 const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSteps: 16, timeoutSeconds: 240 } };
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
@@ -42,6 +43,34 @@ try {
 } catch (error) {
   refuse(error instanceof ConfigError ? error.message : String(error?.message ?? error));
 }
+
+function configuredLimit(config, key) {
+  const root = config?.data;
+  const nested = root?.limits;
+  if (nested && typeof nested === 'object' && !Array.isArray(nested) && Object.hasOwn(nested, key)) return nested[key];
+  if (root && typeof root === 'object' && Object.hasOwn(root, key)) return root[key];
+  return undefined;
+}
+function resolveConfiguredLimit(config, key, fallback, hardCap) {
+  const raw = configuredLimit(config, key);
+  if (raw === undefined) return fallback;
+  const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw.trim()) : NaN;
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    log(`warning: bridge config ${key} is invalid; using default ${fallback}`);
+    return fallback;
+  }
+  if (parsed > hardCap) {
+    log(`warning: bridge config ${key}=${parsed} exceeds hard cap ${hardCap}; clamped to ${hardCap}`);
+    return hardCap;
+  }
+  return parsed;
+}
+const LIMITS = Object.freeze({
+  maxStepsCap: resolveConfiguredLimit(bridgeConfig, 'MAX_STEPS_CAP', HARD_MAX_STEPS_CAP, HARD_MAX_STEPS_CAP),
+  timeoutSecondsCap: resolveConfiguredLimit(bridgeConfig, 'TIMEOUT_SECONDS_CAP', HARD_TIMEOUT_SECONDS_CAP, HARD_TIMEOUT_SECONDS_CAP),
+  outputCharCap: resolveConfiguredLimit(bridgeConfig, 'OUTPUT_CHAR_CAP', HARD_OUTPUT_CHAR_CAP, HARD_OUTPUT_CHAR_CAP),
+  queueCap: resolveConfiguredLimit(bridgeConfig, 'queueCap', HARD_QUEUE_CAP, HARD_QUEUE_CAP),
+});
 
 let CLI_PATH = '';
 try {
@@ -95,9 +124,10 @@ function resolveCwd(raw) {
   return real;
 }
 function clampInteger(value, fallback, cap) {
-  if (value === null || value === '' || typeof value === 'boolean') return fallback;
+  const safeFallback = Math.min(cap, Math.max(1, Math.trunc(fallback)));
+  if (value === null || value === '' || typeof value === 'boolean') return safeFallback;
   const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
+  if (!Number.isFinite(parsed)) return safeFallback;
   return Math.min(cap, Math.max(1, Math.trunc(parsed)));
 }
 function truncate(value, cap) { return value.length <= cap ? value : `${value.slice(0, cap)}\n\n[output truncated; original ${value.length} chars]`; }
@@ -134,7 +164,7 @@ function terminate(child) {
   child.kill('SIGKILL');
   return Promise.resolve();
 }
-function runWorker({ cwd, maxSteps, timeoutSeconds, task, mode }) {
+function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
@@ -145,20 +175,20 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, task, mode }) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      writeCallLog({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > OUTPUT_CHAR_CAP });
-      resolve({ ...result, meta: { outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > OUTPUT_CHAR_CAP } });
+      writeCallLog({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
+      resolve({ ...result, meta: { outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
     };
     const timer = setTimeout(async () => {
       if (settled) return;
       await terminate(child);
       finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}` }, 'timeout');
     }, timeoutSeconds * 1000);
-    child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > OUTPUT_CHAR_CAP * 2) { truncatedOutput = true; void terminate(child); } });
-    child.stderr.on('data', (chunk) => { stderr += chunk; if (stderr.length > OUTPUT_CHAR_CAP) { truncatedOutput = true; void terminate(child); } });
+    child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > outputCharCap * 2) { truncatedOutput = true; void terminate(child); } });
+    child.stderr.on('data', (chunk) => { stderr += chunk; if (stderr.length > outputCharCap) { truncatedOutput = true; void terminate(child); } });
     child.on('error', (error) => finish({ isError: true, text: `cannot start reasonix CLI: ${error.message}` }, 'spawn_error'));
     child.on('close', (code) => {
       if (settled) return;
-      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(stdout.trim(), OUTPUT_CHAR_CAP);
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(stdout.trim(), outputCharCap);
       if (code !== 0) finish({ isError: true, text: `worker exited with code ${code} (${elapsed}s)${body ? `\n\n--- stdout ---\n${body}` : ''}${stderr ? `\n\n--- stderr ---\n${truncate(stderr, 2000)}` : ''}` }, 'worker_exit', code);
       else finish({ isError: false, text: `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
@@ -166,7 +196,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, task, mode }) {
 }
 let queue = Promise.resolve(); let queueDepth = 0;
 function enqueue(job, meta) {
-  if (queueDepth >= 5) {
+  if (queueDepth >= LIMITS.queueCap) {
     writeCallLog({ ...meta, outcome: 'queue_rejected', elapsedMs: 0, outputBytes: 0, truncated: false });
     return Promise.resolve({ isError: true, text: 'too many queued requests; retry later', meta: { outcome: 'queue_rejected', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } });
   }
@@ -176,7 +206,7 @@ function enqueue(job, meta) {
   return run.finally(() => { queueDepth -= 1; });
 }
 async function callTool(name, args) {
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: MAX_STEPS_CAP, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: TIMEOUT_SECONDS_CAP, queueCap: 5 } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
@@ -189,9 +219,9 @@ async function callTool(name, args) {
   if (!preset) { logRejected('mode_invalid'); throw new Error('mode must be inspect or review'); }
   let cwd;
   try { cwd = resolveCwd(args?.cwd); } catch (error) { logRejected('cwd_invalid'); throw error; }
-  const maxSteps = clampInteger(args?.max_steps, preset.maxSteps, MAX_STEPS_CAP); const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, TIMEOUT_SECONDS_CAP);
+  const maxSteps = clampInteger(args?.max_steps, preset.maxSteps, LIMITS.maxStepsCap); const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, LIMITS.timeoutSecondsCap);
   const meta = { mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
-  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => runWorker({ cwd, maxSteps, timeoutSeconds, task, mode }), meta);
+  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }), meta);
 }
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 const handlers = { initialize: () => ({ capabilities: { tools: {} }, protocolVersion: '2024-11-05', serverInfo: { name: SERVER_NAME, version: '1.0.0' } }), ping: () => ({}), 'tools/list': () => ({ tools: TOOLS }), 'tools/call': async (params) => { const result = await callTool(params?.name, params?.arguments ?? {}); return { content: [{ type: 'text', text: result.text }], isError: result.isError }; } };
