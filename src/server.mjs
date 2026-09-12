@@ -6,6 +6,8 @@ import { createInterface } from 'node:readline';
 import {
   ConfigError,
   SERVER_NAME,
+  checkCliVersion,
+  cliSpawnOptions,
   readBridgeConfig,
   resolveCliPath,
   resolveModelRef,
@@ -49,6 +51,16 @@ try {
     'set REASONIX_EXE, or install Reasonix so the standard locations are populated.',
   );
 }
+
+const VERSION_CHECK = checkCliVersion(CLI_PATH);
+if (VERSION_CHECK.status === 'fail') {
+  refuse(
+    VERSION_CHECK.error,
+    `upgrade Reasonix or set REASONIX_MIN_VERSION below ${VERSION_CHECK.version ?? 'the installed version'} only for a deliberate compatibility check.`,
+  );
+}
+if (VERSION_CHECK.warning) log(`warning: ${VERSION_CHECK.warning}`);
+if (VERSION_CHECK.status === 'unknown') log(`warning: Reasonix CLI version check unknown (${VERSION_CHECK.error})`);
 
 const WORKSPACE_ROOT = resolveWorkspaceRoot(bridgeConfig);
 const SUBAGENT = resolveSubagent(bridgeConfig);
@@ -98,7 +110,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, task }) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
-    const child = spawn(CLI_PATH, args, { cwd, env: process.env, shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(CLI_PATH, args, cliSpawnOptions(CLI_PATH, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }));
     let stdout = ''; let stderr = ''; let settled = false;
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     const timer = setTimeout(async () => { if (settled) return; settled = true; await terminate(child); resolve({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}` }); }, timeoutSeconds * 1000);
@@ -116,7 +128,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, task }) {
 let queue = Promise.resolve(); let queueDepth = 0;
 function enqueue(job) { if (queueDepth >= 5) return Promise.resolve({ isError: true, text: 'too many queued requests; retry later' }); queueDepth += 1; const run = queue.then(job, job); queue = run.then(() => undefined, () => undefined); return run.finally(() => { queueDepth -= 1; }); }
 async function callTool(name, args) {
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: MAX_STEPS_CAP, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: TIMEOUT_SECONDS_CAP, queueCap: 5 } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: MAX_STEPS_CAP, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: TIMEOUT_SECONDS_CAP, queueCap: 5 } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const task = typeof args?.task === 'string' ? args.task.trim() : '';
   if (!task) throw new Error('task is required'); if (task.length > TASK_CHAR_CAP) throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`);
