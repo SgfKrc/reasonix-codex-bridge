@@ -165,7 +165,9 @@ default `requireCleanTree: true`:
 }
 ```
 
-The caller must also pass `mode=implement`; inspect/review/plan never write. `allowedPaths` entries
+The caller must also pass `mode=implement`; inspect/review/plan are enforced as read-role calls and
+reject a selected write profile. Conversely, implement requires an explicit write-role profile.
+`allowedPaths` entries
 are repository-relative exact files or directory prefixes, never absolute paths or `..` escapes.
 Before a write call the bridge requires a verifiable Git workspace and, by default, no existing
 changes. After the worker exits it compares Git status with the pre-call snapshot. Any path outside
