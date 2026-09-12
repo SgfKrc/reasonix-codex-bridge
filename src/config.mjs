@@ -7,7 +7,7 @@
  * The CLI path is probed (see README) and can be pinned with REASONIX_EXE.
  */
 import { spawnSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,10 @@ export const PRESETS_PATH = envPath('BRIDGE_PRESETS', path.join(BRIDGE_ROOT, 'pr
 export const PRESETS_EXAMPLE_PATH = path.join(BRIDGE_ROOT, 'presets.example.json');
 export const CODEX_HOME = envPath('CODEX_HOME', path.join(os.homedir(), '.codex'));
 export const CODEX_CONFIG_PATH = envPath('CODEX_CONFIG', path.join(CODEX_HOME, 'config.toml'));
+const REASONIX_HOME = process.env.APPDATA
+  ? path.join(process.env.APPDATA, 'reasonix')
+  : path.join(os.homedir(), '.config', 'reasonix');
+export const REASONIX_SKILLS_PATH = envPath('REASONIX_SKILLS_DIR', path.join(REASONIX_HOME, 'skills'));
 
 export class ConfigError extends Error {}
 
@@ -258,6 +262,110 @@ export function readPresets(presetsPath = PRESETS_PATH) {
     exists: true,
     presets: presets.filter((item) => item && typeof item.name === 'string' && typeof item.modelRef === 'string' && item.modelRef.includes('/')),
   };
+}
+
+function validProfileName(name) {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(String(name ?? '').trim());
+}
+
+export function profilePath(name, skillsPath = REASONIX_SKILLS_PATH) {
+  const value = String(name ?? '').trim();
+  if (!validProfileName(value)) throw new ConfigError(`invalid subagent profile name: ${value || '(empty)'}`);
+  return path.join(path.resolve(skillsPath), value, 'SKILL.md');
+}
+
+function scalarValue(value) {
+  const trimmed = String(value ?? '').trim();
+  if (trimmed.startsWith('"')) {
+    const end = trimmed.lastIndexOf('"');
+    if (end > 0) return trimmed.slice(1, end);
+  }
+  if (trimmed.startsWith("'")) {
+    const end = trimmed.lastIndexOf("'");
+    if (end > 0) return trimmed.slice(1, end);
+  }
+  return trimmed.replace(/\s+#.*$/, '');
+}
+
+/** Parse the small YAML frontmatter contract used by Reasonix profiles. */
+export function parseProfileFrontmatter(text) {
+  const lines = String(text ?? '').replace(/^\uFEFF/, '').split(/\r?\n/);
+  if (lines[0]?.trim() !== '---') return { exists: false, fields: {}, error: 'profile has no YAML frontmatter' };
+  const end = lines.findIndex((line, index) => index > 0 && line.trim() === '---');
+  if (end === -1) return { exists: false, fields: {}, error: 'profile frontmatter is not closed' };
+  const fields = {};
+  let blockListKey = '';
+  for (const line of lines.slice(1, end)) {
+    const match = line.match(/^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+    if (match) {
+      const [, key, raw] = match;
+      const trimmedRaw = raw.trim();
+      if ((key === 'allowed-tools' || key === 'allowed_tools') && trimmedRaw === '') {
+        fields[key] = [];
+        blockListKey = key;
+      } else {
+        fields[key] = scalarValue(raw);
+        blockListKey = '';
+      }
+      continue;
+    }
+    const item = line.match(/^\s+-\s*(.+)$/);
+    if (item && blockListKey) fields[blockListKey].push(scalarValue(item[1]));
+    else if (line.trim()) blockListKey = '';
+  }
+  const model = typeof fields.model === 'string' ? fields.model : '';
+  const readOnlyRaw = fields['read-only'] ?? fields.read_only ?? fields.readOnly;
+  const readOnly = typeof readOnlyRaw === 'string' ? /^(true|yes)$/i.test(readOnlyRaw) : null;
+  const toolsKey = Object.prototype.hasOwnProperty.call(fields, 'allowed-tools') ? 'allowed-tools' : 'allowed_tools';
+  const toolsRaw = fields[toolsKey] ?? '';
+  let tools = [];
+  let toolsKnown = Object.prototype.hasOwnProperty.call(fields, toolsKey);
+  if (Array.isArray(toolsRaw)) {
+    tools = toolsRaw;
+  } else if (typeof toolsRaw === 'string' && toolsRaw.startsWith('[') && toolsRaw.endsWith(']')) {
+    tools = toolsRaw.slice(1, -1).split(',').map((item) => scalarValue(item)).filter(Boolean);
+  } else if (typeof toolsRaw === 'string' && toolsRaw !== '') {
+    toolsKnown = false;
+  }
+  return { exists: true, fields, model, readOnly, tools, toolsKnown, error: '' };
+}
+
+export function readSubagentProfile(name, skillsPath = REASONIX_SKILLS_PATH) {
+  let filePath;
+  try {
+    filePath = profilePath(name, skillsPath);
+  } catch (error) {
+    return { path: '', exists: false, frontmatter: null, error: error.message };
+  }
+  if (!isFile(filePath)) return { path: filePath, exists: false, frontmatter: null, error: 'profile file is missing' };
+  try {
+    const frontmatter = parseProfileFrontmatter(readFileSync(filePath, 'utf8'));
+    return { path: filePath, exists: true, frontmatter, error: frontmatter.error };
+  } catch (error) {
+    return { path: filePath, exists: true, frontmatter: null, error: `cannot read profile: ${error.message}` };
+  }
+}
+
+/** Add or normalize the read-only guard only after an explicit profile --write. */
+export function ensureProfileReadOnly(filePath) {
+  const text = readFileSync(filePath, 'utf8');
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/);
+  if (lines[0]?.trim() !== '---') throw new ConfigError('profile has no YAML frontmatter');
+  const end = lines.findIndex((line, index) => index > 0 && line.trim() === '---');
+  if (end === -1) throw new ConfigError('profile frontmatter is not closed');
+  const readOnlyIndex = lines.findIndex((line, index) => index > 0 && index < end && /^\s*(read-only|read_only|readOnly)\s*:/i.test(line));
+  if (readOnlyIndex >= 0) lines[readOnlyIndex] = 'read-only: true';
+  else lines.splice(end, 0, 'read-only: true');
+  writeFileSync(filePath, `${lines.join('\n').replace(/\n+$/, '')}\n`, 'utf8');
+}
+
+export function profileDrift(profile, modelRef) {
+  const issues = [];
+  if (!profile?.exists) return [profile?.error || 'profile file is missing'];
+  if (!profile.frontmatter?.exists) return [profile.error || 'profile frontmatter is invalid'];
+  if (modelRef && profile.frontmatter.model !== modelRef) issues.push(`model=${profile.frontmatter.model || '(missing)'} expected ${modelRef}`);
+  if (profile.frontmatter.readOnly !== true) issues.push('read-only: true is missing');
+  return issues;
 }
 
 /** TOML-safe value: forward slashes avoid the `\U` escape trap on Windows paths. */

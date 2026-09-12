@@ -10,13 +10,19 @@ import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   BRIDGE_CONFIG_PATH,
+  BRIDGE_ROOT,
   CODEX_CONFIG_PATH,
   PRESETS_EXAMPLE_PATH,
   PRESETS_PATH,
+  REASONIX_SKILLS_PATH,
   buildCodexBlock,
   checkCliVersion,
+  cliSpawnOptions,
   doctorRefs,
   isFile,
+  profileDrift,
+  ensureProfileReadOnly,
+  readSubagentProfile,
   readBridgeConfig,
   readDoctor,
   readPresets,
@@ -35,6 +41,8 @@ const USAGE = `Usage: node src/configure.mjs <command>
   use <ref|preset>     write modelRef into bridge.config.json (a preset name is accepted)
   presets              list presets from presets.json (copy presets.example.json to create it)
   codex [--write]      print the Codex MCP block; --write upserts it into the Codex config (backup first)
+  profile [--create|--sync] [--write]
+                       inspect a profile or print/run a create/edit command, then verify model + read-only
   verify               check the CLI, the selected model ref, and the subagent profile
 
 Environment overrides: REASONIX_EXE, REASONIX_MODEL_REF, REASONIX_SUBAGENT, REASONIX_ROOT,
@@ -178,6 +186,77 @@ function codexCommand(args) {
   process.stdout.write(`updated ${CODEX_CONFIG_PATH}\n${block}`);
 }
 
+function quoteCommandArg(value) {
+  const text = String(value);
+  return /[\s"']/u.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
+}
+
+function profileCommand(args) {
+  const create = args.includes('--create');
+  const sync = args.includes('--sync');
+  const write = args.includes('--write');
+  if (create && sync) fail('profile accepts only one of --create or --sync');
+  if (write && !create && !sync) fail('profile --write requires --create or --sync');
+  const context = loadContext();
+  const name = context.subagent.name;
+  const profile = readSubagentProfile(name);
+  if (profile.error && !profile.exists && profile.path === '') fail(profile.error);
+  const modelRef = context.resolution.ref;
+  const promptFile = path.join(BRIDGE_ROOT, 'prompts', `${name}-prompt.md`);
+  const defaultTools = ['read_file', 'grep', 'glob', 'ls', 'code_index'];
+  if (sync && profile.frontmatter?.exists && profile.frontmatter.toolsKnown === false) {
+    fail(`cannot sync profile with an unparseable allowed-tools field at ${profile.path}; repair it manually first`);
+  }
+  const tools = profile.frontmatter?.exists && profile.frontmatter.toolsKnown ? profile.frontmatter.tools : defaultTools;
+  const description = profile.frontmatter?.fields?.description || 'Read-only reconnaissance and failure analysis subagent.';
+  const commandArgs = create
+    ? ['subagent', 'create', name, '--description', description, '--scope', 'global', '--model', modelRef || '<provider>/<model>', '--prompt-file', promptFile, '--tools', tools.join(',')]
+    : ['subagent', 'edit', name, '--model', modelRef || '<provider>/<model>', '--prompt-file', promptFile, '--tools', tools.join(',')];
+  const command = `reasonix ${commandArgs.map(quoteCommandArg).join(' ')}`;
+  const issues = profileDrift(profile, modelRef);
+  process.stdout.write(`profile name : ${name}\nprofile path : ${profile.path}\nmodel ref    : ${modelRef || '(unresolved)'}\n`);
+  if (profile.exists && profile.frontmatter?.exists) {
+    process.stdout.write(`profile model: ${profile.frontmatter.model || '(missing)'}\nread-only    : ${profile.frontmatter.readOnly === true ? 'true' : profile.frontmatter.readOnly === false ? 'false' : 'missing'}\n`);
+  }
+  if (!create && !sync) {
+    process.stdout.write(`${issues.length ? `DRIFT       : ${issues.join('; ')}\n` : 'consistency  : OK\n'}`);
+    if (issues.length) process.exit(1);
+    return;
+  }
+  if (!modelRef) fail(`cannot prepare profile command: model ref unresolved (${context.resolution.error ?? 'no source'})`);
+  if (!isFile(promptFile)) fail(`profile prompt file is missing: ${promptFile}`);
+  if (create && profile.exists) fail(`profile already exists at ${profile.path}; use --sync or inspect it first`);
+  if (sync && !profile.exists) fail(`cannot sync missing profile at ${profile.path}; use --create first`);
+  process.stdout.write(`command      : ${command}\n`);
+  if (!write) {
+    process.stdout.write('write        : not requested (add --write to execute the CLI command)\n');
+    return;
+  }
+  if (!context.cliPath) fail(`cannot execute profile command: ${context.cliError}`);
+  const result = spawnSync(context.cliPath, commandArgs, cliSpawnOptions(context.cliPath, {
+    cwd: context.root,
+    env: process.env,
+    encoding: 'utf8',
+    timeout: 30_000,
+    windowsHide: true,
+    maxBuffer: 8 * 1024 * 1024,
+  }));
+  if (result.error) fail(`profile command failed to start: ${result.error.message}`);
+  if (result.status !== 0) fail(`profile command failed with code ${result.status}\n${String(result.stderr ?? '').trim()}`);
+  let updated = readSubagentProfile(name);
+  if (updated.exists && updated.frontmatter?.readOnly !== true) {
+    try {
+      ensureProfileReadOnly(updated.path);
+      updated = readSubagentProfile(name);
+    } catch (error) {
+      fail(`profile command completed but read-only guard could not be written: ${error.message}`);
+    }
+  }
+  const updatedIssues = profileDrift(updated, modelRef);
+  if (updatedIssues.length) fail(`profile command completed but consistency check failed at ${updated.path}: ${updatedIssues.join('; ')}`);
+  process.stdout.write(`verified     : ${updated.path} (model and read-only are consistent)\n`);
+}
+
 function verifyCommand() {
   const context = loadContext();
   const results = [];
@@ -215,13 +294,16 @@ function verifyCommand() {
   }
 
   if (context.cliPath) {
-    const listed = spawnSync(context.cliPath, ['subagent', 'list'], { encoding: 'utf8', timeout: 30_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+    const listed = spawnSync(context.cliPath, ['subagent', 'list'], cliSpawnOptions(context.cliPath, { encoding: 'utf8', timeout: 30_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }));
     const text = `${listed.stdout ?? ''}\n${listed.stderr ?? ''}`;
     const name = context.subagent.name;
     const present = listed.status === 0 && text.split('\n').some((line) => line.trim().split(/\s+/)[0] === name);
-    results.push([present ? 'ok' : 'warn', present
-      ? `subagent profile: ${name} is installed`
-      : `subagent profile: ${name} missing - create it with: reasonix subagent create ${name} --scope global --model "${context.resolution.ref || '<ref>'}" --prompt-file prompts/${name}-prompt.md`]);
+    const profile = readSubagentProfile(name);
+    const issues = context.resolution.ref ? profileDrift(profile, context.resolution.ref) : [];
+    results.push(!present ? ['fail', `subagent profile: ${name} missing - create it with: reasonix subagent create ${name} --scope global --model "${context.resolution.ref || '<ref>'}" --prompt-file prompts/${name}-prompt.md`]
+      : !profile.exists ? ['fail', `subagent profile: ${name} is listed but SKILL.md is missing at ${profile.path || REASONIX_SKILLS_PATH}`]
+        : issues.length ? ['fail', `subagent profile drift: ${issues.join('; ')} (${profile.path})`]
+          : ['ok', `subagent profile: ${name} is installed and consistent (model + read-only)`]);
   }
 
   for (const [state, message] of results) process.stdout.write(`${state === 'ok' ? 'OK  ' : state === 'warn' ? 'WARN' : 'FAIL'} ${message}\n`);
@@ -238,5 +320,6 @@ else if (command === 'show') showCommand();
 else if (command === 'use') useCommand(args[0]);
 else if (command === 'presets') presetsCommand();
 else if (command === 'codex') codexCommand(args);
+else if (command === 'profile') profileCommand(args);
 else if (command === 'verify') verifyCommand();
 else fail(`unknown command "${command}"\n\n${USAGE}`);

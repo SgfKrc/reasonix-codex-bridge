@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,7 @@ import {
   checkCliVersion,
   compareVersions,
   doctorRefs,
+  parseProfileFrontmatter,
   parseVersion,
   resolveModelRef,
   upsertReasonixBlock,
@@ -48,8 +49,26 @@ if (args.includes('--json')) {
 }
 `, 'utf8');
   writeFileSync(path.join(root, 'subagent'), `
-process.stdout.write('deepseek-worker  read-only\\n');
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) {
+  const modelIndex = args.indexOf('--model');
+  const model = modelIndex >= 0 ? args[modelIndex + 1] : (process.env.PROFILE_MODEL || 'fixture/provider');
+  const lines = ['---', 'name: deepseek-worker', 'description: Fixture worker', 'model: ' + model, 'allowed-tools: [read_file, grep, glob, ls, code_index]'];
+  if (process.env.PROFILE_READ_ONLY !== '0') lines.push('read-only: true');
+  lines.push('---', '', '# fixture');
+  fs.writeFileSync(process.env.PROFILE_TARGET, lines.join('\\n'));
+} else {
+  process.stdout.write('deepseek-worker  read-only\\n');
+}
 `, 'utf8');
+}
+
+function writeProfile(root, model = 'fixture/provider', readOnly = true) {
+  const dir = path.join(root, 'skills', 'deepseek-worker');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, 'allowed-tools: [read_file, grep, glob, ls, code_index]', `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
+  return path.join(dir, 'SKILL.md');
 }
 
 function writeVersionStub(root, version) {
@@ -156,6 +175,15 @@ describe('configuration pure functions', () => {
     assert.equal(result.refs[2].keyPresent, false);
   });
 
+  test('parses profile model, read-only and tool frontmatter', () => {
+    const profile = parseProfileFrontmatter('---\nmodel: "fixture/provider"\nread-only: true\nallowed-tools: [read_file, grep]\n---\n');
+    assert.equal(profile.model, 'fixture/provider');
+    assert.equal(profile.readOnly, true);
+    assert.deepEqual(profile.tools, ['read_file', 'grep']);
+    assert.equal(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').fields.description, 'workers #1');
+    assert.deepEqual(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').tools, ['read_file', 'grep']);
+  });
+
   test('upserts bridge blocks at append, first and last boundaries', () => {
     const block = '[mcp_servers.reasonix_local]\ncommand = "node"\n';
     assert.match(upsertReasonixBlock('title = "x"\n', block), /title = "x"[\s\S]*\[mcp_servers\.reasonix_local\]/);
@@ -183,12 +211,76 @@ describe('offline command contracts', () => {
     const root = tempRoot();
     const cli = writeVersionStub(root, '1.38.5');
     writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
-    const failed = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_EXE: cli });
+    writeProfile(root);
+    const failed = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_EXE: cli, REASONIX_SKILLS_DIR: path.join(root, 'skills') });
     assert.equal(failed.status, 1);
     assert.match(failed.stdout, /FAIL reasonix CLI/);
-    const relaxed = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_EXE: cli, REASONIX_MIN_VERSION: '1.0' });
+    const relaxed = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_EXE: cli, REASONIX_MIN_VERSION: '1.0', REASONIX_SKILLS_DIR: path.join(root, 'skills') });
     assert.equal(relaxed.status, 0, relaxed.stderr);
     assert.match(relaxed.stdout, /WARN reasonix CLI/);
+  });
+
+  test('profile preview is read-only and profile --sync --write repairs model drift', () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const profileFile = writeProfile(root, 'old/provider');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
+    const profileEnv = { REASONIX_SKILLS_DIR: path.join(root, 'skills') };
+    const verify = runNode([CONFIGURE_PATH, 'verify'], root, profileEnv);
+    assert.equal(verify.status, 1);
+    assert.match(verify.stdout, /subagent profile drift/);
+    const preview = runNode([CONFIGURE_PATH, 'profile', '--sync'], root, profileEnv);
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.match(preview.stdout, /write        : not requested/);
+    assert.match(readFileSync(profileFile, 'utf8'), /old\/provider/);
+    const synced = runNode([CONFIGURE_PATH, 'profile', '--sync', '--write'], root, {
+      ...profileEnv,
+      PROFILE_TARGET: profileFile,
+      PROFILE_MODEL: 'fixture/provider',
+    });
+    assert.equal(synced.status, 0, synced.stderr);
+    assert.match(synced.stdout, /verified/);
+    assert.match(readFileSync(profileFile, 'utf8'), /model: fixture\/provider/);
+    const after = runNode([CONFIGURE_PATH, 'verify'], root, profileEnv);
+    assert.equal(after.status, 0, after.stderr);
+    assert.match(after.stdout, /installed and consistent/);
+  });
+
+  test('profile --create --write adds the read-only guard after CLI creation', () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const skillDir = path.join(root, 'skills', 'deepseek-worker');
+    mkdirSync(skillDir, { recursive: true });
+    const profileFile = path.join(skillDir, 'SKILL.md');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
+    const result = runNode([CONFIGURE_PATH, 'profile', '--create', '--write'], root, {
+      REASONIX_SKILLS_DIR: path.join(root, 'skills'),
+      PROFILE_TARGET: profileFile,
+      PROFILE_READ_ONLY: '0',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /verified/);
+    assert.match(readFileSync(profileFile, 'utf8'), /read-only: true/);
+  });
+
+  test('verify fails closed when the listed profile has no SKILL.md', () => {
+    const root = tempRoot();
+    writeVersionStub(root, '1.38.7');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
+    const result = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_EXE: path.join(root, 'reasonix-stub.cmd'), REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /FAIL subagent profile: deepseek-worker/);
+    assert.match(result.stdout, /SKILL\.md is missing/);
+  });
+
+  test('invalid profile names fail with a concise diagnostic', () => {
+    const root = tempRoot();
+    writeVersionStub(root, '1.38.7');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', subagent: '../escape' }), 'utf8');
+    const result = runNode([CONFIGURE_PATH, 'profile'], root, { REASONIX_EXE: path.join(root, 'reasonix-stub.cmd'), REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /invalid subagent profile name/);
+    assert.doesNotMatch(result.stderr, /at .*configure\.mjs/);
   });
 
   test('MCP session exposes tools and a structured version status without a model call', async () => {
