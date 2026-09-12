@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -136,6 +136,33 @@ async function readMcpSession(child, requests) {
   for (const item of requests) responses.push(await request(item.id, item.method, item.params));
   child.stdin.end();
   return responses;
+}
+
+function mcpClient(child) {
+  let buffer = '';
+  const pending = new Map();
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      const message = JSON.parse(line);
+      const waiter = pending.get(message.id);
+      if (waiter) { pending.delete(message.id); waiter(message); }
+    }
+  });
+  return {
+    request(id, method, params = {}) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { pending.delete(id); reject(new Error(`MCP request ${id} timed out`)); }, 5000);
+        pending.set(id, (message) => { clearTimeout(timer); resolve(message); });
+        child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      });
+    },
+  };
 }
 
 after(() => {
@@ -549,6 +576,62 @@ test('invalid bridge limits fall back or clamp with one warning each', async () 
   for (const key of ['MAX_STEPS_CAP', 'TIMEOUT_SECONDS_CAP', 'OUTPUT_CHAR_CAP', 'queueCap']) {
     assert.equal((stderr.match(new RegExp(`bridge config ${key}`, 'g')) ?? []).length, 1);
   }
+});
+
+test('status reports in-flight depth and a redacted last run while queue-full calls are bounded', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({
+    modelRef: 'fixture/provider',
+    limits: { queueCap: 1 },
+  }), 'utf8');
+  const startedPath = path.join(root, 'worker-started');
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.STARTED, 'started');
+setTimeout(() => process.stdout.write('slow-result'), 500);
+`, 'utf8');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { STARTED: startedPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const client = mcpClient(child);
+  const first = client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'first-secret-task', cwd: '.', timeout_seconds: 5 } });
+  await new Promise((resolve, reject) => {
+    const deadline = Date.now() + 3000;
+    const poll = () => {
+      if (existsSync(startedPath)) resolve();
+      else if (Date.now() >= deadline) reject(new Error('worker did not start'));
+      else setTimeout(poll, 10);
+    };
+    poll();
+  });
+  const during = await client.request(2, 'tools/call', { name: 'reasonix_status', arguments: {} });
+  const duringStatus = JSON.parse(during.result.content[0].text);
+  assert.equal(duringStatus.queueDepth, 1);
+  assert.equal(duringStatus.inFlight, 1);
+  assert.equal(duringStatus.lastRun, null);
+  const rejected = await client.request(3, 'tools/call', { name: 'reasonix_run', arguments: { task: 'second-secret-task', cwd: '.' } });
+  assert.equal(rejected.result.isError, true);
+  assert.match(rejected.result.content[0].text, /depth=1/);
+  assert.match(rejected.result.content[0].text, /cap=1/);
+  assert.match(rejected.result.content[0].text, /retry after about/);
+  const completed = await first;
+  assert.equal(completed.result.isError, false);
+  const after = await client.request(4, 'tools/call', { name: 'reasonix_status', arguments: {} });
+  const afterStatus = JSON.parse(after.result.content[0].text);
+  assert.equal(afterStatus.queueDepth, 0);
+  assert.equal(afterStatus.inFlight, 0);
+  assert.equal(afterStatus.lastRun.outcome, 'success');
+  assert.equal(afterStatus.lastRun.exitCode, 0);
+  assert.equal(afterStatus.lastRun.cwdRoot, 'workspace');
+  assert.doesNotMatch(JSON.stringify(afterStatus.lastRun), /first-secret-task|second-secret-task/);
+  assert.doesNotMatch(JSON.stringify(afterStatus.lastRun), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  child.stdin.end();
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
 });
 
 test('low-version CLI is refused before the bridge starts', () => {

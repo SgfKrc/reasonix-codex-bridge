@@ -137,9 +137,9 @@ function cwdRootLabel(cwd) {
   return index === 0 ? 'workspace' : index > 0 ? `allowed-${index}` : 'unknown';
 }
 let logFailureReported = false;
-function writeCallLog(entry) {
-  if (!BRIDGE_LOG_PATH) return;
-  const record = {
+let lastRun = null;
+function runSummary(entry) {
+  return {
     timestamp: new Date().toISOString(),
     mode: entry.mode,
     cwdRoot: entry.cwdRoot,
@@ -151,12 +151,20 @@ function writeCallLog(entry) {
     outputBytes: Number.isFinite(entry.outputBytes) ? entry.outputBytes : 0,
     truncated: entry.truncated === true,
   };
+}
+function writeCallLog(record) {
+  if (!BRIDGE_LOG_PATH) return;
   try { appendFileSync(BRIDGE_LOG_PATH, `${JSON.stringify(record)}\n`, 'utf8'); } catch (error) {
     if (!logFailureReported) {
       logFailureReported = true;
       log(`call log disabled after write failure: ${error.message}`);
     }
   }
+}
+function recordRun(entry) {
+  const summary = runSummary(entry);
+  lastRun = summary;
+  writeCallLog(summary);
 }
 function terminate(child) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
@@ -175,7 +183,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode })
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      writeCallLog({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
+      recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
       resolve({ ...result, meta: { outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
     };
     const timer = setTimeout(async () => {
@@ -194,23 +202,31 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode })
     });
   });
 }
-let queue = Promise.resolve(); let queueDepth = 0;
+let queue = Promise.resolve(); let queueDepth = 0; let inFlight = 0;
+function retryHint() {
+  const seconds = lastRun?.elapsedMs > 0 ? Math.max(1, Math.ceil(lastRun.elapsedMs / 1000)) : 1;
+  return `retry after about ${seconds}s`;
+}
 function enqueue(job, meta) {
   if (queueDepth >= LIMITS.queueCap) {
-    writeCallLog({ ...meta, outcome: 'queue_rejected', elapsedMs: 0, outputBytes: 0, truncated: false });
-    return Promise.resolve({ isError: true, text: 'too many queued requests; retry later', meta: { outcome: 'queue_rejected', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } });
+    recordRun({ ...meta, outcome: 'queue_rejected', elapsedMs: 0, outputBytes: 0, truncated: false });
+    return Promise.resolve({ isError: true, text: `too many queued requests (depth=${queueDepth}, cap=${LIMITS.queueCap}); ${retryHint()}`, meta: { outcome: 'queue_rejected', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } });
   }
   queueDepth += 1;
-  const run = queue.then(job, job);
+  const execute = async () => {
+    inFlight += 1;
+    try { return await job(); } finally { inFlight -= 1; }
+  };
+  const run = queue.then(execute, execute);
   queue = run.then(() => undefined, () => undefined);
   return run.finally(() => { queueDepth -= 1; });
 }
 async function callTool(name, args) {
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
-  const logRejected = (error) => writeCallLog({ mode: ['inspect', 'review', 'implement'].includes(mode) ? mode : 'invalid', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false, error });
+  const logRejected = (error) => recordRun({ mode: ['inspect', 'review', 'implement'].includes(mode) ? mode : 'invalid', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false, error });
   const task = typeof args?.task === 'string' ? args.task.trim() : '';
   if (!task) { logRejected('task_required'); throw new Error('task is required'); }
   if (task.length > TASK_CHAR_CAP) { logRejected('task_too_long'); throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`); }
@@ -232,6 +248,6 @@ async function handleMessage(message) {
   try { send({ jsonrpc: '2.0', id, result: await handler(params) }); } catch (error) { const text = error instanceof Error ? error.message : String(error); if (method === 'tools/call') send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: true } }); else send({ jsonrpc: '2.0', id, error: { code: -32603, message: text } }); }
 }
 log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} model=${MODEL_REF} source=${MODEL_REF_SOURCE} readOnly=true`);
-const reader = createInterface({ input: process.stdin, terminal: false }); const inFlight = new Set();
-reader.on('line', (line) => { if (!line.trim()) return; let message; try { message = JSON.parse(line); } catch { log(`ignored invalid JSON input: ${line.slice(0, 200)}`); return; } const task = handleMessage(message).catch((error) => log(`message failed: ${error?.message ?? error}`)); inFlight.add(task); void task.finally(() => inFlight.delete(task)); });
-reader.on('close', () => { void Promise.allSettled([...inFlight]).then(() => process.exit(0)); });
+const reader = createInterface({ input: process.stdin, terminal: false }); const pendingMessages = new Set();
+reader.on('line', (line) => { if (!line.trim()) return; let message; try { message = JSON.parse(line); } catch { log(`ignored invalid JSON input: ${line.slice(0, 200)}`); return; } const task = handleMessage(message).catch((error) => log(`message failed: ${error?.message ?? error}`)); pendingMessages.add(task); void task.finally(() => pendingMessages.delete(task)); });
+reader.on('close', () => { void Promise.allSettled([...pendingMessages]).then(() => process.exit(0)); });

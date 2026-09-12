@@ -108,6 +108,11 @@ Each value must be a positive integer. Invalid values fall back to the defaults 
 warning; values above the code hard caps are clamped with one warning. `reasonix_status.limits`
 always reports the effective values used for calls.
 
+`reasonix_status` also reports the live `queueDepth` (accepted calls not yet completed), numeric
+`inFlight` count, and a redacted `lastRun` summary. A full queue error includes the current depth,
+configured capacity, and a retry-after hint. The summary never contains task text, worker output,
+model references, or absolute paths.
+
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
 stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
