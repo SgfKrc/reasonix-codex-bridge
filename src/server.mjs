@@ -9,6 +9,8 @@ import {
   checkCliVersion,
   cliSpawnOptions,
   readBridgeConfig,
+  doctorRefs,
+  readDoctor,
   resolveCliPath,
   resolveModelRef,
   resolveSubagent,
@@ -108,6 +110,26 @@ if (MODEL_REF_PROBLEM) {
 }
 const SUBAGENT_NAME = SUBAGENT.name;
 const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
+const MODEL_CAPABILITIES = resolveModelCapabilities();
+
+function resolveModelCapabilities() {
+  const doctor = MODEL_RESOLUTION.doctor?.ok
+    ? MODEL_RESOLUTION.doctor
+    : readDoctor(CLI_PATH, 30_000, { writeCache: false });
+  if (!doctor?.ok) return { available: false, provider: null, model: null, contextWindow: null, vision: null, base_url_host: null, error: doctor?.error || 'reasonix doctor unavailable' };
+  const selected = doctorRefs(doctor.data).refs.find((item) => item.ref === MODEL_REF);
+  if (!selected) return { available: false, provider: null, model: null, contextWindow: null, vision: null, base_url_host: null, error: 'selected model is not reported by reasonix doctor' };
+  const host = selected.baseHost && /^[A-Za-z0-9.:[\]-]+$/u.test(selected.baseHost) ? selected.baseHost : null;
+  return {
+    available: true,
+    provider: selected.provider,
+    model: selected.model,
+    contextWindow: selected.contextWindow,
+    vision: selected.vision,
+    base_url_host: host,
+    error: null,
+  };
+}
 
 function allowedRoots() {
   const extra = (process.env.REASONIX_ADD_DIRS ?? '').split(path.delimiter).map((x) => x.trim()).filter(Boolean);
@@ -202,6 +224,9 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode })
     });
   });
 }
+function estimateTaskTokens(task) {
+  return Math.max(1, Math.ceil(Buffer.byteLength(task, 'utf8') / 4));
+}
 let queue = Promise.resolve(); let queueDepth = 0; let inFlight = 0;
 function retryHint() {
   const seconds = lastRun?.elapsedMs > 0 ? Math.max(1, Math.ceil(lastRun.elapsedMs / 1000)) : 1;
@@ -222,7 +247,7 @@ function enqueue(job, meta) {
   return run.finally(() => { queueDepth -= 1; });
 }
 async function callTool(name, args) {
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
@@ -231,6 +256,13 @@ async function callTool(name, args) {
   if (!task) { logRejected('task_required'); throw new Error('task is required'); }
   if (task.length > TASK_CHAR_CAP) { logRejected('task_too_long'); throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`); }
   if (mode === 'implement') { logRejected('implement_disabled'); return { isError: true, text: 'mode=implement is disabled; Codex applies all changes.' }; }
+  if (MODEL_CAPABILITIES.contextWindow !== null) {
+    const estimatedTokens = estimateTaskTokens(task);
+    if (estimatedTokens > MODEL_CAPABILITIES.contextWindow) {
+      logRejected('context_window_exceeded');
+      throw new Error(`task exceeds model context window (estimated ${estimatedTokens} tokens; limit ${MODEL_CAPABILITIES.contextWindow} tokens)`);
+    }
+  }
   const preset = MODES[mode];
   if (!preset) { logRejected('mode_invalid'); throw new Error('mode must be inspect or review'); }
   let cwd;

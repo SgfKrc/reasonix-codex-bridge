@@ -113,6 +113,12 @@ always reports the effective values used for calls.
 configured capacity, and a retry-after hint. The summary never contains task text, worker output,
 model references, or absolute paths.
 
+The status also exposes the selected provider/model capabilities reported by `reasonix doctor`:
+`contextWindow`, `vision`, and the provider's redacted `base_url_host`. Before spawning a worker,
+the bridge estimates task tokens from UTF-8 bytes and rejects a task whose estimate exceeds the
+reported context window, with the concrete estimate and limit in the error. Capability discovery
+is read-only and does not write the doctor cache during bridge startup.
+
 `reasonix_run` also accepts read-only `mode=plan`. In this mode the bridge returns worker stdout
 unchanged so callers can consume a machine-readable change list, for example:
 

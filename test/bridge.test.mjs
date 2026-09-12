@@ -53,11 +53,11 @@ function envFor(root, overrides = {}) {
   };
 }
 
-function writeCliFiles(root, { version = '1.38.7' } = {}) {
+function writeCliFiles(root, { version = '1.38.7', contextWindow = 4096, vision = true } = {}) {
   writeFileSync(path.join(root, 'doctor'), `
 const args = process.argv.slice(2);
 if (args.includes('--json')) {
-  process.stdout.write(JSON.stringify({ version: ${JSON.stringify(version)}, config: { default_model: 'fixture/provider' }, providers: [{ name: 'fixture', models: ['provider'], key_present: true, base_url_host: 'fixture.invalid' }] }));
+  process.stdout.write(JSON.stringify({ version: ${JSON.stringify(version)}, config: { default_model: 'fixture/provider' }, providers: [{ name: 'fixture', models: ['provider'], key_present: true, base_url_host: 'fixture.invalid', context_window: ${contextWindow}, vision: ${vision} }] }));
 }
 `, 'utf8');
   writeFileSync(path.join(root, 'subagent'), `
@@ -205,12 +205,15 @@ describe('configuration pure functions', () => {
     const result = doctorRefs({
       config: { default_model: 'alpha/one' },
       providers: [
-        { name: 'alpha', models: ['one', 'two'], key_present: true, base_url_host: 'alpha.invalid', context_window: 8192 },
+        { name: 'alpha', models: ['one', 'two'], key_present: true, base_url_host: 'alpha.invalid', context_window: 8192, vision: true },
         { name: 'beta', model: 'solo', key_present: false },
       ],
     });
     assert.deepEqual(result.refs.map((item) => item.ref), ['alpha/one', 'alpha/two', 'beta/solo']);
     assert.equal(result.refs[0].isReasonixDefault, true);
+    assert.equal(result.refs[0].baseHost, 'alpha.invalid');
+    assert.equal(result.refs[0].contextWindow, 8192);
+    assert.equal(result.refs[0].vision, true);
     assert.equal(result.refs[2].keyPresent, false);
   });
 
@@ -473,7 +476,40 @@ describe('offline command contracts', () => {
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
     assert.equal(status.historyHardCapBytes, 128 * 1024 * 1024);
+    assert.equal(status.contextWindow, 4096);
+    assert.equal(status.vision, true);
+    assert.equal(status.base_url_host, 'fixture.invalid');
+    assert.deepEqual(status.providerCapabilities, {
+      available: true,
+      provider: 'fixture',
+      model: 'provider',
+      contextWindow: 4096,
+      vision: true,
+      base_url_host: 'fixture.invalid',
+      error: null,
+    });
     assert.equal(readdirSync(root).some((name) => name.endsWith('.jsonl')), false);
+  });
+
+  test('rejects a task over the reported context window before spawning the worker', async () => {
+    const root = tempRoot();
+    writeCliFiles(root, { contextWindow: 4 });
+    const marker = path.join(root, 'worker-called');
+    writeFileSync(path.join(root, 'subagent'), `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'called');`, 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      cwd: root,
+      env: envFor(root),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const responses = await readMcpSession(child, [
+      { id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'x'.repeat(100), mode: 'inspect' } } },
+    ]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, true);
+    assert.match(responses[0].result.content[0].text, /estimated \d+ tokens; limit 4 tokens/);
+    assert.equal(existsSync(marker), false);
   });
 });
 
