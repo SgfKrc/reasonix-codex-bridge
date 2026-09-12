@@ -7,6 +7,7 @@ Zero-dependency stdio MCP server for Codex. It exposes a narrow `reasonix_run` t
 - Node.js 20 or newer.
 - Reasonix 1.38.6 or newer, using the post-rewrite `reasonix subagent run` interface.
 - Lower Reasonix versions are intentionally unsupported.
+- The CLI path is resolved at startup and never hard-coded: `REASONIX_EXE` wins when set, otherwise the bridge probes `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`, the newest `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`, `/usr/local/bin|/usr/bin/reasonix-cli`, then `reasonix-cli(.exe)` on `PATH`. If nothing is found (or `REASONIX_EXE` points to a missing file) the server logs the reason and exits with code 2.
 
 ## Configure Codex
 
@@ -37,6 +38,6 @@ reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_inde
 
 ## Environment variables
 
-`REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable. The model reference is hard-locked to `example-inventory-name/deepseek-flash`; changing it makes the server exit with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter.
+`REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. The model reference is hard-locked to `example-inventory-name/deepseek-flash`; changing it makes the server exit with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter.
 
 The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots, rejects `implement`, limits task/budget/output sizes, and terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's hard 128 MB history limit. A persistent ACP transport is a later extension; it must compact or rotate the session before 128 MB and never treat that limit as configurable.

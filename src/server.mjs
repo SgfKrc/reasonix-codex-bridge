@@ -1,12 +1,12 @@
 /** Local stdio MCP facade for the read-only Reasonix DeepSeek worker. */
 import { spawn } from 'node:child_process';
-import { existsSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 
 const SERVER_NAME = 'reasonix-local-bridge';
 const REQUIRED_MODEL_REF = 'example-inventory-name/deepseek-flash';
-const CLI_PATH = process.env.REASONIX_EXE ?? 'L:\\Reasonix\\versions\\v1.38.7\\reasonix-cli.exe';
+const CLI_PATH = resolveCliPath();
 const WORKSPACE_ROOT = path.resolve(process.env.REASONIX_ROOT ?? process.cwd());
 const SUBAGENT_NAME = process.env.REASONIX_SUBAGENT ?? 'deepseek-worker';
 const MODEL_REF = process.env.REASONIX_MODEL_REF ?? REQUIRED_MODEL_REF;
@@ -23,6 +23,56 @@ const TOOLS = [
 ];
 
 function log(message) { process.stderr.write(`[${SERVER_NAME}] ${message}\n`); }
+/** Explicit REASONIX_EXE wins; otherwise probe standard install locations and PATH. No machine path is hard-coded. */
+function resolveCliPath() {
+  const configured = (process.env.REASONIX_EXE ?? '').trim();
+  if (configured) {
+    const explicit = path.resolve(configured);
+    if (isFile(explicit)) return explicit;
+    log(`refusing to start: REASONIX_EXE is set but is not a readable file: ${explicit}`);
+    process.exit(2);
+  }
+  const candidates = cliCandidates();
+  for (const candidate of candidates) if (isFile(candidate)) return candidate;
+  log(`refusing to start: reasonix CLI not found and REASONIX_EXE is unset (probed ${candidates.length} standard location(s))`);
+  process.exit(2);
+}
+function isFile(candidate) {
+  try { return statSync(candidate).isFile(); } catch { return false; }
+}
+function cliCandidates() {
+  if (process.platform !== 'win32') {
+    return ['/usr/local/bin/reasonix-cli', '/usr/bin/reasonix-cli', '/opt/reasonix/reasonix-cli', ...pathCandidates(['reasonix-cli'])];
+  }
+  const programs = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Reasonix') : '';
+  const candidates = [];
+  if (programs) {
+    candidates.push(path.join(programs, 'reasonix-cli.exe'));
+    const versionsRoot = path.join(programs, 'versions');
+    let entries = [];
+    try { entries = readdirSync(versionsRoot, { withFileTypes: true }); } catch { entries = []; }
+    const versions = entries
+      .filter((entry) => entry.isDirectory() && /^v?\d+(?:\.\d+)*$/.test(entry.name))
+      .map((entry) => entry.name)
+      .sort(compareVersions)
+      .reverse();
+    for (const version of versions) candidates.push(path.join(versionsRoot, version, 'reasonix-cli.exe'));
+  }
+  return [...candidates, ...pathCandidates(['reasonix-cli.exe'])];
+}
+function pathCandidates(names) {
+  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  return dirs.flatMap((dir) => names.map((name) => path.join(dir, name)));
+}
+function compareVersions(left, right) {
+  const a = left.replace(/^v/i, '').split('.').map(Number);
+  const b = right.replace(/^v/i, '').split('.').map(Number);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] ?? 0) - (b[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
 function allowedRoots() {
   const extra = (process.env.REASONIX_ADD_DIRS ?? '').split(path.delimiter).map((x) => x.trim()).filter(Boolean);
   return [WORKSPACE_ROOT, ...extra].map((entry) => { const absolute = path.resolve(entry); try { return realpathSync.native(absolute); } catch { return absolute; } });
@@ -90,7 +140,7 @@ async function handleMessage(message) {
   try { send({ jsonrpc: '2.0', id, result: await handler(params) }); } catch (error) { const text = error instanceof Error ? error.message : String(error); if (method === 'tools/call') send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: true } }); else send({ jsonrpc: '2.0', id, error: { code: -32603, message: text } }); }
 }
 if (MODEL_REF !== REQUIRED_MODEL_REF) { log(`refusing to start: REASONIX_MODEL_REF must equal ${REQUIRED_MODEL_REF}`); process.exit(2); }
-if (!existsSync(CLI_PATH)) log(`warning: reasonix CLI not found: ${CLI_PATH}`); log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} model=${MODEL_REF} readOnly=true`);
+log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} model=${MODEL_REF} readOnly=true`);
 const reader = createInterface({ input: process.stdin, terminal: false }); const inFlight = new Set();
 reader.on('line', (line) => { if (!line.trim()) return; let message; try { message = JSON.parse(line); } catch { log(`ignored invalid JSON input: ${line.slice(0, 200)}`); return; } const task = handleMessage(message).catch((error) => log(`message failed: ${error?.message ?? error}`)); inFlight.add(task); void task.finally(() => inFlight.delete(task)); });
 reader.on('close', () => { void Promise.allSettled([...inFlight]).then(() => process.exit(0)); });
