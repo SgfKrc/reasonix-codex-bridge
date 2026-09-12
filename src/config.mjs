@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 export const SERVER_NAME = 'reasonix-local-bridge';
 export const DEFAULT_SUBAGENT = 'deepseek-worker';
 export const DEFAULT_MIN_REASONIX_VERSION = '1.38.6';
+export const READ_ONLY_PROFILE_TOOLS = Object.freeze(['read_file', 'grep', 'glob', 'ls', 'code_index', 'git_log', 'git_diff']);
 export const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
 
@@ -454,12 +455,18 @@ export function ensureProfileReadOnly(filePath) {
   writeFileSync(filePath, `${lines.join('\n').replace(/\n+$/, '')}\n`, 'utf8');
 }
 
-export function profileDrift(profile, modelRef) {
+export function profileDrift(profile, modelRef, expectedTools = READ_ONLY_PROFILE_TOOLS) {
   const issues = [];
   if (!profile?.exists) return [profile?.error || 'profile file is missing'];
   if (!profile.frontmatter?.exists) return [profile.error || 'profile frontmatter is invalid'];
   if (modelRef && profile.frontmatter.model !== modelRef) issues.push(`model=${profile.frontmatter.model || '(missing)'} expected ${modelRef}`);
   if (profile.frontmatter.readOnly !== true) issues.push('read-only: true is missing');
+  if (profile.frontmatter.toolsKnown !== true) issues.push('allowed-tools is missing or unparseable');
+  else {
+    const actual = [...new Set(profile.frontmatter.tools)].sort();
+    const expected = [...new Set(expectedTools)].sort();
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) issues.push(`allowed-tools=${actual.join(',') || '(none)'} expected ${expected.join(',')}`);
+  }
   return issues;
 }
 
