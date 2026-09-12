@@ -1,6 +1,6 @@
 /** Local stdio MCP facade for the read-only Reasonix worker. */
 import { spawn } from 'node:child_process';
-import { existsSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import {
@@ -29,6 +29,7 @@ const TASK_CHAR_CAP = 8000;
 const OUTPUT_CHAR_CAP = 24000;
 const HISTORY_HARD_CAP_BYTES = 128 * 1024 * 1024;
 const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSteps: 16, timeoutSeconds: 240 } };
+const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
   { name: 'reasonix_run', description: 'Run the read-only DeepSeek worker in Reasonix for inspection, review and failure analysis.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
@@ -100,42 +101,97 @@ function clampInteger(value, fallback, cap) {
   return Math.min(cap, Math.max(1, Math.trunc(parsed)));
 }
 function truncate(value, cap) { return value.length <= cap ? value : `${value.slice(0, cap)}\n\n[output truncated; original ${value.length} chars]`; }
+function cwdRootLabel(cwd) {
+  const roots = allowedRoots();
+  const index = roots.findIndex((root) => isInside(root, cwd));
+  return index === 0 ? 'workspace' : index > 0 ? `allowed-${index}` : 'unknown';
+}
+let logFailureReported = false;
+function writeCallLog(entry) {
+  if (!BRIDGE_LOG_PATH) return;
+  const record = {
+    timestamp: new Date().toISOString(),
+    mode: entry.mode,
+    cwdRoot: entry.cwdRoot,
+    maxSteps: entry.maxSteps,
+    timeoutSeconds: entry.timeoutSeconds,
+    outcome: entry.outcome,
+    exitCode: entry.exitCode ?? null,
+    elapsedMs: Number.isFinite(entry.elapsedMs) ? entry.elapsedMs : 0,
+    outputBytes: Number.isFinite(entry.outputBytes) ? entry.outputBytes : 0,
+    truncated: entry.truncated === true,
+  };
+  try { appendFileSync(BRIDGE_LOG_PATH, `${JSON.stringify(record)}\n`, 'utf8'); } catch (error) {
+    if (!logFailureReported) {
+      logFailureReported = true;
+      log(`call log disabled after write failure: ${error.message}`);
+    }
+  }
+}
 function terminate(child) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   if (process.platform === 'win32' && child.pid) return new Promise((resolve) => { const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }); killer.once('close', resolve); killer.once('error', () => { child.kill('SIGKILL'); resolve(); }); });
   child.kill('SIGKILL');
   return Promise.resolve();
 }
-function runWorker({ cwd, maxSteps, timeoutSeconds, task }) {
+function runWorker({ cwd, maxSteps, timeoutSeconds, task, mode }) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
     const child = spawn(CLI_PATH, args, cliSpawnOptions(CLI_PATH, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }));
-    let stdout = ''; let stderr = ''; let settled = false;
+    let stdout = ''; let stderr = ''; let settled = false; let truncatedOutput = false;
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    const timer = setTimeout(async () => { if (settled) return; settled = true; await terminate(child); resolve({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}` }); }, timeoutSeconds * 1000);
-    child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > OUTPUT_CHAR_CAP * 2) void terminate(child); });
-    child.stderr.on('data', (chunk) => { stderr += chunk; if (stderr.length > OUTPUT_CHAR_CAP) void terminate(child); });
-    child.on('error', (error) => { if (settled) return; settled = true; clearTimeout(timer); resolve({ isError: true, text: `cannot start reasonix CLI: ${error.message}` }); });
+    const finish = (result, outcome, exitCode = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      writeCallLog({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > OUTPUT_CHAR_CAP });
+      resolve({ ...result, meta: { outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > OUTPUT_CHAR_CAP } });
+    };
+    const timer = setTimeout(async () => {
+      if (settled) return;
+      await terminate(child);
+      finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}` }, 'timeout');
+    }, timeoutSeconds * 1000);
+    child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > OUTPUT_CHAR_CAP * 2) { truncatedOutput = true; void terminate(child); } });
+    child.stderr.on('data', (chunk) => { stderr += chunk; if (stderr.length > OUTPUT_CHAR_CAP) { truncatedOutput = true; void terminate(child); } });
+    child.on('error', (error) => finish({ isError: true, text: `cannot start reasonix CLI: ${error.message}` }, 'spawn_error'));
     child.on('close', (code) => {
-      if (settled) return; settled = true; clearTimeout(timer);
+      if (settled) return;
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(stdout.trim(), OUTPUT_CHAR_CAP);
-      if (code !== 0) resolve({ isError: true, text: `worker exited with code ${code} (${elapsed}s)${body ? `\n\n--- stdout ---\n${body}` : ''}${stderr ? `\n\n--- stderr ---\n${truncate(stderr, 2000)}` : ''}` });
-      else resolve({ isError: false, text: `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` });
+      if (code !== 0) finish({ isError: true, text: `worker exited with code ${code} (${elapsed}s)${body ? `\n\n--- stdout ---\n${body}` : ''}${stderr ? `\n\n--- stderr ---\n${truncate(stderr, 2000)}` : ''}` }, 'worker_exit', code);
+      else finish({ isError: false, text: `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
   });
 }
 let queue = Promise.resolve(); let queueDepth = 0;
-function enqueue(job) { if (queueDepth >= 5) return Promise.resolve({ isError: true, text: 'too many queued requests; retry later' }); queueDepth += 1; const run = queue.then(job, job); queue = run.then(() => undefined, () => undefined); return run.finally(() => { queueDepth -= 1; }); }
+function enqueue(job, meta) {
+  if (queueDepth >= 5) {
+    writeCallLog({ ...meta, outcome: 'queue_rejected', elapsedMs: 0, outputBytes: 0, truncated: false });
+    return Promise.resolve({ isError: true, text: 'too many queued requests; retry later', meta: { outcome: 'queue_rejected', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } });
+  }
+  queueDepth += 1;
+  const run = queue.then(job, job);
+  queue = run.then(() => undefined, () => undefined);
+  return run.finally(() => { queueDepth -= 1; });
+}
 async function callTool(name, args) {
   if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), limits: { maxStepsCap: MAX_STEPS_CAP, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: TIMEOUT_SECONDS_CAP, queueCap: 5 } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
+  const startedAt = Date.now();
+  const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
+  const logRejected = (error) => writeCallLog({ mode: ['inspect', 'review', 'implement'].includes(mode) ? mode : 'invalid', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false, error });
   const task = typeof args?.task === 'string' ? args.task.trim() : '';
-  if (!task) throw new Error('task is required'); if (task.length > TASK_CHAR_CAP) throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`);
-  const mode = args?.mode === undefined ? 'inspect' : String(args.mode); if (mode === 'implement') return { isError: true, text: 'mode=implement is disabled; Codex applies all changes.' };
-  const preset = MODES[mode]; if (!preset) throw new Error('mode must be inspect or review');
-  const cwd = resolveCwd(args?.cwd); const maxSteps = clampInteger(args?.max_steps, preset.maxSteps, MAX_STEPS_CAP); const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, TIMEOUT_SECONDS_CAP);
-  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => runWorker({ cwd, maxSteps, timeoutSeconds, task }));
+  if (!task) { logRejected('task_required'); throw new Error('task is required'); }
+  if (task.length > TASK_CHAR_CAP) { logRejected('task_too_long'); throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`); }
+  if (mode === 'implement') { logRejected('implement_disabled'); return { isError: true, text: 'mode=implement is disabled; Codex applies all changes.' }; }
+  const preset = MODES[mode];
+  if (!preset) { logRejected('mode_invalid'); throw new Error('mode must be inspect or review'); }
+  let cwd;
+  try { cwd = resolveCwd(args?.cwd); } catch (error) { logRejected('cwd_invalid'); throw error; }
+  const maxSteps = clampInteger(args?.max_steps, preset.maxSteps, MAX_STEPS_CAP); const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, TIMEOUT_SECONDS_CAP);
+  const meta = { mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
+  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => runWorker({ cwd, maxSteps, timeoutSeconds, task, mode }), meta);
 }
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 const handlers = { initialize: () => ({ capabilities: { tools: {} }, protocolVersion: '2024-11-05', serverInfo: { name: SERVER_NAME, version: '1.0.0' } }), ping: () => ({}), 'tools/list': () => ({ tools: TOOLS }), 'tools/call': async (params) => { const result = await callTool(params?.name, params?.arguments ?? {}); return { content: [{ type: 'text', text: result.text }], isError: result.isError }; } };

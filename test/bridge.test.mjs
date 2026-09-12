@@ -425,7 +425,7 @@ describe('offline command contracts', () => {
   test('MCP session exposes tools and a structured version status without a model call', async () => {
     const root = tempRoot();
     writeCliFiles(root);
-    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { BRIDGE_LOG: '' }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const responses = await readMcpSession(child, [
       { id: 1, method: 'initialize' },
       { id: 2, method: 'tools/list' },
@@ -439,7 +439,57 @@ describe('offline command contracts', () => {
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
     assert.equal(status.historyHardCapBytes, 128 * 1024 * 1024);
+    assert.equal(readdirSync(root).some((name) => name.endsWith('.jsonl')), false);
   });
+});
+
+test('BRIDGE_LOG records redacted run metadata and stays optional', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  writeFileSync(path.join(root, 'subagent'), `
+const args = process.argv.slice(2);
+if (args[0] === 'run' && args.includes('--max-steps') && args[args.indexOf('--max-steps') + 1] === '3') {
+  process.stderr.write('stderr-secret');
+  process.exit(7);
+}
+process.stdout.write('worker-visible-output');
+`, 'utf8');
+  const logPath = path.join(root, 'calls.jsonl');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { BRIDGE_LOG: logPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const responses = await readMcpSession(child, [
+    { id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'task-secret-success', cwd: '.', mode: 'inspect', max_steps: 2, timeout_seconds: 2 } } },
+    { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'task-secret-rejected', mode: 'implement' } } },
+    { id: 3, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'task-secret-failure', cwd: '.', mode: 'inspect', max_steps: 3, timeout_seconds: 2 } } },
+  ]);
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
+  assert.equal(responses[0].result.isError, false);
+  assert.equal(responses[1].result.isError, true);
+  assert.equal(responses[2].result.isError, true);
+  const records = readFileSync(logPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(records.length, 3);
+  assert.equal(records[0].mode, 'inspect');
+  assert.equal(records[0].cwdRoot, 'workspace');
+  assert.equal(records[0].maxSteps, 2);
+  assert.equal(records[0].timeoutSeconds, 2);
+  assert.equal(records[0].outcome, 'success');
+  assert.equal(records[0].exitCode, 0);
+  assert.ok(records[0].elapsedMs >= 0);
+  assert.ok(records[0].outputBytes > 0);
+  assert.equal(records[0].truncated, false);
+  assert.equal(records[1].mode, 'implement');
+  assert.equal(records[1].outcome, 'rejected');
+  assert.equal(records[1].exitCode, null);
+  assert.equal(records[2].outcome, 'worker_exit');
+  assert.equal(records[2].exitCode, 7);
+  assert.equal(records[2].outputBytes, 0);
+  assert.doesNotMatch(readFileSync(logPath, 'utf8'), /task-secret|stderr-secret|worker-visible-output/);
+  for (const record of records) assert.doesNotMatch(JSON.stringify(record), /[A-Za-z]:\\\\|\\\\Users\\\\|\/tmp\//);
 });
 
 test('low-version CLI is refused before the bridge starts', () => {
