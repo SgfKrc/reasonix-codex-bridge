@@ -9,6 +9,7 @@ import {
   ConfigError,
   SERVER_NAME,
   checkCliVersion,
+  cliSpawnCommand,
   cliSpawnOptions,
   readBridgeConfig,
   doctorRefs,
@@ -225,15 +226,29 @@ function runGitSync(root, args) {
   if (result.error || result.status !== 0) return { ok: false, stdout: '', error: result.error?.message || `git ${args[0]} exited with code ${result.status}` };
   return { ok: true, stdout: String(result.stdout ?? ''), error: '' };
 }
+function gitHeadHash(root, relativePath) {
+  const result = spawnSync('git', ['-C', root, 'show', `HEAD:${relativePath}`], cliSpawnOptions('git', {
+    encoding: 'buffer',
+    windowsHide: true,
+    maxBuffer: 128 * 1024 * 1024,
+  }));
+  if (result.error || result.status !== 0) return '';
+  return createHash('sha256').update(result.stdout).digest('hex');
+}
 function hashFile(filePath) {
   return new Promise((resolve) => {
-    if (!existsSync(filePath)) return resolve(null);
+    let stats;
+    try { stats = statSync(filePath); } catch (error) {
+      if (error?.code === 'ENOENT') return resolve({ status: 'missing', sha256: null, error: '' });
+      return resolve({ status: 'unreadable', sha256: null, error: error?.message ?? String(error) });
+    }
+    if (!stats.isFile()) return resolve({ status: 'unreadable', sha256: null, error: 'path is not a regular file' });
     let hash;
-    try { hash = createHash('sha256'); } catch { return resolve(null); }
+    try { hash = createHash('sha256'); } catch (error) { return resolve({ status: 'unreadable', sha256: null, error: error?.message ?? String(error) }); }
     const stream = createReadStream(filePath);
     stream.on('data', (chunk) => hash.update(chunk));
-    stream.once('error', () => resolve(null));
-    stream.once('end', () => resolve(hash.digest('hex')));
+    stream.once('error', (error) => resolve({ status: 'unreadable', sha256: null, error: error?.message ?? String(error) }));
+    stream.once('end', () => resolve({ status: 'readable', sha256: hash.digest('hex'), error: '' }));
   });
 }
 function countTextLines(filePath) {
@@ -278,13 +293,13 @@ async function buildChangeSet(root, entries, rollbackId = null) {
   const changes = [];
   for (const entry of entries) {
     const filePath = path.resolve(root, entry.path);
-    const exists = existsSync(filePath) && statSync(filePath).isFile();
+    const fileHash = await hashFile(filePath);
+    const exists = fileHash.status === 'readable';
     const kind = changeKind(entry);
-    const fileHash = exists ? await hashFile(filePath) : null;
     let lineStats = numstat.get(entry.path);
     if (!lineStats && exists && kind === 'added') lineStats = countTextLines(filePath);
     if (!lineStats) lineStats = { additions: kind === 'deleted' ? 0 : null, deletions: kind === 'deleted' ? null : 0, binary: false };
-    changes.push({ path: entry.path, kind, additions: lineStats.additions, deletions: lineStats.deletions, binary: lineStats.binary, sha256: fileHash });
+    changes.push({ path: entry.path, kind, additions: lineStats.additions, deletions: lineStats.deletions, binary: lineStats.binary, sha256: fileHash.sha256, hash_status: fileHash.status });
   }
   return {
     schema: 'qlh.reasonix.changes.v1',
@@ -306,16 +321,45 @@ async function explicitRollback(rollbackId) {
   const record = rollbackRecords.get(value);
   if (!record) return { isError: true, text: 'rollback_id is unknown or has expired' };
   const conflicts = [];
+  const missing = [];
+  const unreadable = [];
   for (const change of record.changes) {
     const currentPath = path.resolve(record.root, change.path);
-    const exists = existsSync(currentPath) && statSync(currentPath).isFile();
-    const currentHash = exists ? await hashFile(currentPath) : null;
-    if (currentHash !== change.sha256 && !(currentHash === null && change.sha256 === null)) conflicts.push(change.path);
+    const currentHash = await hashFile(currentPath);
+    if (currentHash.status === 'unreadable') {
+      unreadable.push(change.path);
+      continue;
+    }
+    const expectedStatus = change.hash_status ?? (change.sha256 === null ? 'missing' : 'readable');
+    if (expectedStatus === 'unreadable') {
+      unreadable.push(`${change.path} (recorded hash unavailable)`);
+    } else if (currentHash.status === 'missing' && expectedStatus !== 'missing') {
+      missing.push(change.path);
+    } else if (currentHash.status !== expectedStatus || currentHash.sha256 !== change.sha256) {
+      conflicts.push(change.path);
+    }
   }
+  if (unreadable.length) return { isError: true, text: `rollback refused because files are unreadable: ${unreadable.join(', ')}` };
+  if (missing.length) return { isError: true, text: `rollback refused because files are missing: ${missing.join(', ')}` };
   if (conflicts.length) return { isError: true, text: `rollback refused because files changed after the implement call: ${conflicts.join(', ')}` };
   const entries = record.changes.map((change) => ({ path: change.path, status: change.kind === 'added' ? '??' : change.kind === 'deleted' ? ' D' : ' M' }));
   const rollback = await rollbackEntries(record.root, entries);
   if (!rollback.ok) return { isError: true, text: `rollback failed: ${rollback.error}` };
+  const afterStatus = await gitStatus(record.root);
+  if (!afterStatus.ok) return { isError: true, text: `rollback post-check failed: ${afterStatus.error}` };
+  const remaining = afterStatus.entries.filter((entry) => record.changes.some((change) => change.path === entry.path));
+  if (remaining.length) return { isError: true, text: `rollback post-check found changes still present: ${remaining.map((entry) => entry.path).join(', ')}` };
+  const postHashConflicts = [];
+  for (const change of record.changes) {
+    const currentHash = await hashFile(path.resolve(record.root, change.path));
+    if (change.kind === 'added') {
+      if (currentHash.status !== 'missing') postHashConflicts.push(change.path);
+      continue;
+    }
+    const expectedHash = gitHeadHash(record.root, change.path);
+    if (!expectedHash || currentHash.status !== 'readable' || currentHash.sha256 !== expectedHash) postHashConflicts.push(change.path);
+  }
+  if (postHashConflicts.length) return { isError: true, text: `rollback post-check hash mismatch: ${postHashConflicts.join(', ')}` };
   rollbackRecords.delete(value);
   return { isError: false, text: JSON.stringify({ schema: 'qlh.reasonix.rollback.v1', rollback_id: value, status: 'rolled_back', paths: record.changes.map((change) => change.path) }) };
 }
@@ -372,7 +416,13 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
-    const child = spawn(CLI_PATH, args, cliSpawnOptions(CLI_PATH, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }));
+    const invocation = cliSpawnCommand(CLI_PATH, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    if (invocation.error) {
+      recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+      resolve({ isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } });
+      return;
+    }
+    const child = spawn(invocation.file, invocation.args, invocation.options);
     let stdout = ''; let stderr = ''; let settled = false; let truncatedOutput = false;
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     const finish = (result, outcome, exitCode = null) => {
@@ -467,7 +517,12 @@ function enqueue(job, meta) {
   return run.finally(() => { queueDepth -= 1; });
 }
 async function callTool(name, args) {
-  if (name === 'reasonix_rollback') return explicitRollback(args?.rollback_id);
+  if (name === 'reasonix_rollback') {
+    const rollbackId = typeof args?.rollback_id === 'string' ? args.rollback_id.trim() : '';
+    const record = rollbackRecords.get(rollbackId);
+    if (!record) return explicitRollback(rollbackId);
+    return enqueue(() => explicitRollback(rollbackId), { mode: 'rollback', cwdRoot: cwdRootLabel(record.root), maxSteps: null, timeoutSeconds: null });
+  }
   if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();

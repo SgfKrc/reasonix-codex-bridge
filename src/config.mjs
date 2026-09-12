@@ -83,22 +83,54 @@ export function resolveMinReasonixVersion() {
   };
 }
 
-/** Spawn options shared by doctor/version/worker calls, including Windows shims. */
-export function cliSpawnOptions(cliPath, options = {}) {
+const WINDOWS_CMD_SHIM = /\.(?:cmd|bat)$/i;
+const WINDOWS_CMD_META = /["&|<>^()%!\r\n]/u;
+
+/** Spawn options shared by doctor/version/worker calls; shell execution is never implicit. */
+export function cliSpawnOptions(_cliPath, options = {}) {
+  return { ...options, shell: false };
+}
+
+function quoteWindowsCmdArg(value) {
+  const text = String(value);
+  return text === '' || /\s/u.test(text) ? `"${text}"` : text;
+}
+
+/** Resolve a CLI invocation without passing user-controlled arguments through a shell. */
+export function cliSpawnCommand(cliPath, args = [], options = {}) {
+  const safeOptions = cliSpawnOptions(cliPath, options);
+  if (process.platform !== 'win32' || !WINDOWS_CMD_SHIM.test(String(cliPath))) {
+    return { file: cliPath, args, options: safeOptions, error: '' };
+  }
+  const unsafeIndex = args.findIndex((value) => WINDOWS_CMD_META.test(String(value)));
+  if (unsafeIndex >= 0 || WINDOWS_CMD_META.test(String(cliPath))) {
+    return {
+      file: '',
+      args: [],
+      options: safeOptions,
+      error: `Windows command shim arguments cannot contain cmd metacharacters (argument ${unsafeIndex >= 0 ? unsafeIndex : 'path'})`,
+    };
+  }
+  const commandBody = [cliPath, ...args].map(quoteWindowsCmdArg).join(' ');
+  const command = /\s/u.test(String(cliPath)) ? `"${commandBody}"` : commandBody;
   return {
-    ...options,
-    shell: process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(cliPath),
+    file: process.env.ComSpec || process.env.COMSPEC || 'cmd.exe',
+    args: ['/d', '/s', '/c', command],
+    options: { ...safeOptions, shell: false },
+    error: '',
   };
 }
 
 export function readCliVersion(cliPath, timeoutMs = 30_000) {
   if (!cliPath) return { status: 'unknown', version: null, raw: '', error: 'reasonix CLI is not available' };
-  const result = spawnSync(cliPath, ['--version'], cliSpawnOptions(cliPath, {
+  const invocation = cliSpawnCommand(cliPath, ['--version'], {
     encoding: 'utf8',
     timeout: timeoutMs,
     windowsHide: true,
     maxBuffer: 1024 * 1024,
-  }));
+  });
+  if (invocation.error) return { status: 'unknown', version: null, raw: '', error: invocation.error };
+  const result = spawnSync(invocation.file, invocation.args, invocation.options);
   const raw = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
   if (result.error) return { status: 'unknown', version: null, raw, error: `cannot run reasonix --version: ${result.error.message}` };
   if (result.status !== 0) return { status: 'unknown', version: null, raw, error: `reasonix --version exited with code ${result.status}` };
@@ -257,7 +289,9 @@ export function readDoctor(cliPath, timeoutMs = 30_000, options = {}) {
     const cached = readDoctorCache(cliPath, cachePath, ttlMs);
     if (cached) return cached;
   }
-  const result = spawnSync(cliPath, ['doctor', '--json'], cliSpawnOptions(cliPath, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }));
+  const invocation = cliSpawnCommand(cliPath, ['doctor', '--json'], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+  if (invocation.error) return { ok: false, error: invocation.error, data: null, cache: 'live' };
+  const result = spawnSync(invocation.file, invocation.args, invocation.options);
   if (result.error) return { ok: false, error: `cannot run reasonix doctor: ${result.error.message}`, data: null, cache: 'live' };
   if (result.status !== 0) return { ok: false, error: `reasonix doctor exited with code ${result.status}`, data: null, cache: 'live' };
   try {

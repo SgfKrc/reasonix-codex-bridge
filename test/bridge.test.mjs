@@ -11,6 +11,7 @@ import {
   atomicWriteFile,
   checkCliVersion,
   compareVersions,
+  cliSpawnCommand,
   doctorCachePath,
   doctorRefs,
   parseProfileFrontmatter,
@@ -223,6 +224,21 @@ describe('configuration pure functions', () => {
     assert.equal(compareVersions('1.38.6', DEFAULT_MIN_REASONIX_VERSION), 0);
     assert.equal(compareVersions('1.39', DEFAULT_MIN_REASONIX_VERSION), 1);
     assert.equal(parseVersion('development build'), null);
+  });
+
+  test('Windows command shims never enable a shell and reject cmd metacharacters', () => {
+    const safe = cliSpawnCommand('reasonix.cmd', ['subagent', 'run', 'deepseek-worker', '--', 'review task'], { shell: true });
+    if (process.platform !== 'win32') {
+      assert.equal(safe.file, 'reasonix.cmd');
+      assert.equal(safe.error, '');
+      return;
+    }
+    assert.equal(safe.file.toLowerCase().endsWith('cmd.exe'), true);
+    assert.equal(safe.options.shell, false);
+    assert.equal(safe.error, '');
+    const unsafe = cliSpawnCommand('reasonix.cmd', ['subagent', 'run', 'deepseek-worker', '--', 'review & echo injected | %PATH%!'], {});
+    assert.match(unsafe.error, /cmd metacharacters/);
+    assert.deepEqual(unsafe.args, []);
   });
 
   test('keeps model resolution order and validates refs', () => {
@@ -732,6 +748,7 @@ process.stdout.write('implemented');
     assert.match(changeSet.rollback_id, /^[0-9a-f-]{36}$/);
     assert.equal(changeSet.changes.length, 1);
     assert.equal(changeSet.changes[0].path, 'allowed.txt');
+    assert.equal(changeSet.changes[0].hash_status, 'readable');
     assert.match(changeSet.changes[0].sha256, /^[0-9a-f]{64}$/);
     assert.equal(changeSet.changes[0].additions, 1);
     assert.equal(changeSet.changes[0].deletions, 1);
@@ -805,6 +822,107 @@ fs.writeFileSync(process.env.WRITE_TARGET, 'after');
     assert.equal(readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'manual edit after worker');
     child.stdin.end();
     await new Promise((resolve) => child.once('close', resolve));
+  });
+
+  test('rollback is serialized behind an in-flight implement in the same workspace', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['first.txt', 'second.txt'] }), 'utf8');
+    const callCount = path.join(tmpdir(), `reasonix-call-count-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    const secondStarted = path.join(tmpdir(), `reasonix-second-started-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+const path = require('node:path');
+const count = fs.existsSync(process.env.CALL_COUNT) ? Number(fs.readFileSync(process.env.CALL_COUNT, 'utf8')) : 0;
+fs.writeFileSync(process.env.CALL_COUNT, String(count + 1));
+if (count === 0) {
+  fs.writeFileSync(path.join(process.env.WORKSPACE, 'first.txt'), 'first');
+  process.stdout.write('first');
+} else {
+  fs.writeFileSync(process.env.SECOND_STARTED, 'started');
+  setTimeout(() => {
+    fs.writeFileSync(path.join(process.env.WORKSPACE, 'first.txt'), 'second');
+    fs.writeFileSync(path.join(process.env.WORKSPACE, 'second.txt'), 'second');
+    process.stdout.write('second');
+  }, 250);
+}
+`, 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      cwd: root,
+      env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', CALL_COUNT: callCount, SECOND_STARTED: secondStarted, WORKSPACE: root }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const client = mcpClient(child);
+    try {
+      const firstResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'first write', mode: 'implement' } });
+      const firstSet = JSON.parse(firstResponse.result.content[0].text);
+      assert.equal(firstResponse.result.isError, false);
+      assert.equal(firstSet.changes[0].path, 'first.txt');
+      const commit = spawnSync('git', ['-C', root, 'add', 'first.txt'], { encoding: 'utf8', windowsHide: true });
+      assert.equal(commit.status, 0, commit.stderr);
+      const saved = spawnSync('git', ['-C', root, 'commit', '-qm', 'save first implement'], { encoding: 'utf8', windowsHide: true });
+      assert.equal(saved.status, 0, saved.stderr);
+
+      const secondPromise = client.request(2, 'tools/call', { name: 'reasonix_run', arguments: { task: 'second write', mode: 'implement' } });
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 3000;
+        const poll = () => {
+          if (existsSync(secondStarted)) resolve();
+          else if (Date.now() >= deadline) reject(new Error('second implement did not start'));
+          else setTimeout(poll, 10);
+        };
+        poll();
+      });
+      const rollbackPromise = client.request(3, 'tools/call', { name: 'reasonix_rollback', arguments: { rollback_id: firstSet.rollback_id } });
+      const [secondResponse, rollbackResponse] = await Promise.all([secondPromise, rollbackPromise]);
+      assert.equal(secondResponse.result.isError, false);
+      assert.equal(rollbackResponse.result.isError, true);
+      assert.match(rollbackResponse.result.content[0].text, /changed after the implement call/);
+      assert.equal(readFileSync(path.join(root, 'first.txt'), 'utf8'), 'second');
+      assert.equal(readFileSync(path.join(root, 'second.txt'), 'utf8'), 'second');
+    } finally {
+      child.stdin.end();
+      await new Promise((resolve) => child.once('close', resolve));
+      rmSync(callCount, { force: true });
+      rmSync(secondStarted, { force: true });
+    }
+  });
+
+  test('rollback refuses a non-regular target instead of treating it as missing', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['non-file'] }), 'utf8');
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.WRITE_TARGET, 'regular file');
+process.stdout.write('implemented');
+`, 'utf8');
+    commitFixture(root);
+    const target = path.join(root, 'non-file');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WRITE_TARGET: target }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    try {
+      const writeResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'create non-regular target', mode: 'implement' } });
+      const changeSet = JSON.parse(writeResponse.result.content[0].text);
+      assert.equal(writeResponse.result.isError, false);
+      assert.equal(changeSet.changes.length, 1);
+      assert.equal(changeSet.changes[0].hash_status, 'readable');
+      rmSync(target, { force: true });
+      mkdirSync(target);
+      const rollbackResponse = await client.request(2, 'tools/call', { name: 'reasonix_rollback', arguments: { rollback_id: changeSet.rollback_id } });
+      assert.equal(rollbackResponse.result.isError, true);
+      assert.match(rollbackResponse.result.content[0].text, /files are unreadable/);
+      assert.equal(existsSync(target), true);
+      rmSync(target, { recursive: true, force: true });
+      const missingResponse = await client.request(3, 'tools/call', { name: 'reasonix_rollback', arguments: { rollback_id: changeSet.rollback_id } });
+      assert.equal(missingResponse.result.isError, true);
+      assert.match(missingResponse.result.content[0].text, /files are missing/);
+    } finally {
+      child.stdin.end();
+      await new Promise((resolve) => child.once('close', resolve));
+    }
   });
 
   test('implement rolls back a change outside the whitelist', async () => {
