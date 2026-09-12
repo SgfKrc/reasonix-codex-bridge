@@ -16,6 +16,7 @@ import {
   PRESETS_PATH,
   REASONIX_SKILLS_PATH,
   buildCodexBlock,
+  atomicWriteFile,
   checkCliVersion,
   cliSpawnOptions,
   doctorRefs,
@@ -182,7 +183,13 @@ function codexCommand(args) {
     mkdirSync(path.dirname(CODEX_CONFIG_PATH), { recursive: true });
   }
   const existing = isFile(CODEX_CONFIG_PATH) ? readFileSync(CODEX_CONFIG_PATH, 'utf8') : '';
-  writeFileSync(CODEX_CONFIG_PATH, upsertReasonixBlock(existing, block), 'utf8');
+  let updated;
+  try {
+    updated = upsertReasonixBlock(existing, block);
+    atomicWriteFile(CODEX_CONFIG_PATH, updated);
+  } catch (error) {
+    fail(error.message);
+  }
   process.stdout.write(`updated ${CODEX_CONFIG_PATH}\n${block}`);
 }
 
