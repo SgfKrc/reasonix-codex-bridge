@@ -2,6 +2,8 @@
 
 Zero-dependency stdio MCP server for Codex. It exposes a narrow `reasonix_run` tool that starts the configured read-only Reasonix subagent and a `reasonix_status` diagnostic tool.
 
+Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited release contents.
+
 ## Supported runtime
 
 - Node.js 20 or newer.

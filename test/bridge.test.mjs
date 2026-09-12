@@ -34,6 +34,8 @@ const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
 const CONFIGURE_PATH = path.join(BRIDGE_ROOT, 'src', 'configure.mjs');
 const CHECK_LINKS_PATH = path.join(BRIDGE_ROOT, 'scripts', 'check-readme-links.mjs');
+const PACKAGE_PATH = path.join(BRIDGE_ROOT, 'package.json');
+const CHANGELOG_PATH = path.join(BRIDGE_ROOT, 'CHANGELOG.md');
 const tempRoots = new Set();
 
 function tempRoot() {
@@ -179,6 +181,14 @@ after(() => {
 });
 
 describe('configuration pure functions', () => {
+  test('release metadata uses semver and documents the package version', () => {
+    const packageData = JSON.parse(readFileSync(PACKAGE_PATH, 'utf8'));
+    assert.match(packageData.version, /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/);
+    const changelog = readFileSync(CHANGELOG_PATH, 'utf8');
+    const escapedVersion = packageData.version.replaceAll('.', '\\.');
+    assert.match(changelog, new RegExp(`^## \\[${escapedVersion}\\] - \\d{4}-\\d{2}-\\d{2}$`, 'm'));
+  });
+
   test('parses and compares version gates', () => {
     assert.deepEqual(parseVersion('Reasonix CLI v1.38.7'), { major: 1, minor: 38, patch: 7, normalized: '1.38.7' });
     assert.equal(compareVersions('1.38.5', DEFAULT_MIN_REASONIX_VERSION), -1);
