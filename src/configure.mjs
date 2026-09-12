@@ -24,6 +24,7 @@ import {
   isFile,
   profileDrift,
   ensureProfileReadOnly,
+  parseVersion,
   readSubagentProfile,
   readBridgeConfig,
   readDoctor,
@@ -49,6 +50,9 @@ const USAGE = `Usage: node src/configure.mjs <command>
   profile [--create|--sync] [--write] [--refresh]
                        inspect a profile or print/run a create/edit command, then verify model + read-only
   verify [--refresh]   check the CLI, the selected model ref, and the subagent profile
+  export [--refresh]   print a path-free, redacted environment summary as JSON
+  import <file|-> [--refresh]
+                       compare a summary file (or stdin) with this machine; never writes config
 
 --refresh             bypass the doctor cache for commands that inspect the machine inventory
 
@@ -86,6 +90,171 @@ function doctorFor(context) {
   if (context.resolution.doctor) return context.resolution.doctor;
   if (!context.cliPath) return { ok: false, error: context.cliError || 'reasonix CLI is not available', data: null };
   return readDoctor(context.cliPath, 30_000, context.doctorOptions);
+}
+
+const SAFE_PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function safeSegment(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text && text.length <= 200 && !/[\s\\/]/u.test(text) && !/:\/\//u.test(text) ? text : null;
+}
+
+function safeModelRef(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text || text.length > 400 || /[\s\\]/u.test(text) || /:\/\//u.test(text)) return null;
+  const separator = text.indexOf('/');
+  if (separator <= 0 || separator === text.length - 1 || text.indexOf('/', separator + 1) !== -1) return null;
+  return safeSegment(text.slice(0, separator)) && safeSegment(text.slice(separator + 1)) ? text : null;
+}
+
+function safeProfileName(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return SAFE_PROFILE_NAME.test(text) ? text : null;
+}
+
+function modelSourceLabel(source, bridgeConfig) {
+  if (source === 'REASONIX_MODEL_REF environment variable') return 'environment';
+  if (source === 'reasonix default_model (auto fallback)') return 'reasonix default';
+  if (source && bridgeConfig?.path && path.resolve(source) === path.resolve(bridgeConfig.path)) return 'bridge.config.json';
+  return source ? 'configured' : null;
+}
+
+function summaryProviders(doctor) {
+  if (!doctor?.ok) return [];
+  const grouped = new Map();
+  for (const item of doctorRefs(doctor.data).refs) {
+    const provider = safeSegment(item.provider);
+    const model = safeSegment(item.model);
+    if (!provider || !model) continue;
+    if (!grouped.has(provider)) grouped.set(provider, new Set());
+    grouped.get(provider).add(model);
+  }
+  return [...grouped.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, models]) => ({ name, models: [...models].sort() }));
+}
+
+function summaryProfile(context) {
+  const name = safeProfileName(context.subagent.name);
+  if (!name) return { name: null, exists: false, status: 'invalid', model: null, readOnly: null, tools: [] };
+  let profile;
+  try { profile = readSubagentProfile(name); } catch { profile = { exists: false, frontmatter: null }; }
+  const frontmatter = profile.frontmatter;
+  return {
+    name,
+    exists: profile.exists === true,
+    status: !profile.exists ? 'missing' : frontmatter?.exists ? 'ok' : 'invalid',
+    model: safeModelRef(frontmatter?.model),
+    readOnly: typeof frontmatter?.readOnly === 'boolean' ? frontmatter.readOnly : null,
+    tools: frontmatter?.toolsKnown && Array.isArray(frontmatter.tools)
+      ? frontmatter.tools.map(safeSegment).filter(Boolean).sort()
+      : [],
+  };
+}
+
+function environmentSummary(context, doctor) {
+  const versionCheck = context.cliPath ? checkCliVersion(context.cliPath) : { status: 'unknown', version: null };
+  const doctorVersion = parseVersion(doctor?.data?.version)?.normalized ?? null;
+  const profile = summaryProfile(context);
+  return {
+    schema: 1,
+    platform: { os: process.platform, arch: process.arch },
+    nodeMajor: Number(process.versions.node.split('.')[0]),
+    reasonix: { version: versionCheck.version ?? doctorVersion, versionCheck: versionCheck.status },
+    providers: summaryProviders(doctor),
+    current: {
+      modelRef: safeModelRef(context.resolution.ref),
+      modelSource: modelSourceLabel(context.resolution.source, context.bridgeConfig),
+      profile: profile.name,
+      profileExists: profile.exists,
+      profileStatus: profile.status,
+      profileModel: profile.model,
+      profileReadOnly: profile.readOnly,
+      profileTools: profile.tools,
+    },
+  };
+}
+
+function normalizeSummary(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || input.schema !== 1) throw new Error('schema must be 1');
+  const platform = input.platform;
+  if (!platform || typeof platform !== 'object' || !safeSegment(platform.os) || !safeSegment(platform.arch)) throw new Error('platform is invalid');
+  if (!Number.isInteger(input.nodeMajor) || input.nodeMajor < 1) throw new Error('nodeMajor is invalid');
+  const reasonix = input.reasonix;
+  if (!reasonix || typeof reasonix !== 'object' || (reasonix.version !== null && typeof reasonix.version !== 'string')
+    || (reasonix.version !== null && !parseVersion(reasonix.version))
+    || !['ok', 'fail', 'unknown', 'unavailable'].includes(reasonix.versionCheck)) throw new Error('reasonix is invalid');
+  if (!Array.isArray(input.providers)) throw new Error('providers is invalid');
+  const providers = input.providers.map((provider) => {
+    if (!provider || typeof provider !== 'object' || !safeSegment(provider.name) || !Array.isArray(provider.models)
+      || provider.models.some((model) => !safeSegment(model))) throw new Error('providers contains invalid fields');
+    return { name: provider.name.trim(), models: [...new Set(provider.models.map((model) => model.trim()))].sort() };
+  }).sort((left, right) => left.name.localeCompare(right.name));
+  const current = input.current;
+  if (!current || typeof current !== 'object') throw new Error('current is invalid');
+  if (current.modelRef !== null && !safeModelRef(current.modelRef)) throw new Error('current.modelRef is invalid');
+  if (current.modelSource !== null && !safeSegment(current.modelSource)) throw new Error('current.modelSource is invalid');
+  if (current.profile !== null && !safeProfileName(current.profile)) throw new Error('current.profile is invalid');
+  if (typeof current.profileExists !== 'boolean' || !['ok', 'missing', 'invalid'].includes(current.profileStatus)) throw new Error('current profile status is invalid');
+  if (current.profileModel !== null && !safeModelRef(current.profileModel)) throw new Error('current.profileModel is invalid');
+  if (current.profileReadOnly !== null && typeof current.profileReadOnly !== 'boolean') throw new Error('current.profileReadOnly is invalid');
+  if (!Array.isArray(current.profileTools) || current.profileTools.some((tool) => !safeSegment(tool))) throw new Error('current.profileTools is invalid');
+  return {
+    schema: 1,
+    platform: { os: platform.os.trim(), arch: platform.arch.trim() },
+    nodeMajor: input.nodeMajor,
+    reasonix: { version: reasonix.version === null ? null : parseVersion(reasonix.version).normalized, versionCheck: reasonix.versionCheck },
+    providers,
+    current: {
+      modelRef: current.modelRef === null ? null : current.modelRef.trim(),
+      modelSource: current.modelSource === null ? null : current.modelSource.trim(),
+      profile: current.profile === null ? null : current.profile.trim(),
+      profileExists: current.profileExists,
+      profileStatus: current.profileStatus,
+      profileModel: current.profileModel === null ? null : current.profileModel.trim(),
+      profileReadOnly: current.profileReadOnly,
+      profileTools: [...new Set(current.profileTools.map((tool) => tool.trim()))].sort(),
+    },
+  };
+}
+
+function summaryDifferences(local, imported) {
+  const fields = [
+    ['platform', local.platform, imported.platform],
+    ['nodeMajor', local.nodeMajor, imported.nodeMajor],
+    ['reasonix', local.reasonix, imported.reasonix],
+    ['providers', local.providers, imported.providers],
+    ['current', local.current, imported.current],
+  ];
+  return fields.filter(([, left, right]) => JSON.stringify(left) !== JSON.stringify(right))
+    .map(([field, left, right]) => ({ field, local: left, imported: right }));
+}
+
+function exportCommand(args = []) {
+  const context = loadContext({ refresh: args.includes('--refresh') });
+  const doctor = doctorFor(context);
+  process.stdout.write(`${JSON.stringify(environmentSummary(context, doctor), null, 2)}\n`);
+}
+
+function importCommand(args = []) {
+  const source = args.find((arg) => arg !== '--refresh');
+  if (!source) fail('usage: node src/configure.mjs import <summary.json|-> [--refresh]');
+  let text;
+  try {
+    text = source === '-' ? readFileSync(0, 'utf8') : readFileSync(path.resolve(source), 'utf8');
+  } catch {
+    fail(`cannot read environment summary: ${source === '-' ? 'stdin' : path.basename(source)}`);
+  }
+  let imported;
+  try { imported = normalizeSummary(JSON.parse(text)); } catch (error) { fail(`invalid environment summary: ${error.message}`); }
+  const context = loadContext({ refresh: args.includes('--refresh') });
+  const local = normalizeSummary(environmentSummary(context, doctorFor(context)));
+  const differences = summaryDifferences(local, imported);
+  if (differences.length === 0) {
+    process.stdout.write('no differences\n');
+    return;
+  }
+  for (const difference of differences) process.stdout.write(`DIFF ${difference.field}: local=${JSON.stringify(difference.local)} imported=${JSON.stringify(difference.imported)}\n`);
 }
 
 function listCommand(args = []) {
@@ -348,4 +517,6 @@ else if (command === 'presets') presetsCommand();
 else if (command === 'codex') codexCommand(args);
 else if (command === 'profile') profileCommand(args);
 else if (command === 'verify') verifyCommand(args);
+else if (command === 'export') exportCommand(args);
+else if (command === 'import') importCommand(args);
 else fail(`unknown command "${command}"\n\n${USAGE}`);
