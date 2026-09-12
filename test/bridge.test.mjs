@@ -230,3 +230,19 @@ test('unparseable CLI version remains unknown instead of blocking startup', () =
   assert.equal(result.status, 'unknown');
   assert.match(result.error, /cannot run|not available|ENOENT/);
 });
+
+test('server keeps running with an unparseable CLI version and reports unknown', async () => {
+  const root = tempRoot();
+  const cli = writeVersionStub(root, 'development');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { REASONIX_EXE: cli }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } }]);
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
+  const status = JSON.parse(responses[0].result.content[0].text);
+  assert.equal(status.versionCheck, 'unknown');
+});
