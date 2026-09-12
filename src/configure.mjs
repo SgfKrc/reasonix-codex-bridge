@@ -12,6 +12,7 @@ import {
   BRIDGE_CONFIG_PATH,
   BRIDGE_ROOT,
   CODEX_CONFIG_PATH,
+  DOCTOR_CACHE_PATH,
   PRESETS_EXAMPLE_PATH,
   PRESETS_PATH,
   REASONIX_SKILLS_PATH,
@@ -33,18 +34,23 @@ import {
   resolveWorkspaceRoot,
   upsertReasonixBlock,
   validateModelRef,
+  doctorCachePath,
 } from './config.mjs';
 
 const USAGE = `Usage: node src/configure.mjs <command>
 
-  list                 list every <provider>/<model> ref this machine reports
-  show                 print the configuration the bridge will use, and each value's source
-  use <ref|preset>     write modelRef into bridge.config.json (a preset name is accepted)
+  list [--refresh]     list every <provider>/<model> ref this machine reports
+  show [--refresh]     print the configuration the bridge will use, and each value's source
+  use <ref|preset> [--refresh]
+                       write modelRef into bridge.config.json (a preset name is accepted)
   presets              list presets from presets.json (copy presets.example.json to create it)
-  codex [--write]      print the Codex MCP block; --write upserts it into the Codex config (backup first)
-  profile [--create|--sync] [--write]
+  codex [--write] [--refresh]
+                       print the Codex MCP block; --write upserts it into the Codex config (backup first)
+  profile [--create|--sync] [--write] [--refresh]
                        inspect a profile or print/run a create/edit command, then verify model + read-only
-  verify               check the CLI, the selected model ref, and the subagent profile
+  verify [--refresh]   check the CLI, the selected model ref, and the subagent profile
+
+--refresh             bypass the doctor cache for commands that inspect the machine inventory
 
 Environment overrides: REASONIX_EXE, REASONIX_MODEL_REF, REASONIX_SUBAGENT, REASONIX_ROOT,
 REASONIX_MIN_VERSION, BRIDGE_CONFIG, BRIDGE_PRESETS, CODEX_CONFIG, CODEX_HOME.`;
@@ -54,29 +60,36 @@ function fail(message) {
   process.exit(1);
 }
 
-function loadContext() {
+function loadContext({ refresh = false } = {}) {
   let cliPath = '';
   let cliError = '';
   try { cliPath = resolveCliPath(); } catch (error) { cliError = error.message; }
   const bridgeConfig = readBridgeConfig();
+  const resolution = resolveModelRef({ cliPath, bridgeConfig, doctorOptions: { refresh } });
+  const doctor = refresh && cliPath && !resolution.doctor
+    ? readDoctor(cliPath, 30_000, { refresh: true, cachePath: doctorCachePath(bridgeConfig.path) })
+    : null;
   return {
     cliPath,
     cliError,
     bridgeConfig,
-    resolution: resolveModelRef({ cliPath, bridgeConfig }),
+    resolution,
+    doctor,
     subagent: resolveSubagent(bridgeConfig),
     root: resolveWorkspaceRoot(bridgeConfig),
+    doctorOptions: { refresh },
   };
 }
 
 function doctorFor(context) {
+  if (context.doctor) return context.doctor;
   if (context.resolution.doctor) return context.resolution.doctor;
   if (!context.cliPath) return { ok: false, error: context.cliError || 'reasonix CLI is not available', data: null };
-  return readDoctor(context.cliPath);
+  return readDoctor(context.cliPath, 30_000, context.doctorOptions);
 }
 
-function listCommand() {
-  const context = loadContext();
+function listCommand(args = []) {
+  const context = loadContext({ refresh: args.includes('--refresh') });
   if (!context.cliPath) fail(`[bridge] ${context.cliError}`);
   const doctor = doctorFor(context);
   if (!doctor.ok) fail(`[bridge] ${doctor.error}`);
@@ -84,6 +97,7 @@ function listCommand() {
   const current = context.resolution.ref;
   process.stdout.write(`reasonix CLI           : ${context.cliPath}\n`);
   process.stdout.write(`reasonix version       : ${doctor.data?.version ?? 'unknown'}\n`);
+  process.stdout.write(`doctor inventory       : ${doctor.cache === 'hit' ? 'cache hit' : doctor.cache === 'refreshed' ? 'refreshed' : 'live'}\n`);
   process.stdout.write(`reasonix default_model : ${defaultRef || '(none reported)'}\n\n`);
   if (refs.length === 0) {
     process.stdout.write('this machine reports no providers; run `reasonix doctor` to inspect the Reasonix config\n');
@@ -101,12 +115,17 @@ function listCommand() {
   process.stdout.write('\nselect one with: node src/configure.mjs use <ref>\n');
 }
 
-function showCommand() {
-  const context = loadContext();
+function showCommand(args = []) {
+  const context = loadContext({ refresh: args.includes('--refresh') });
   const lines = [];
   lines.push(`bridge config  : ${context.bridgeConfig.path}${context.bridgeConfig.exists ? '' : ' (not created yet)'}`);
   lines.push(`reasonix CLI   : ${context.cliPath || `UNRESOLVED - ${context.cliError}`}`);
   lines.push(`codex config   : ${CODEX_CONFIG_PATH}${isFile(CODEX_CONFIG_PATH) ? '' : ' (missing)'}`);
+  lines.push(`doctor cache   : ${doctorCachePath()}${isFile(DOCTOR_CACHE_PATH) ? '' : ' (missing)'}`);
+  if (args.includes('--refresh')) {
+    const doctor = context.doctor ?? context.resolution.doctor;
+    lines.push(`doctor inventory: ${doctor?.cache === 'refreshed' ? 'refreshed' : doctor?.cache === 'hit' ? 'cache hit' : 'live/unavailable'}`);
+  }
   lines.push(`workspace root : ${context.root}`);
   lines.push(`subagent       : ${context.subagent.name}  (source: ${context.subagent.source})`);
   if (context.resolution.ref) {
@@ -118,7 +137,7 @@ function showCommand() {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
-function useCommand(target) {
+function useCommand(target, args = []) {
   const wanted = (target ?? '').trim();
   if (!wanted) fail('usage: node src/configure.mjs use <provider>/<model>|<preset-name>');
   const presets = readPresets();
@@ -130,7 +149,7 @@ function useCommand(target) {
   writeFileSync(BRIDGE_CONFIG_PATH, `${JSON.stringify({ ...config.data, modelRef }, null, 2)}\n`, 'utf8');
   process.stdout.write(`wrote ${BRIDGE_CONFIG_PATH}\n  modelRef = ${modelRef}${preset ? `  (preset "${preset.name}")` : ''}\n`);
   try {
-    const doctor = readDoctor(resolveCliPath());
+    const doctor = readDoctor(resolveCliPath(), 30_000, { refresh: args.includes('--refresh') });
     if (doctor.ok) {
       const { refs } = doctorRefs(doctor.data);
       if (refs.length > 0 && !refs.some((item) => item.ref === modelRef)) {
@@ -161,7 +180,7 @@ function presetsCommand() {
 
 function codexCommand(args) {
   const write = args.includes('--write');
-  const context = loadContext();
+  const context = loadContext({ refresh: args.includes('--refresh') });
   if (!context.resolution.ref) {
     fail(`no model ref resolved (${context.resolution.error ?? 'no source'}); run: node src/configure.mjs use <provider>/<model>`);
   }
@@ -204,7 +223,7 @@ function profileCommand(args) {
   const write = args.includes('--write');
   if (create && sync) fail('profile accepts only one of --create or --sync');
   if (write && !create && !sync) fail('profile --write requires --create or --sync');
-  const context = loadContext();
+  const context = loadContext({ refresh: args.includes('--refresh') });
   const name = context.subagent.name;
   const profile = readSubagentProfile(name);
   if (profile.error && !profile.exists && profile.path === '') fail(profile.error);
@@ -264,8 +283,8 @@ function profileCommand(args) {
   process.stdout.write(`verified     : ${updated.path} (model and read-only are consistent)\n`);
 }
 
-function verifyCommand() {
-  const context = loadContext();
+function verifyCommand(args = []) {
+  const context = loadContext({ refresh: args.includes('--refresh') });
   const results = [];
   if (context.cliPath) {
     const version = checkCliVersion(context.cliPath);
@@ -322,11 +341,11 @@ if (!command || command === 'help' || command === '--help' || command === '-h') 
   process.stdout.write(`${USAGE}\n`);
   process.exit(0);
 }
-if (command === 'list') listCommand();
-else if (command === 'show') showCommand();
-else if (command === 'use') useCommand(args[0]);
+if (command === 'list') listCommand(args);
+else if (command === 'show') showCommand(args);
+else if (command === 'use') useCommand(args[0], args);
 else if (command === 'presets') presetsCommand();
 else if (command === 'codex') codexCommand(args);
 else if (command === 'profile') profileCommand(args);
-else if (command === 'verify') verifyCommand();
+else if (command === 'verify') verifyCommand(args);
 else fail(`unknown command "${command}"\n\n${USAGE}`);

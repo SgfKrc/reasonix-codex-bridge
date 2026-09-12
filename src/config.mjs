@@ -24,6 +24,8 @@ function envPath(name, fallback) {
 }
 
 export const BRIDGE_CONFIG_PATH = envPath('BRIDGE_CONFIG', path.join(BRIDGE_ROOT, 'bridge.config.json'));
+export const DOCTOR_CACHE_PATH = `${BRIDGE_CONFIG_PATH}.doctor-cache.json`;
+export const DEFAULT_DOCTOR_CACHE_TTL_MS = 10 * 60 * 1000;
 export const PRESETS_PATH = envPath('BRIDGE_PRESETS', path.join(BRIDGE_ROOT, 'presets.json'));
 export const PRESETS_EXAMPLE_PATH = path.join(BRIDGE_ROOT, 'presets.example.json');
 export const CODEX_HOME = envPath('CODEX_HOME', path.join(os.homedir(), '.codex'));
@@ -162,16 +164,105 @@ function pathCandidates(names) {
   return dirs.flatMap((dir) => names.map((name) => path.join(dir, name)));
 }
 
-/** Redacted machine inventory straight from the CLI: providers, models, default_model. */
-export function readDoctor(cliPath, timeoutMs = 30_000) {
-  if (!cliPath) return { ok: false, error: 'reasonix CLI is not available', data: null };
-  const result = spawnSync(cliPath, ['doctor', '--json'], cliSpawnOptions(cliPath, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }));
-  if (result.error) return { ok: false, error: `cannot run reasonix doctor: ${result.error.message}`, data: null };
-  if (result.status !== 0) return { ok: false, error: `reasonix doctor exited with code ${result.status}`, data: null };
+export function doctorCachePath(configPath = BRIDGE_CONFIG_PATH) {
+  return `${path.resolve(configPath)}.doctor-cache.json`;
+}
+
+function cliMtimeMs(cliPath) {
   try {
-    return { ok: true, error: '', data: JSON.parse(result.stdout) };
+    const stats = statSync(cliPath);
+    return stats.isFile() ? stats.mtimeMs : null;
+  } catch {
+    return null;
+  }
+}
+
+function cacheableDoctorData(data) {
+  const providers = Array.isArray(data?.providers) ? data.providers.flatMap((provider) => {
+    if (!provider || typeof provider.name !== 'string' || !provider.name.trim()) return [];
+    const safe = { name: provider.name.trim() };
+    if (Array.isArray(provider.models)) safe.models = provider.models.filter((model) => typeof model === 'string' && model.trim()).map((model) => model.trim());
+    else if (typeof provider.model === 'string' && provider.model.trim()) safe.model = provider.model.trim();
+    if (typeof provider.key_present === 'boolean') safe.key_present = provider.key_present;
+    if (typeof provider.base_url_host === 'string') safe.base_url_host = provider.base_url_host;
+    if (typeof provider.context_window === 'number' && Number.isFinite(provider.context_window)) safe.context_window = provider.context_window;
+    if (typeof provider.vision === 'boolean') safe.vision = provider.vision;
+    return [safe];
+  }) : [];
+  return {
+    version: typeof data?.version === 'string' ? data.version : null,
+    config: { default_model: typeof data?.config?.default_model === 'string' ? data.config.default_model.trim() : '' },
+    providers,
+  };
+}
+
+function isCacheableDoctorData(data) {
+  if (!data || typeof data !== 'object' || (data.version !== null && typeof data.version !== 'string')
+    || !data.config || typeof data.config !== 'object' || typeof data.config.default_model !== 'string'
+    || !Array.isArray(data.providers)) return false;
+  return data.providers.every((provider) => {
+    if (!provider || typeof provider !== 'object' || typeof provider.name !== 'string') return false;
+    if (provider.models !== undefined && (!Array.isArray(provider.models) || provider.models.some((model) => typeof model !== 'string'))) return false;
+    if (provider.model !== undefined && typeof provider.model !== 'string') return false;
+    if (provider.key_present !== undefined && typeof provider.key_present !== 'boolean') return false;
+    if (provider.base_url_host !== undefined && typeof provider.base_url_host !== 'string') return false;
+    if (provider.context_window !== undefined && (typeof provider.context_window !== 'number' || !Number.isFinite(provider.context_window))) return false;
+    return provider.vision === undefined || typeof provider.vision === 'boolean';
+  });
+}
+
+function readDoctorCache(cliPath, cachePath, ttlMs) {
+  const currentMtimeMs = cliMtimeMs(cliPath);
+  if (currentMtimeMs === null || !isFile(cachePath)) return null;
+  try {
+    const cached = JSON.parse(readFileSync(cachePath, 'utf8'));
+    const fetchedAt = Number(cached?.fetchedAt);
+    const age = Date.now() - fetchedAt;
+    if (cached?.schema !== 1 || path.resolve(String(cached.cliPath ?? '')) !== path.resolve(cliPath)
+      || cached.cliMtimeMs !== currentMtimeMs || !Number.isFinite(fetchedAt) || age < 0 || age >= ttlMs
+      || !isCacheableDoctorData(cached.data)) return null;
+    return { ok: true, error: '', data: cached.data, cache: 'hit', cachePath, fetchedAt };
+  } catch {
+    return null;
+  }
+}
+
+function writeDoctorCache(cliPath, cachePath, data) {
+  const currentMtimeMs = cliMtimeMs(cliPath);
+  if (currentMtimeMs === null) return;
+  const payload = {
+    schema: 1,
+    cliPath: path.resolve(cliPath),
+    cliMtimeMs: currentMtimeMs,
+    fetchedAt: Date.now(),
+    data: cacheableDoctorData(data),
+  };
+  try { atomicWriteFile(cachePath, `${JSON.stringify(payload, null, 2)}\n`); } catch { /* cache is an optimization; live doctor already succeeded */ }
+}
+
+/** Redacted machine inventory straight from the CLI: providers, models, default_model. */
+export function readDoctor(cliPath, timeoutMs = 30_000, options = {}) {
+  if (typeof timeoutMs === 'object') {
+    options = timeoutMs;
+    timeoutMs = 30_000;
+  }
+  if (!options || typeof options !== 'object') options = {};
+  if (!cliPath) return { ok: false, error: 'reasonix CLI is not available', data: null };
+  const cachePath = path.resolve(options.cachePath ?? DOCTOR_CACHE_PATH);
+  const ttlMs = Number.isFinite(options.ttlMs) ? Math.max(0, Number(options.ttlMs)) : DEFAULT_DOCTOR_CACHE_TTL_MS;
+  if (!options.refresh) {
+    const cached = readDoctorCache(cliPath, cachePath, ttlMs);
+    if (cached) return cached;
+  }
+  const result = spawnSync(cliPath, ['doctor', '--json'], cliSpawnOptions(cliPath, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }));
+  if (result.error) return { ok: false, error: `cannot run reasonix doctor: ${result.error.message}`, data: null, cache: 'live' };
+  if (result.status !== 0) return { ok: false, error: `reasonix doctor exited with code ${result.status}`, data: null, cache: 'live' };
+  try {
+    const data = JSON.parse(result.stdout);
+    writeDoctorCache(cliPath, cachePath, data);
+    return { ok: true, error: '', data, cache: options.refresh ? 'refreshed' : 'miss', cachePath, fetchedAt: Date.now() };
   } catch (error) {
-    return { ok: false, error: `cannot parse reasonix doctor output: ${error.message}`, data: null };
+    return { ok: false, error: `cannot parse reasonix doctor output: ${error.message}`, data: null, cache: 'live' };
   }
 }
 
@@ -215,12 +306,15 @@ export function readBridgeConfig(configPath = BRIDGE_CONFIG_PATH) {
 }
 
 /** Resolves the subagent model ref, recording where it came from. */
-export function resolveModelRef({ cliPath, bridgeConfig } = {}) {
+export function resolveModelRef({ cliPath, bridgeConfig, doctorOptions } = {}) {
   const fromEnv = (process.env.REASONIX_MODEL_REF ?? '').trim();
   if (fromEnv) return { ref: fromEnv, source: 'REASONIX_MODEL_REF environment variable', doctor: null };
   const fromFile = typeof bridgeConfig?.data?.modelRef === 'string' ? bridgeConfig.data.modelRef.trim() : '';
   if (fromFile) return { ref: fromFile, source: bridgeConfig.path, doctor: null };
-  const doctor = readDoctor(cliPath);
+  const resolvedDoctorOptions = doctorOptions?.cachePath
+    ? doctorOptions
+    : { ...(doctorOptions ?? {}), cachePath: doctorCachePath(bridgeConfig?.path ?? BRIDGE_CONFIG_PATH) };
+  const doctor = readDoctor(cliPath, 30_000, resolvedDoctorOptions);
   if (doctor.ok) {
     const ref = typeof doctor.data?.config?.default_model === 'string' ? doctor.data.config.default_model.trim() : '';
     if (ref) return { ref, source: 'reasonix default_model (auto fallback)', doctor };

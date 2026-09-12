@@ -15,6 +15,7 @@ Every machine may use a different provider, so no model reference is hard-coded.
 
 ```bash
 node src/configure.mjs list      # every <provider>/<model> ref this machine reports (key present, Reasonix default, current)
+node src/configure.mjs list --refresh # bypass the doctor inventory cache and query the CLI
 node src/configure.mjs use <ref> # write it to bridge.config.json (a preset name works too)
 node src/configure.mjs show      # effective configuration and where each value comes from
 node src/configure.mjs profile   # inspect the selected profile and report drift
@@ -24,6 +25,12 @@ node src/configure.mjs verify    # check CLI + model ref + subagent profile
 ```
 
 `presets.example.json` ships three editable examples (OpenCode Go, Shizi gateway, DeepSeek official) and `node src/configure.mjs presets` lists them once you copy it to `presets.json`. Provider ids are account-specific — always take the refs from `configure list` on the machine you are setting up instead of copying someone else's value.
+
+Doctor inventory responses are cached beside `bridge.config.json` as
+`bridge.config.json.doctor-cache.json`. The cache stores only the redacted provider/model summary,
+CLI path, CLI mtime, version, and fetch timestamp. It is valid for 10 minutes; a changed CLI file,
+expired or malformed cache, or `--refresh` causes a live query. A failed live query is returned as an
+error and never replaced with stale inventory.
 
 Resolution order for the model reference (first hit wins):
 
