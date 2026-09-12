@@ -29,11 +29,11 @@ const TASK_CHAR_CAP = 8000;
 const HARD_OUTPUT_CHAR_CAP = 24000;
 const HARD_QUEUE_CAP = 5;
 const HISTORY_HARD_CAP_BYTES = 128 * 1024 * 1024;
-const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSteps: 16, timeoutSeconds: 240 } };
+const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSteps: 16, timeoutSeconds: 240 }, plan: { maxSteps: 16, timeoutSeconds: 240 } };
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
-  { name: 'reasonix_run', description: 'Run the read-only DeepSeek worker in Reasonix for inspection, review and failure analysis.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
+  { name: 'reasonix_run', description: 'Run the read-only DeepSeek worker in inspect, review or machine-readable plan mode.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
 
@@ -196,9 +196,9 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode })
     child.on('error', (error) => finish({ isError: true, text: `cannot start reasonix CLI: ${error.message}` }, 'spawn_error'));
     child.on('close', (code) => {
       if (settled) return;
-      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(stdout.trim(), outputCharCap);
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(mode === 'plan' ? stdout : stdout.trim(), outputCharCap);
       if (code !== 0) finish({ isError: true, text: `worker exited with code ${code} (${elapsed}s)${body ? `\n\n--- stdout ---\n${body}` : ''}${stderr ? `\n\n--- stderr ---\n${truncate(stderr, 2000)}` : ''}` }, 'worker_exit', code);
-      else finish({ isError: false, text: `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
+      else finish({ isError: false, text: mode === 'plan' ? body : `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
   });
 }
@@ -226,7 +226,7 @@ async function callTool(name, args) {
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
-  const logRejected = (error) => recordRun({ mode: ['inspect', 'review', 'implement'].includes(mode) ? mode : 'invalid', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false, error });
+  const logRejected = (error) => recordRun({ mode: ['inspect', 'review', 'implement', 'plan'].includes(mode) ? mode : 'invalid', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false, error });
   const task = typeof args?.task === 'string' ? args.task.trim() : '';
   if (!task) { logRejected('task_required'); throw new Error('task is required'); }
   if (task.length > TASK_CHAR_CAP) { logRejected('task_too_long'); throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`); }

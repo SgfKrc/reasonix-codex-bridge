@@ -113,6 +113,16 @@ always reports the effective values used for calls.
 configured capacity, and a retry-after hint. The summary never contains task text, worker output,
 model references, or absolute paths.
 
+`reasonix_run` also accepts read-only `mode=plan`. In this mode the bridge returns worker stdout
+unchanged so callers can consume a machine-readable change list, for example:
+
+```json
+{"schema":"qlh.reasonix.plan.v1","changes":[{"file":"src/server.mjs","location":"line 1","reason":"...","patch":"..."}]}
+```
+
+The plan is advisory only: the bridge does not parse or apply it, and `mode=implement` remains
+disabled. Use repository-relative file names and omit file contents from plan entries.
+
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
 stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
