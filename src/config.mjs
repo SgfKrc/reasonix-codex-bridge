@@ -358,8 +358,13 @@ export function resolveSubagentRole(bridgeConfig, subagent = resolveSubagent(bri
   const configured = (process.env.REASONIX_SUBAGENT_ROLE ?? '').trim().toLowerCase()
     || (typeof bridgeConfig?.data?.subagentRole === 'string' ? bridgeConfig.data.subagentRole.trim().toLowerCase() : '');
   if (configured && !['read', 'write'].includes(configured)) throw new ConfigError(`invalid subagent role: ${configured}`);
-  if (configured) return { role: configured, source: configured === (process.env.REASONIX_SUBAGENT_ROLE ?? '').trim().toLowerCase() ? 'REASONIX_SUBAGENT_ROLE environment variable' : bridgeConfig.path };
   const writeName = resolveRoleSubagent(bridgeConfig, 'write').name;
+  if (configured) {
+    if (configured === 'read' && subagent.name === writeName) {
+      throw new ConfigError(`subagent role read conflicts with selected write profile: ${subagent.name}`);
+    }
+    return { role: configured, source: configured === (process.env.REASONIX_SUBAGENT_ROLE ?? '').trim().toLowerCase() ? 'REASONIX_SUBAGENT_ROLE environment variable' : bridgeConfig.path };
+  }
   return { role: subagent.name === writeName ? 'write' : 'read', source: subagent.name === writeName ? 'write profile name' : 'default read role' };
 }
 

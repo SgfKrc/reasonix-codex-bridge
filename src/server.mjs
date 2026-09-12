@@ -101,7 +101,12 @@ if (VERSION_CHECK.status === 'unknown') log(`warning: Reasonix CLI version check
 
 const WORKSPACE_ROOT = resolveWorkspaceRoot(bridgeConfig);
 const SUBAGENT = resolveSubagent(bridgeConfig);
-const SUBAGENT_ROLE = resolveSubagentRole(bridgeConfig, SUBAGENT);
+let SUBAGENT_ROLE;
+try {
+  SUBAGENT_ROLE = resolveSubagentRole(bridgeConfig, SUBAGENT);
+} catch (error) {
+  refuse(error instanceof ConfigError ? error.message : String(error?.message ?? error));
+}
 const MODEL_RESOLUTION = resolveModelRef({ cliPath: CLI_PATH, bridgeConfig });
 const MODEL_REF = MODEL_RESOLUTION.ref;
 if (!MODEL_REF) {
@@ -481,6 +486,14 @@ async function callTool(name, args) {
   }
   const preset = MODES[mode];
   if (!preset) { logRejected('mode_invalid'); throw new Error(`mode must be one of ${Object.keys(MODES).join(', ')}`); }
+  if (mode !== 'implement' && SUBAGENT_ROLE.role !== 'read') {
+    logRejected('write_profile_not_allowed');
+    return { isError: true, text: `mode=${mode} requires a read-role subagent; selected role is ${SUBAGENT_ROLE.role}.` };
+  }
+  if (mode === 'implement' && SUBAGENT_ROLE.role !== 'write') {
+    logRejected('write_profile_required');
+    return { isError: true, text: 'mode=implement requires an explicit write-role subagent.' };
+  }
   let cwd;
   try { cwd = resolveCwd(args?.cwd); } catch (error) { logRejected('cwd_invalid'); throw error; }
   const maxSteps = clampInteger(args?.max_steps, preset.maxSteps, LIMITS.maxStepsCap); const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, LIMITS.timeoutSecondsCap);

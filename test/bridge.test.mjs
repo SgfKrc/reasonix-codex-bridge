@@ -19,6 +19,7 @@ import {
   WRITE_PROFILE_TOOLS,
   readDoctor,
   resolveModelRef,
+  resolveSubagentRole,
   upsertReasonixBlock,
   validateCodexBlock,
   validateModelRef,
@@ -649,6 +650,51 @@ describe('offline command contracts', () => {
     assert.equal(status.workerReadOnlyAssumed, false);
   });
 
+  test('write profile is rejected for read-only modes', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const marker = path.join(root, 'write-marker');
+    writeFileSync(path.join(root, 'subagent'), `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'must not run');`, 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      cwd: root,
+      env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write' }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'review only', mode: 'review' } } }]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, true);
+    assert.match(responses[0].result.content[0].text, /requires a read-role/);
+    assert.equal(existsSync(marker), false);
+  });
+
+  test('implement requires an explicit write-role subagent', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
+    const marker = path.join(root, 'write-marker');
+    writeFileSync(path.join(root, 'subagent'), `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'must not run');`, 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'write', mode: 'implement' } } }]);
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, true);
+    assert.match(responses[0].result.content[0].text, /requires an explicit write-role/);
+    assert.equal(existsSync(marker), false);
+  });
+
+  test('explicit read role cannot downgrade the canonical write profile', () => {
+    const previous = process.env.REASONIX_SUBAGENT_ROLE;
+    process.env.REASONIX_SUBAGENT_ROLE = 'read';
+    try {
+      assert.throws(() => resolveSubagentRole({ data: {}, path: 'fixture' }, { name: 'deepseek-worker-write' }), /conflicts with selected write profile/);
+    } finally {
+      if (previous === undefined) delete process.env.REASONIX_SUBAGENT_ROLE;
+      else process.env.REASONIX_SUBAGENT_ROLE = previous;
+    }
+  });
+
   test('implement stays disabled until the bridge config opts in', async () => {
     const root = tempRoot();
     writeCliFiles(root);
@@ -677,7 +723,7 @@ fs.writeFileSync(process.env.WRITE_TARGET, 'after');
 process.stdout.write('implemented');
 `, 'utf8');
     commitFixture(root);
-    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const client = mcpClient(child);
     const writeResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'write allowed file', mode: 'implement' } });
     const changeSet = JSON.parse(writeResponse.result.content[0].text);
@@ -714,7 +760,7 @@ fs.writeFileSync(process.env.WORKER_MARKER, 'called');
 `, 'utf8');
     commitFixture(root);
     writeFileSync(path.join(root, 'unrelated.txt'), 'dirty', 'utf8');
-    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WORKER_MARKER: marker }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WORKER_MARKER: marker }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'must wait for clean tree', mode: 'implement' } } }]);
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
@@ -733,7 +779,7 @@ const fs = require('node:fs');
 fs.writeFileSync(process.env.WRITE_TARGET, 'after');
 `, 'utf8');
     commitFixture(root);
-    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const client = mcpClient(child);
     const writeResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'write once', mode: 'implement' } });
     const changeSet = JSON.parse(writeResponse.result.content[0].text);
@@ -757,7 +803,7 @@ process.stdout.write('implemented');
 `, 'utf8');
     commitFixture(root);
     const target = path.join(root, 'outside.txt');
-    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WRITE_TARGET: target }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WRITE_TARGET: target }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'write outside file', mode: 'implement' } } }]);
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
