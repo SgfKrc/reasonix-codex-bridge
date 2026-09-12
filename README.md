@@ -128,4 +128,6 @@ the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit co
 stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
 paths are never written. With `BRIDGE_LOG` unset, the bridge performs no log writes.
 
-The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots, rejects `implement`, limits task/budget/output sizes, and terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's hard 128 MB history limit. A persistent ACP transport is a later extension; it must compact or rotate the session before 128 MB and never treat that limit as configurable.
+The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots, rejects `implement`, limits task/budget/output sizes, and terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's hard 128 MB history limit.
+
+Persistent ACP transport remains design-only; see `ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The offline prototype in `src/acp-prototype.mjs` triggers transactional compaction at 75% of the fixed 128 MiB Reasonix history cap, rotates when a compacted session still cannot fit, and falls back to per-call without mutating persistent history when compaction fails. `src/server.mjs` remains stateless and does not import the prototype.
