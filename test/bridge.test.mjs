@@ -294,6 +294,58 @@ describe('offline command contracts', () => {
     assert.match(shown.stdout, /doctor inventory: refreshed/);
   });
 
+  test('configure export is redacted and import only prints safe differences', () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeProfile(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
+    const profileEnv = { REASONIX_SKILLS_DIR: path.join(root, 'skills') };
+    const exported = runNode([CONFIGURE_PATH, 'export'], root, profileEnv);
+    assert.equal(exported.status, 0, exported.stderr);
+    const summary = JSON.parse(exported.stdout);
+    assert.equal(summary.schema, 1);
+    assert.equal(summary.current.modelRef, 'fixture/provider');
+    assert.equal(summary.current.profile, 'deepseek-worker');
+    assert.equal(summary.current.profileReadOnly, true);
+    assert.equal(summary.providers[0].name, 'fixture');
+    assert.equal(Object.hasOwn(summary.providers[0], 'key_present'), false);
+    assert.equal(Object.hasOwn(summary.providers[0], 'base_url_host'), false);
+    const rootPattern = new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    assert.doesNotMatch(exported.stdout, rootPattern);
+
+    const imported = {
+      ...summary,
+      platform: { ...summary.platform, os: summary.platform.os === 'win32' ? 'linux' : 'win32' },
+      providers: [{ name: 'other', models: ['other-model'] }],
+      current: { ...summary.current, modelRef: 'other/provider' },
+    };
+    const summaryPath = path.join(root, 'peer-summary.json');
+    writeFileSync(summaryPath, JSON.stringify(imported), 'utf8');
+    const bridgePath = path.join(root, 'bridge.config.json');
+    const bridgeBefore = readFileSync(bridgePath, 'utf8');
+    const compared = runNode([CONFIGURE_PATH, 'import', summaryPath], root, profileEnv);
+    assert.equal(compared.status, 0, compared.stderr);
+    assert.match(compared.stdout, /DIFF platform/);
+    assert.match(compared.stdout, /DIFF current/);
+    assert.doesNotMatch(compared.stdout, rootPattern);
+    assert.equal(readFileSync(bridgePath, 'utf8'), bridgeBefore);
+    assert.equal(readdirSync(root).some((name) => name === 'codex.config.toml'), false);
+
+    const unsafe = { ...summary, current: { ...summary.current, modelRef: 'https://secret.example/token' } };
+    writeFileSync(summaryPath, JSON.stringify(unsafe), 'utf8');
+    const rejected = runNode([CONFIGURE_PATH, 'import', summaryPath], root, profileEnv);
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /current\.modelRef is invalid/);
+    assert.doesNotMatch(rejected.stderr, /secret\.example/);
+
+    const unsafeVersion = { ...summary, reasonix: { ...summary.reasonix, version: 'C:\\Users\\secret\\version' } };
+    writeFileSync(summaryPath, JSON.stringify(unsafeVersion), 'utf8');
+    const rejectedVersion = runNode([CONFIGURE_PATH, 'import', summaryPath], root, profileEnv);
+    assert.equal(rejectedVersion.status, 1);
+    assert.match(rejectedVersion.stderr, /reasonix is invalid/);
+    assert.doesNotMatch(rejectedVersion.stderr, /Users\\secret/);
+  });
+
   test('verify fails below the default version and downgrades only with an explicit override', () => {
     const root = tempRoot();
     const cli = writeVersionStub(root, '1.38.5');

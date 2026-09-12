@@ -18,6 +18,8 @@ node src/configure.mjs list      # every <provider>/<model> ref this machine rep
 node src/configure.mjs list --refresh # bypass the doctor inventory cache and query the CLI
 node src/configure.mjs use <ref> # write it to bridge.config.json (a preset name works too)
 node src/configure.mjs show      # effective configuration and where each value comes from
+node src/configure.mjs export    # print a redacted, path-free environment summary as JSON
+node src/configure.mjs import summary.json # compare a summary; use '-' to read stdin, never writes config
 node src/configure.mjs profile   # inspect the selected profile and report drift
 node src/configure.mjs profile --sync        # print the exact edit command (no write)
 node src/configure.mjs profile --sync --write # execute edit, enforce read-only, then re-check
@@ -31,6 +33,11 @@ Doctor inventory responses are cached beside `bridge.config.json` as
 CLI path, CLI mtime, version, and fetch timestamp. It is valid for 10 minutes; a changed CLI file,
 expired or malformed cache, or `--refresh` causes a live query. A failed live query is returned as an
 error and never replaced with stale inventory.
+
+`configure export` reports only platform, Node major, Reasonix version status, provider/model names,
+the current model ref, and profile name/model/read-only/tools metadata. It omits CLI/config/profile
+paths, keys, and endpoints. `configure import <file|->` validates that schema and prints only
+field-level differences; it never changes `bridge.config.json`, Codex config, or profiles.
 
 Resolution order for the model reference (first hit wins):
 
