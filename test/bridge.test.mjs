@@ -529,7 +529,7 @@ describe('offline command contracts', () => {
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
     assert.equal(responses[0].result.serverInfo.name, 'reasonix-local-bridge');
-    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_status']);
+    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_rollback', 'reasonix_status']);
     const status = JSON.parse(responses[2].result.content[0].text);
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
@@ -599,11 +599,28 @@ process.stdout.write('implemented');
 `, 'utf8');
     commitFixture(root);
     const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'write allowed file', mode: 'implement' } } }]);
+    const client = mcpClient(child);
+    const writeResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'write allowed file', mode: 'implement' } });
+    const changeSet = JSON.parse(writeResponse.result.content[0].text);
+    assert.equal(writeResponse.result.isError, false);
+    assert.equal(changeSet.schema, 'qlh.reasonix.changes.v1');
+    assert.match(changeSet.rollback_id, /^[0-9a-f-]{36}$/);
+    assert.equal(changeSet.changes.length, 1);
+    assert.equal(changeSet.changes[0].path, 'allowed.txt');
+    assert.match(changeSet.changes[0].sha256, /^[0-9a-f]{64}$/);
+    assert.equal(changeSet.changes[0].additions, 1);
+    assert.equal(changeSet.changes[0].deletions, 1);
+    assert.doesNotMatch(writeResponse.result.content[0].text, /implemented|after/);
+    const rollbackResponse = await client.request(2, 'tools/call', { name: 'reasonix_rollback', arguments: { rollback_id: changeSet.rollback_id } });
+    const rollbackSet = JSON.parse(rollbackResponse.result.content[0].text);
+    assert.equal(rollbackResponse.result.isError, false);
+    assert.equal(rollbackSet.status, 'rolled_back');
+    child.stdin.end();
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
-    assert.equal(responses[0].result.isError, false);
-    assert.equal(readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'after');
+    assert.equal(readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'before');
+    const status = spawnSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8', windowsHide: true });
+    assert.equal(status.stdout.trim(), '');
   });
 
   test('implement refuses an existing dirty tree by default', async () => {
@@ -625,6 +642,29 @@ fs.writeFileSync(process.env.WORKER_MARKER, 'called');
     assert.equal(responses[0].result.isError, true);
     assert.match(responses[0].result.content[0].text, /clean Git workspace/);
     assert.equal(existsSync(marker), false);
+  });
+
+  test('rollback refuses to overwrite a later manual edit', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'allowed.txt'), 'before', 'utf8');
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.WRITE_TARGET, 'after');
+`, 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    const writeResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'write once', mode: 'implement' } });
+    const changeSet = JSON.parse(writeResponse.result.content[0].text);
+    writeFileSync(path.join(root, 'allowed.txt'), 'manual edit after worker', 'utf8');
+    const rollbackResponse = await client.request(2, 'tools/call', { name: 'reasonix_rollback', arguments: { rollback_id: changeSet.rollback_id } });
+    assert.equal(rollbackResponse.result.isError, true);
+    assert.match(rollbackResponse.result.content[0].text, /changed after the implement call/);
+    assert.equal(readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'manual edit after worker');
+    child.stdin.end();
+    await new Promise((resolve) => child.once('close', resolve));
   });
 
   test('implement rolls back a change outside the whitelist', async () => {

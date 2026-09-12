@@ -1,6 +1,8 @@
 /** Local stdio MCP facade for the read-only Reasonix worker. */
-import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import {
@@ -37,6 +39,7 @@ const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(pro
 
 const TOOLS = [
   { name: 'reasonix_run', description: 'Run the read-only DeepSeek worker in inspect, review or machine-readable plan mode.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
+  { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
 
@@ -113,6 +116,8 @@ const SUBAGENT_NAME = SUBAGENT.name;
 const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
 const MODEL_CAPABILITIES = resolveModelCapabilities();
 const WRITE_POLICY = resolveWritePolicy(bridgeConfig);
+const rollbackRecords = new Map();
+const MAX_ROLLBACK_RECORDS = 32;
 
 function resolveModelCapabilities() {
   const doctor = MODEL_RESOLUTION.doctor?.ok
@@ -203,6 +208,109 @@ async function rollbackEntries(root, entries) {
     try { rmSync(path.join(root, relativePath), { recursive: true, force: true }); } catch (error) { errors.push(`remove ${relativePath}: ${error.message}`); }
   }
   return { ok: errors.length === 0, error: errors.join('; ') };
+}
+function runGitSync(root, args) {
+  const result = spawnSync('git', ['-C', root, ...args], cliSpawnOptions('git', {
+    encoding: 'utf8',
+    windowsHide: true,
+    maxBuffer: 4 * 1024 * 1024,
+  }));
+  if (result.error || result.status !== 0) return { ok: false, stdout: '', error: result.error?.message || `git ${args[0]} exited with code ${result.status}` };
+  return { ok: true, stdout: String(result.stdout ?? ''), error: '' };
+}
+function hashFile(filePath) {
+  return new Promise((resolve) => {
+    if (!existsSync(filePath)) return resolve(null);
+    let hash;
+    try { hash = createHash('sha256'); } catch { return resolve(null); }
+    const stream = createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.once('error', () => resolve(null));
+    stream.once('end', () => resolve(hash.digest('hex')));
+  });
+}
+function countTextLines(filePath) {
+  try {
+    const data = readFileSync(filePath);
+    if (data.includes(0)) return { additions: null, deletions: null, binary: true };
+    const text = data.toString('utf8');
+    return { additions: text === '' ? 0 : text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length - (text.endsWith('\n') ? 1 : 0), deletions: 0, binary: false };
+  } catch {
+    return { additions: null, deletions: null, binary: false };
+  }
+}
+function gitNumstat(root, paths) {
+  if (!paths.length) return new Map();
+  const result = runGitSync(root, ['diff', 'HEAD', '--numstat', '--', ...paths]);
+  if (!result.ok) return new Map();
+  const stats = new Map();
+  for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
+    const match = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+    if (!match) continue;
+    stats.set(match[3].replaceAll('\\', '/'), {
+      additions: match[1] === '-' ? null : Number(match[1]),
+      deletions: match[2] === '-' ? null : Number(match[2]),
+      binary: match[1] === '-' || match[2] === '-',
+    });
+  }
+  return stats;
+}
+function gitDiffStat(root, paths) {
+  if (!paths.length) return '';
+  const result = runGitSync(root, ['diff', 'HEAD', '--stat', '--', ...paths]);
+  return result.ok ? result.stdout.trim() : '';
+}
+function changeKind(entry) {
+  if (entry.status.includes('D')) return 'deleted';
+  if (entry.status.includes('A') || entry.status.includes('?')) return 'added';
+  return 'modified';
+}
+async function buildChangeSet(root, entries, rollbackId = null) {
+  const paths = entries.map((entry) => entry.path);
+  const numstat = gitNumstat(root, paths);
+  const changes = [];
+  for (const entry of entries) {
+    const filePath = path.resolve(root, entry.path);
+    const exists = existsSync(filePath) && statSync(filePath).isFile();
+    const kind = changeKind(entry);
+    const fileHash = exists ? await hashFile(filePath) : null;
+    let lineStats = numstat.get(entry.path);
+    if (!lineStats && exists && kind === 'added') lineStats = countTextLines(filePath);
+    if (!lineStats) lineStats = { additions: kind === 'deleted' ? 0 : null, deletions: kind === 'deleted' ? null : 0, binary: false };
+    changes.push({ path: entry.path, kind, additions: lineStats.additions, deletions: lineStats.deletions, binary: lineStats.binary, sha256: fileHash });
+  }
+  return {
+    schema: 'qlh.reasonix.changes.v1',
+    rollback_id: rollbackId,
+    diff_stat: gitDiffStat(root, paths) || (changes.length ? `untracked changes: ${changes.length} file(s)` : ''),
+    changes,
+  };
+}
+function rememberRollback(root, changes) {
+  if (!changes.length) return null;
+  const rollbackId = randomUUID();
+  rollbackRecords.set(rollbackId, { root, changes, createdAt: Date.now() });
+  while (rollbackRecords.size > MAX_ROLLBACK_RECORDS) rollbackRecords.delete(rollbackRecords.keys().next().value);
+  return rollbackId;
+}
+async function explicitRollback(rollbackId) {
+  const value = typeof rollbackId === 'string' ? rollbackId.trim() : '';
+  if (!value) return { isError: true, text: 'rollback_id is required' };
+  const record = rollbackRecords.get(value);
+  if (!record) return { isError: true, text: 'rollback_id is unknown or has expired' };
+  const conflicts = [];
+  for (const change of record.changes) {
+    const currentPath = path.resolve(record.root, change.path);
+    const exists = existsSync(currentPath) && statSync(currentPath).isFile();
+    const currentHash = exists ? await hashFile(currentPath) : null;
+    if (currentHash !== change.sha256 && !(currentHash === null && change.sha256 === null)) conflicts.push(change.path);
+  }
+  if (conflicts.length) return { isError: true, text: `rollback refused because files changed after the implement call: ${conflicts.join(', ')}` };
+  const entries = record.changes.map((change) => ({ path: change.path, status: change.kind === 'added' ? '??' : change.kind === 'deleted' ? ' D' : ' M' }));
+  const rollback = await rollbackEntries(record.root, entries);
+  if (!rollback.ok) return { isError: true, text: `rollback failed: ${rollback.error}` };
+  rollbackRecords.delete(value);
+  return { isError: false, text: JSON.stringify({ schema: 'qlh.reasonix.rollback.v1', rollback_id: value, status: 'rolled_back', paths: record.changes.map((change) => change.path) }) };
 }
 function clampInteger(value, fallback, cap) {
   const safeFallback = Math.min(cap, Math.max(1, Math.trunc(fallback)));
@@ -317,14 +425,17 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
     const rollbackText = rollback.ok ? 'rollback completed' : `rollback failed: ${rollback.error}`;
     const outcome = disallowed.length ? 'write_rejected' : (result.meta?.outcome ?? 'worker_exit');
     recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-    return { isError: true, text: `${reason}; ${rollbackText}`, meta: { ...result.meta, outcome } };
+    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, outcome } };
   }
   if (result.isError) {
     recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: result.meta?.outcome ?? 'worker_exit', exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-    return result;
+    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome: result.meta?.outcome ?? 'worker_exit', error: 'worker failed; no changes were retained', changes: [] }), meta: result.meta };
   }
+  const changeSet = await buildChangeSet(WORKSPACE_ROOT, changed);
+  const rollbackId = rememberRollback(WORKSPACE_ROOT, changeSet.changes);
+  changeSet.rollback_id = rollbackId;
   recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-  return result;
+  return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, outcome: 'success', rollbackId } };
 }
 function estimateTaskTokens(task) {
   return Math.max(1, Math.ceil(Buffer.byteLength(task, 'utf8') / 4));
@@ -349,7 +460,8 @@ function enqueue(job, meta) {
   return run.finally(() => { queueDepth -= 1; });
 }
 async function callTool(name, args) {
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_rollback') return explicitRollback(args?.rollback_id);
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);

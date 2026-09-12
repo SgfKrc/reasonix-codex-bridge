@@ -1,6 +1,6 @@
 # Reasonix ↔ Codex MCP Bridge
 
-Zero-dependency stdio MCP server for Codex. It exposes a narrow `reasonix_run` tool that starts the configured Reasonix subagent and a `reasonix_status` diagnostic tool. The worker remains read-only by default; controlled writes require an explicit policy.
+Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_rollback`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
 
 Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited release contents.
 
@@ -160,8 +160,12 @@ are repository-relative exact files or directory prefixes, never absolute paths 
 Before a write call the bridge requires a verifiable Git workspace and, by default, no existing
 changes. After the worker exits it compares Git status with the pre-call snapshot. Any path outside
 the whitelist, or any failed worker, causes the changes from that call to be rolled back. A dirty
-allowed path is rejected even when `requireCleanTree` is explicitly false. W2 will add structured
-change evidence and a principal-controlled rollback entry; W3 will add a dedicated write profile.
+allowed path is rejected even when `requireCleanTree` is explicitly false. A successful write returns
+only a `qlh.reasonix.changes.v1` change set with repository-relative paths, add/delete counts,
+`git diff --stat`, SHA-256 hashes, and a one-shot `rollback_id`; worker stdout and file contents are
+never returned. Call `reasonix_rollback` explicitly with that id to restore the call's changes.
+Rollback refuses to overwrite a file that changed after the implement call, and rollback records
+live only in the current bridge process. W3 will add a dedicated write profile.
 
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
