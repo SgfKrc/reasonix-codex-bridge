@@ -1,18 +1,21 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, describe, test } from 'node:test';
 import {
   DEFAULT_MIN_REASONIX_VERSION,
+  DEFAULT_DOCTOR_CACHE_TTL_MS,
   atomicWriteFile,
   checkCliVersion,
   compareVersions,
+  doctorCachePath,
   doctorRefs,
   parseProfileFrontmatter,
   parseVersion,
+  readDoctor,
   resolveModelRef,
   upsertReasonixBlock,
   validateCodexBlock,
@@ -177,6 +180,37 @@ describe('configuration pure functions', () => {
     assert.equal(result.refs[2].keyPresent, false);
   });
 
+  test('caches doctor inventory, expires it, and invalidates on CLI changes', () => {
+    const root = tempRoot();
+    const cli = writeVersionStub(root, '1.38.7');
+    const cachePath = doctorCachePath(path.join(root, 'bridge.config.json'));
+    const first = readDoctor(cli, 30_000, { cachePath });
+    assert.equal(first.cache, 'miss');
+    assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).schema, 1);
+    assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).data.providers[0].name, 'fixture');
+    const second = readDoctor(cli, 30_000, { cachePath });
+    assert.equal(second.cache, 'hit');
+
+    writeFileSync(cachePath, '{broken', 'utf8');
+    const recovered = readDoctor(cli, 30_000, { cachePath });
+    assert.equal(recovered.cache, 'miss');
+    const malformed = JSON.parse(readFileSync(cachePath, 'utf8'));
+    malformed.data = { providers: 'not-an-array' };
+    writeFileSync(cachePath, JSON.stringify(malformed), 'utf8');
+    assert.equal(readDoctor(cli, 30_000, { cachePath }).cache, 'miss');
+    const expired = JSON.parse(readFileSync(cachePath, 'utf8'));
+    expired.fetchedAt = Date.now() - DEFAULT_DOCTOR_CACHE_TTL_MS - 1;
+    writeFileSync(cachePath, JSON.stringify(expired), 'utf8');
+    const refreshedAfterExpiry = readDoctor(cli, 30_000, { cachePath });
+    assert.equal(refreshedAfterExpiry.cache, 'miss');
+
+    const changedAt = new Date(Date.now() + 20_000);
+    utimesSync(cli, changedAt, changedAt);
+    const refreshedAfterCliChange = readDoctor(cli, 30_000, { cachePath });
+    assert.equal(refreshedAfterCliChange.cache, 'miss');
+    assert.equal(readDoctor(cli, 30_000, { cachePath, refresh: true }).cache, 'refreshed');
+  });
+
   test('parses profile model, read-only and tool frontmatter', () => {
     const profile = parseProfileFrontmatter('---\nmodel: "fixture/provider"\nread-only: true\nallowed-tools: [read_file, grep]\n---\n');
     assert.equal(profile.model, 'fixture/provider');
@@ -241,6 +275,23 @@ describe('offline command contracts', () => {
     assert.equal((written.match(/^\[mcp_servers\.reasonix_local\]$/gm) ?? []).length, 1);
     assert.equal((written.match(/^\[mcp_servers\.reasonix_local\.env\]$/gm) ?? []).length, 1);
     assert.equal(readdirSync(root).filter((name) => name.includes('codex.config.toml.bak-')).length, 1);
+  });
+
+  test('configure list reuses doctor cache and --refresh bypasses it', () => {
+    const root = tempRoot();
+    const cli = writeVersionStub(root, '1.38.7');
+    const first = runNode([CONFIGURE_PATH, 'list'], root, { REASONIX_EXE: cli });
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stdout, /doctor inventory\s+: live/);
+    const second = runNode([CONFIGURE_PATH, 'list'], root, { REASONIX_EXE: cli });
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(second.stdout, /doctor inventory\s+: cache hit/);
+    const forced = runNode([CONFIGURE_PATH, 'list', '--refresh'], root, { REASONIX_EXE: cli });
+    assert.equal(forced.status, 0, forced.stderr);
+    assert.match(forced.stdout, /doctor inventory\s+: refreshed/);
+    const shown = runNode([CONFIGURE_PATH, 'show', '--refresh'], root, { REASONIX_EXE: cli });
+    assert.equal(shown.status, 0, shown.stderr);
+    assert.match(shown.stdout, /doctor inventory: refreshed/);
   });
 
   test('verify fails below the default version and downgrades only with an explicit override', () => {
