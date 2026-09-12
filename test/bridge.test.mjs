@@ -33,6 +33,7 @@ import {
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
 const CONFIGURE_PATH = path.join(BRIDGE_ROOT, 'src', 'configure.mjs');
+const CHECK_LINKS_PATH = path.join(BRIDGE_ROOT, 'scripts', 'check-readme-links.mjs');
 const tempRoots = new Set();
 
 function tempRoot() {
@@ -295,6 +296,27 @@ describe('configuration pure functions', () => {
 });
 
 describe('offline command contracts', () => {
+  test('README link checker validates local links without network access', () => {
+    const valid = spawnSync(process.execPath, [CHECK_LINKS_PATH], {
+      cwd: BRIDGE_ROOT,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(valid.status, 0, valid.stderr);
+    assert.match(valid.stdout, /README\.md: local links OK/);
+
+    const root = tempRoot();
+    writeFileSync(path.join(root, 'README.md'), '[missing](docs/nope.md)\n[external](https://example.invalid/docs)\n#anchor\n', 'utf8');
+    const broken = spawnSync(process.execPath, [CHECK_LINKS_PATH, 'README.md'], {
+      cwd: root,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(broken.status, 1);
+    assert.match(broken.stderr, /missing local link target docs\/nope\.md/);
+    assert.doesNotMatch(broken.stderr, /example\.invalid/);
+  });
+
   test('configure use and codex --write only touch temporary files', () => {
     const root = tempRoot();
     writeCliFiles(root);
