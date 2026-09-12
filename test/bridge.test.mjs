@@ -16,6 +16,7 @@ import {
   parseProfileFrontmatter,
   parseVersion,
   READ_ONLY_PROFILE_TOOLS,
+  WRITE_PROFILE_TOOLS,
   readDoctor,
   resolveModelRef,
   upsertReasonixBlock,
@@ -70,12 +71,15 @@ const args = process.argv.slice(2);
 if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) {
   const modelIndex = args.indexOf('--model');
   const model = modelIndex >= 0 ? args[modelIndex + 1] : (process.env.PROFILE_MODEL || 'fixture/provider');
-  const lines = ['---', 'name: deepseek-worker', 'description: Fixture worker', 'model: ' + model, 'allowed-tools: [read_file, grep, glob, ls, code_index, git_log, git_diff]'];
-  if (process.env.PROFILE_READ_ONLY !== '0') lines.push('read-only: true');
+  const name = args[2] || 'deepseek-worker';
+  const toolsIndex = args.indexOf('--tools');
+  const tools = toolsIndex >= 0 ? args[toolsIndex + 1].split(',').join(', ') : 'read_file, grep, glob, ls, code_index, git_log, git_diff';
+  const lines = ['---', 'name: ' + name, 'description: Fixture worker', 'model: ' + model, 'allowed-tools: [' + tools + ']'];
+  if ((!name.endsWith('-write') && process.env.PROFILE_READ_ONLY !== '0') || (name.endsWith('-write') && process.env.PROFILE_WRITE_READ_ONLY === '1')) lines.push('read-only: true');
   lines.push('---', '', '# fixture');
   fs.writeFileSync(process.env.PROFILE_TARGET, lines.join('\\n'));
 } else {
-  process.stdout.write('deepseek-worker  read-only\\n');
+  process.stdout.write('deepseek-worker  read-only\\ndeepseek-worker-write  write\\n');
 }
 `, 'utf8');
 }
@@ -84,6 +88,16 @@ function writeProfile(root, model = 'fixture/provider', readOnly = true) {
   const dir = path.join(root, 'skills', 'deepseek-worker');
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, 'allowed-tools: [read_file, grep, glob, ls, code_index, git_log, git_diff]', `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
+  return path.join(dir, 'SKILL.md');
+}
+
+function writeRoleProfile(root, model = 'fixture/provider', readOnly = null) {
+  const dir = path.join(root, 'skills', 'deepseek-worker-write');
+  mkdirSync(dir, { recursive: true });
+  const lines = ['---', 'name: deepseek-worker-write', 'description: Fixture write worker', `model: ${model}`, `allowed-tools: [${WRITE_PROFILE_TOOLS.join(', ')}]`];
+  if (readOnly !== null) lines.push(`read-only: ${readOnly}`);
+  lines.push('---', '', '# fixture');
+  writeFileSync(path.join(dir, 'SKILL.md'), lines.join('\n'), 'utf8');
   return path.join(dir, 'SKILL.md');
 }
 
@@ -281,6 +295,7 @@ describe('configuration pure functions', () => {
     assert.equal(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').fields.description, 'workers #1');
     assert.deepEqual(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').tools, ['read_file', 'grep']);
     assert.deepEqual(READ_ONLY_PROFILE_TOOLS, ['read_file', 'grep', 'glob', 'ls', 'code_index', 'git_log', 'git_diff']);
+    assert.deepEqual(WRITE_PROFILE_TOOLS, [...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
   });
 
   test('upserts bridge blocks at append, first and last boundaries', () => {
@@ -470,6 +485,50 @@ describe('offline command contracts', () => {
     assert.match(after.stdout, /tools: read_file,grep,glob,ls,code_index,git_log,git_diff/);
   });
 
+  test('write profile is separate, explicit, and has no read-only guard', () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
+    const writeProfilePath = path.join(root, 'skills', 'deepseek-worker-write', 'SKILL.md');
+    mkdirSync(path.dirname(writeProfilePath), { recursive: true });
+    const created = runNode([CONFIGURE_PATH, 'profile', '--role', 'write', '--create', '--write'], root, {
+      REASONIX_SKILLS_DIR: path.join(root, 'skills'),
+      PROFILE_TARGET: writeProfilePath,
+    });
+    assert.equal(created.status, 0, created.stderr);
+    assert.match(created.stdout, /profile role : write/);
+    assert.match(created.stdout, /profile name : deepseek-worker-write/);
+    assert.match(created.stdout, /write-role contract are consistent/);
+    const profileText = readFileSync(writeProfilePath, 'utf8');
+    assert.doesNotMatch(profileText, /read-only\s*:/i);
+    assert.match(profileText, /edit_file/);
+    assert.match(profileText, /write_file/);
+    const verified = runNode([CONFIGURE_PATH, 'verify', '--role', 'write'], root, { REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    assert.equal(verified.status, 0, verified.stderr);
+    assert.match(verified.stdout, /subagent profile: deepseek-worker-write .*write-role/);
+    const readVerified = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    assert.equal(readVerified.status, 1);
+    assert.match(readVerified.stdout, /subagent profile: deepseek-worker .*SKILL\.md is missing/);
+  });
+
+  test('write profile sync removes a stale read-only guard without changing read profile', () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const readProfilePath = writeProfile(root);
+    const writeProfilePath = writeRoleProfile(root, 'old/provider', true);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
+    const synced = runNode([CONFIGURE_PATH, 'profile', '--role=write', '--sync', '--write'], root, {
+      REASONIX_SKILLS_DIR: path.join(root, 'skills'),
+      PROFILE_TARGET: writeProfilePath,
+      PROFILE_MODEL: 'fixture/provider',
+      PROFILE_WRITE_READ_ONLY: '1',
+    });
+    assert.equal(synced.status, 0, synced.stderr);
+    assert.doesNotMatch(readFileSync(writeProfilePath, 'utf8'), /read-only\s*:/i);
+    assert.match(readFileSync(writeProfilePath, 'utf8'), /model: fixture\/provider/);
+    assert.match(readFileSync(readProfilePath, 'utf8'), /read-only: true/);
+  });
+
   test('verify fails when the profile tool set drifts from the read-only contract', () => {
     const root = tempRoot();
     writeCliFiles(root);
@@ -533,6 +592,7 @@ describe('offline command contracts', () => {
     const status = JSON.parse(responses[2].result.content[0].text);
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
+    assert.equal(status.subagentRole, 'read');
     assert.equal(status.historyHardCapBytes, 128 * 1024 * 1024);
     assert.equal(status.contextWindow, 4096);
     assert.equal(status.vision, true);
@@ -568,6 +628,25 @@ describe('offline command contracts', () => {
     assert.equal(responses[0].result.isError, true);
     assert.match(responses[0].result.content[0].text, /estimated \d+ tokens; limit 4 tokens/);
     assert.equal(existsSync(marker), false);
+  });
+
+  test('status identifies the explicit write profile without treating it as read-only', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      cwd: root,
+      env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write' }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const responses = await readMcpSession(child, [
+      { id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
+    ]);
+    assert.equal(responses[0].result.isError, false);
+    const status = JSON.parse(responses[0].result.content[0].text);
+    assert.equal(status.subagent, 'deepseek-worker-write');
+    assert.equal(status.subagentRole, 'write');
+    assert.equal(status.workerReadOnlyAssumed, false);
   });
 
   test('implement stays disabled until the bridge config opts in', async () => {

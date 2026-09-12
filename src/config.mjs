@@ -16,6 +16,8 @@ export const SERVER_NAME = 'reasonix-local-bridge';
 export const DEFAULT_SUBAGENT = 'deepseek-worker';
 export const DEFAULT_MIN_REASONIX_VERSION = '1.38.6';
 export const READ_ONLY_PROFILE_TOOLS = Object.freeze(['read_file', 'grep', 'glob', 'ls', 'code_index', 'git_log', 'git_diff']);
+export const WRITE_PROFILE_TOOLS = Object.freeze([...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
+export const DEFAULT_WRITE_SUBAGENT_SUFFIX = '-write';
 export const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
 
@@ -340,6 +342,27 @@ export function resolveSubagent(bridgeConfig) {
   return { name: DEFAULT_SUBAGENT, source: 'bridge default' };
 }
 
+export function resolveRoleSubagent(bridgeConfig, role = 'read') {
+  const base = resolveSubagent(bridgeConfig);
+  if (role === 'read') return { ...base, role };
+  if (role !== 'write') throw new ConfigError(`invalid profile role: ${role}`);
+  if (base.name.endsWith(DEFAULT_WRITE_SUBAGENT_SUFFIX)) return { ...base, role };
+  const fromEnv = (process.env.REASONIX_WRITE_SUBAGENT ?? '').trim();
+  if (fromEnv) return { name: fromEnv, source: 'REASONIX_WRITE_SUBAGENT environment variable', role };
+  const fromFile = typeof bridgeConfig?.data?.writeSubagent === 'string' ? bridgeConfig.data.writeSubagent.trim() : '';
+  if (fromFile) return { name: fromFile, source: bridgeConfig.path, role };
+  return { name: `${base.name}${DEFAULT_WRITE_SUBAGENT_SUFFIX}`, source: 'derived from read profile', role };
+}
+
+export function resolveSubagentRole(bridgeConfig, subagent = resolveSubagent(bridgeConfig)) {
+  const configured = (process.env.REASONIX_SUBAGENT_ROLE ?? '').trim().toLowerCase()
+    || (typeof bridgeConfig?.data?.subagentRole === 'string' ? bridgeConfig.data.subagentRole.trim().toLowerCase() : '');
+  if (configured && !['read', 'write'].includes(configured)) throw new ConfigError(`invalid subagent role: ${configured}`);
+  if (configured) return { role: configured, source: configured === (process.env.REASONIX_SUBAGENT_ROLE ?? '').trim().toLowerCase() ? 'REASONIX_SUBAGENT_ROLE environment variable' : bridgeConfig.path };
+  const writeName = resolveRoleSubagent(bridgeConfig, 'write').name;
+  return { role: subagent.name === writeName ? 'write' : 'read', source: subagent.name === writeName ? 'write profile name' : 'default read role' };
+}
+
 export function resolveWorkspaceRoot(bridgeConfig) {
   const fromEnv = (process.env.REASONIX_ROOT ?? '').trim();
   if (fromEnv) return path.resolve(fromEnv);
@@ -495,12 +518,25 @@ export function ensureProfileReadOnly(filePath) {
   writeFileSync(filePath, `${lines.join('\n').replace(/\n+$/, '')}\n`, 'utf8');
 }
 
-export function profileDrift(profile, modelRef, expectedTools = READ_ONLY_PROFILE_TOOLS) {
+/** Remove every read-only guard from an explicitly selected write profile. */
+export function ensureProfileWritable(filePath) {
+  const text = readFileSync(filePath, 'utf8');
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/);
+  if (lines[0]?.trim() !== '---') throw new ConfigError('profile has no YAML frontmatter');
+  const end = lines.findIndex((line, index) => index > 0 && line.trim() === '---');
+  if (end === -1) throw new ConfigError('profile frontmatter is not closed');
+  const filtered = lines.filter((line, index) => index >= end || !(index > 0 && index < end && /^\s*(read-only|read_only|readOnly)\s*:/i.test(line)));
+  writeFileSync(filePath, `${filtered.join('\n').replace(/\n+$/, '')}\n`, 'utf8');
+}
+
+export function profileDrift(profile, modelRef, expectedTools = READ_ONLY_PROFILE_TOOLS, role = 'read') {
   const issues = [];
   if (!profile?.exists) return [profile?.error || 'profile file is missing'];
   if (!profile.frontmatter?.exists) return [profile.error || 'profile frontmatter is invalid'];
   if (modelRef && profile.frontmatter.model !== modelRef) issues.push(`model=${profile.frontmatter.model || '(missing)'} expected ${modelRef}`);
-  if (profile.frontmatter.readOnly !== true) issues.push('read-only: true is missing');
+  if (role === 'read' && profile.frontmatter.readOnly !== true) issues.push('read-only: true is missing');
+  if (role === 'write' && profile.frontmatter.readOnly !== null) issues.push('read-only must be absent for write role');
+  if (!['read', 'write'].includes(role)) issues.push(`profile role is invalid: ${role}`);
   if (profile.frontmatter.toolsKnown !== true) issues.push('allowed-tools is missing or unparseable');
   else {
     const actual = [...new Set(profile.frontmatter.tools)].sort();
