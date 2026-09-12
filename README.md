@@ -98,4 +98,9 @@ reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_inde
 
 `REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable and always win over `bridge.config.json`. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. Any `<provider>/<model>` ref this machine reports is accepted for `REASONIX_MODEL_REF`; an empty value, whitespace, or a ref without `/` exits with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter. `BRIDGE_CONFIG`, `BRIDGE_PRESETS`, `CODEX_CONFIG`, and `CODEX_HOME` relocate the files the helper scripts read and write.
 
+Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
+the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
+stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
+paths are never written. With `BRIDGE_LOG` unset, the bridge performs no log writes.
+
 The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots, rejects `implement`, limits task/budget/output sizes, and terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's hard 128 MB history limit. A persistent ACP transport is a later extension; it must compact or rotate the session before 128 MB and never treat that limit as configurable.
