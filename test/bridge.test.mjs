@@ -634,6 +634,42 @@ setTimeout(() => process.stdout.write('slow-result'), 500);
   assert.equal(exit, 0);
 });
 
+test('plan mode passes a machine-readable change list without enabling writes', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const plan = {
+    schema: 'qlh.reasonix.plan.v1',
+    changes: [{ file: 'src/server.mjs', location: 'line 1', reason: 'fixture reason', patch: 'replace one line' }],
+  };
+  writeFileSync(path.join(root, 'subagent'), `process.stdout.write(${JSON.stringify(JSON.stringify(plan))});`, 'utf8');
+  const before = readdirSync(root).sort();
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { BRIDGE_LOG: '' }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const responses = await readMcpSession(child, [
+    { id: 1, method: 'tools/list' },
+    { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'plan-secret-task', cwd: '.', mode: 'plan' } } },
+    { id: 3, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
+    { id: 4, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'write-secret-task', cwd: '.', mode: 'implement' } } },
+  ]);
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
+  const planTool = responses[0].result.tools.find((tool) => tool.name === 'reasonix_run');
+  assert.deepEqual(planTool.inputSchema.properties.mode.enum, ['inspect', 'implement', 'review', 'plan']);
+  assert.equal(responses[1].result.isError, false);
+  assert.equal(responses[1].result.content[0].text, JSON.stringify(plan));
+  assert.deepEqual(JSON.parse(responses[1].result.content[0].text), plan);
+  const status = JSON.parse(responses[2].result.content[0].text);
+  assert.ok(status.modes.includes('plan'));
+  assert.equal(status.workerReadOnlyAssumed, true);
+  assert.equal(responses[3].result.isError, true);
+  assert.match(responses[3].result.content[0].text, /mode=implement is disabled/);
+  assert.deepEqual(readdirSync(root).sort(), before);
+});
+
 test('low-version CLI is refused before the bridge starts', () => {
   const root = tempRoot();
   const cli = writeVersionStub(root, '1.38.5');
