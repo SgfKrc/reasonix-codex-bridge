@@ -169,10 +169,10 @@ The caller must also pass `mode=implement`; inspect/review/plan are enforced as 
 reject a selected write profile. Conversely, implement requires an explicit write-role profile.
 `allowedPaths` entries
 are repository-relative exact files or directory prefixes, never absolute paths or `..` escapes.
-Before a write call the bridge requires a verifiable Git workspace and, by default, no existing
-changes. After the worker exits it compares Git status with the pre-call snapshot. Any path outside
-the whitelist, or any failed worker, causes the changes from that call to be rolled back. A dirty
-allowed path is rejected even when `requireCleanTree` is explicitly false. A successful write returns
+Before a write call the bridge requires a verifiable Git workspace and no existing changes.
+`requireCleanTree=false` is rejected as an unsafe policy; the clean-tree gate cannot be disabled.
+After the worker exits it compares Git status with the pre-call snapshot. Any path outside
+the whitelist, or any failed worker, causes the changes from that call to be rolled back. A successful write returns
 only a `qlh.reasonix.changes.v1` change set with repository-relative paths, add/delete counts,
 `git diff --stat`, SHA-256 hashes, and a one-shot `rollback_id`; worker stdout and file contents are
 never returned. Call `reasonix_rollback` explicitly with that id to restore the call's changes.

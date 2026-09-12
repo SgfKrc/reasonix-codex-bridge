@@ -10,6 +10,7 @@ All notable changes to this project are documented here.
 - The write profile uses only `edit_file` and `write_file` beyond the canonical read tools, omits `read-only`, and has a dedicated implementation prompt.
 - Role-aware verification and status reporting for the explicit write profile workflow.
 - Run-mode authorization now rejects write profiles in inspect/review/plan and requires a write profile for implement.
+- Unsafe `requireCleanTree=false` write policies are rejected; controlled writes always require a clean Git tree.
 
 ## [0.1.0] - 2026-09-12
 
