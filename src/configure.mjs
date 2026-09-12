@@ -24,15 +24,18 @@ import {
   isFile,
   profileDrift,
   ensureProfileReadOnly,
+  ensureProfileWritable,
   parseVersion,
   readSubagentProfile,
   readBridgeConfig,
   readDoctor,
   READ_ONLY_PROFILE_TOOLS,
+  WRITE_PROFILE_TOOLS,
   readPresets,
   resolveCliPath,
   resolveModelRef,
   resolveSubagent,
+  resolveRoleSubagent,
   resolveWorkspaceRoot,
   upsertReasonixBlock,
   validateModelRef,
@@ -48,9 +51,10 @@ const USAGE = `Usage: node src/configure.mjs <command>
   presets              list presets from presets.json (copy presets.example.json to create it)
   codex [--write] [--refresh]
                        print the Codex MCP block; --write upserts it into the Codex config (backup first)
-  profile [--create|--sync] [--write] [--refresh]
-                       inspect a profile or print/run a create/edit command, then verify model + read-only
-  verify [--refresh]   check the CLI, the selected model ref, and the subagent profile
+  profile [--role read|write] [--create|--sync] [--write] [--refresh]
+                       inspect a role profile or print/run a create/edit command, then verify its contract
+  verify [--role read|write] [--refresh]
+                       check the CLI, the selected model ref, and the requested role profile
   export [--refresh]   print a path-free, redacted environment summary as JSON
   import <file|-> [--refresh]
                        compare a summary file (or stdin) with this machine; never writes config
@@ -58,7 +62,7 @@ const USAGE = `Usage: node src/configure.mjs <command>
 --refresh             bypass the doctor cache for commands that inspect the machine inventory
 
 Environment overrides: REASONIX_EXE, REASONIX_MODEL_REF, REASONIX_SUBAGENT, REASONIX_ROOT,
-REASONIX_MIN_VERSION, BRIDGE_CONFIG, BRIDGE_PRESETS, CODEX_CONFIG, CODEX_HOME.`;
+REASONIX_WRITE_SUBAGENT, REASONIX_MIN_VERSION, BRIDGE_CONFIG, BRIDGE_PRESETS, CODEX_CONFIG, CODEX_HOME.`;
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -387,30 +391,57 @@ function quoteCommandArg(value) {
   return /[\s"']/u.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
 }
 
+function optionValue(args, option) {
+  const index = args.findIndex((arg) => arg === option || arg.startsWith(`${option}=`));
+  if (index < 0) return '';
+  if (args[index].startsWith(`${option}=`)) return args[index].slice(option.length + 1).trim();
+  return String(args[index + 1] ?? '').trim();
+}
+
+function profileRole(args) {
+  const hasRole = args.some((arg) => arg === '--role' || arg.startsWith('--role='));
+  const value = hasRole ? optionValue(args, '--role') : 'read';
+  if (!value) fail('profile role is required after --role; expected read or write');
+  if (!['read', 'write'].includes(value)) fail(`invalid profile role: ${value}; expected read or write`);
+  return value;
+}
+
+function roleProfile(context, role) {
+  const resolved = resolveRoleSubagent(context.bridgeConfig, role);
+  const promptName = role === 'write' ? 'deepseek-worker-write' : 'deepseek-worker';
+  return {
+    ...resolved,
+    promptFile: path.join(BRIDGE_ROOT, 'prompts', `${promptName}-prompt.md`),
+    tools: role === 'write' ? WRITE_PROFILE_TOOLS : READ_ONLY_PROFILE_TOOLS,
+  };
+}
+
 function profileCommand(args) {
   const create = args.includes('--create');
   const sync = args.includes('--sync');
   const write = args.includes('--write');
+  const role = profileRole(args);
   if (create && sync) fail('profile accepts only one of --create or --sync');
   if (write && !create && !sync) fail('profile --write requires --create or --sync');
   const context = loadContext({ refresh: args.includes('--refresh') });
-  const name = context.subagent.name;
+  const target = roleProfile(context, role);
+  const name = target.name;
   const profile = readSubagentProfile(name);
   if (profile.error && !profile.exists && profile.path === '') fail(profile.error);
   const modelRef = context.resolution.ref;
-  const promptFile = path.join(BRIDGE_ROOT, 'prompts', `${name}-prompt.md`);
-  const defaultTools = READ_ONLY_PROFILE_TOOLS;
   if (sync && profile.frontmatter?.exists && profile.frontmatter.toolsKnown === false) {
     fail(`cannot sync profile with an unparseable allowed-tools field at ${profile.path}; repair it manually first`);
   }
-  const tools = defaultTools;
-  const description = profile.frontmatter?.fields?.description || 'Read-only reconnaissance and failure analysis subagent.';
+  const tools = target.tools;
+  const description = profile.frontmatter?.fields?.description || (role === 'write'
+    ? 'Controlled implementation worker invoked by the bridge after explicit authorization.'
+    : 'Read-only reconnaissance and failure analysis subagent.');
   const commandArgs = create
-    ? ['subagent', 'create', name, '--description', description, '--scope', 'global', '--model', modelRef || '<provider>/<model>', '--prompt-file', promptFile, '--tools', tools.join(',')]
-    : ['subagent', 'edit', name, '--model', modelRef || '<provider>/<model>', '--prompt-file', promptFile, '--tools', tools.join(',')];
+    ? ['subagent', 'create', name, '--description', description, '--scope', 'global', '--model', modelRef || '<provider>/<model>', '--prompt-file', target.promptFile, '--tools', tools.join(',')]
+    : ['subagent', 'edit', name, '--model', modelRef || '<provider>/<model>', '--prompt-file', target.promptFile, '--tools', tools.join(',')];
   const command = `reasonix ${commandArgs.map(quoteCommandArg).join(' ')}`;
-  const issues = profileDrift(profile, modelRef);
-  process.stdout.write(`profile name : ${name}\nprofile path : ${profile.path}\nmodel ref    : ${modelRef || '(unresolved)'}\n`);
+  const issues = profileDrift(profile, modelRef, tools, role);
+  process.stdout.write(`profile role : ${role}\nprofile name : ${name}\nprofile path : ${profile.path}\nmodel ref    : ${modelRef || '(unresolved)'}\n`);
   if (profile.exists && profile.frontmatter?.exists) {
     process.stdout.write(`profile model: ${profile.frontmatter.model || '(missing)'}\nread-only    : ${profile.frontmatter.readOnly === true ? 'true' : profile.frontmatter.readOnly === false ? 'false' : 'missing'}\n`);
     process.stdout.write(`tools       : ${profile.frontmatter.toolsKnown ? profile.frontmatter.tools.join(',') : '(unknown)'}\n`);
@@ -421,7 +452,7 @@ function profileCommand(args) {
     return;
   }
   if (!modelRef) fail(`cannot prepare profile command: model ref unresolved (${context.resolution.error ?? 'no source'})`);
-  if (!isFile(promptFile)) fail(`profile prompt file is missing: ${promptFile}`);
+  if (!isFile(target.promptFile)) fail(`profile prompt file is missing: ${target.promptFile}`);
   if (create && profile.exists) fail(`profile already exists at ${profile.path}; use --sync or inspect it first`);
   if (sync && !profile.exists) fail(`cannot sync missing profile at ${profile.path}; use --create first`);
   process.stdout.write(`command      : ${command}\n`);
@@ -441,21 +472,25 @@ function profileCommand(args) {
   if (result.error) fail(`profile command failed to start: ${result.error.message}`);
   if (result.status !== 0) fail(`profile command failed with code ${result.status}\n${String(result.stderr ?? '').trim()}`);
   let updated = readSubagentProfile(name);
-  if (updated.exists && updated.frontmatter?.readOnly !== true) {
+  if (updated.exists && ((role === 'read' && updated.frontmatter?.readOnly !== true)
+    || (role === 'write' && updated.frontmatter?.readOnly !== null))) {
     try {
-      ensureProfileReadOnly(updated.path);
+      if (role === 'read') ensureProfileReadOnly(updated.path);
+      else ensureProfileWritable(updated.path);
       updated = readSubagentProfile(name);
     } catch (error) {
-      fail(`profile command completed but read-only guard could not be written: ${error.message}`);
+      fail(`profile command completed but role guard could not be normalized: ${error.message}`);
     }
   }
-  const updatedIssues = profileDrift(updated, modelRef);
+  const updatedIssues = profileDrift(updated, modelRef, tools, role);
   if (updatedIssues.length) fail(`profile command completed but consistency check failed at ${updated.path}: ${updatedIssues.join('; ')}`);
-  process.stdout.write(`verified     : ${updated.path} (model and read-only are consistent)\n`);
+  process.stdout.write(`verified     : ${updated.path} (model and ${role === 'read' ? 'read-only' : 'write-role'} contract are consistent)\n`);
 }
 
 function verifyCommand(args = []) {
+  const role = profileRole(args);
   const context = loadContext({ refresh: args.includes('--refresh') });
+  const target = roleProfile(context, role);
   const results = [];
   if (context.cliPath) {
     const version = checkCliVersion(context.cliPath);
@@ -493,14 +528,14 @@ function verifyCommand(args = []) {
   if (context.cliPath) {
     const listed = spawnSync(context.cliPath, ['subagent', 'list'], cliSpawnOptions(context.cliPath, { encoding: 'utf8', timeout: 30_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }));
     const text = `${listed.stdout ?? ''}\n${listed.stderr ?? ''}`;
-    const name = context.subagent.name;
+    const name = target.name;
     const present = listed.status === 0 && text.split('\n').some((line) => line.trim().split(/\s+/)[0] === name);
     const profile = readSubagentProfile(name);
-    const issues = context.resolution.ref ? profileDrift(profile, context.resolution.ref) : [];
-    results.push(!present ? ['fail', `subagent profile: ${name} missing - create it with: reasonix subagent create ${name} --scope global --model "${context.resolution.ref || '<ref>'}" --prompt-file prompts/${name}-prompt.md`]
+    const issues = context.resolution.ref ? profileDrift(profile, context.resolution.ref, target.tools, role) : [];
+    results.push(!present ? ['fail', `subagent profile: ${name} missing - create it with: node src/configure.mjs profile --role ${role} --create --write`]
       : !profile.exists ? ['fail', `subagent profile: ${name} is listed but SKILL.md is missing at ${profile.path || REASONIX_SKILLS_PATH}`]
         : issues.length ? ['fail', `subagent profile drift: ${issues.join('; ')} (${profile.path})`]
-          : ['ok', `subagent profile: ${name} is installed and consistent (model + read-only + tools: ${profile.frontmatter.tools.join(',')})`]);
+          : ['ok', `subagent profile: ${name} is installed and consistent (model + ${role === 'read' ? 'read-only' : 'write-role'} + tools: ${profile.frontmatter.tools.join(',')})`]);
   }
 
   for (const [state, message] of results) process.stdout.write(`${state === 'ok' ? 'OK  ' : state === 'warn' ? 'WARN' : 'FAIL'} ${message}\n`);

@@ -1,4 +1,4 @@
-/** Local stdio MCP facade for the read-only Reasonix worker. */
+/** Local stdio MCP facade for the configured Reasonix worker. */
 import { spawn, spawnSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { appendFileSync, existsSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
@@ -16,6 +16,7 @@ import {
   resolveCliPath,
   resolveModelRef,
   resolveSubagent,
+  resolveSubagentRole,
   resolveWritePolicy,
   resolveWorkspaceRoot,
   validateModelRef,
@@ -38,7 +39,7 @@ const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSte
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
-  { name: 'reasonix_run', description: 'Run the read-only DeepSeek worker in inspect, review or machine-readable plan mode.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
+  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
@@ -100,6 +101,7 @@ if (VERSION_CHECK.status === 'unknown') log(`warning: Reasonix CLI version check
 
 const WORKSPACE_ROOT = resolveWorkspaceRoot(bridgeConfig);
 const SUBAGENT = resolveSubagent(bridgeConfig);
+const SUBAGENT_ROLE = resolveSubagentRole(bridgeConfig, SUBAGENT);
 const MODEL_RESOLUTION = resolveModelRef({ cliPath: CLI_PATH, bridgeConfig });
 const MODEL_REF = MODEL_RESOLUTION.ref;
 if (!MODEL_REF) {
@@ -461,7 +463,7 @@ function enqueue(job, meta) {
 }
 async function callTool(name, args) {
   if (name === 'reasonix_rollback') return explicitRollback(args?.rollback_id);
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: true, historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
@@ -495,7 +497,7 @@ async function handleMessage(message) {
   const handler = handlers[method]; if (!handler) return send({ jsonrpc: '2.0', id, error: { code: -32601, message: `unknown method: ${method}` } });
   try { send({ jsonrpc: '2.0', id, result: await handler(params) }); } catch (error) { const text = error instanceof Error ? error.message : String(error); if (method === 'tools/call') send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: true } }); else send({ jsonrpc: '2.0', id, error: { code: -32603, message: text } }); }
 }
-log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} model=${MODEL_REF} source=${MODEL_REF_SOURCE} readOnly=true`);
+log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} role=${SUBAGENT_ROLE.role} model=${MODEL_REF} source=${MODEL_REF_SOURCE}`);
 const reader = createInterface({ input: process.stdin, terminal: false }); const pendingMessages = new Set();
 reader.on('line', (line) => { if (!line.trim()) return; let message; try { message = JSON.parse(line); } catch { log(`ignored invalid JSON input: ${line.slice(0, 200)}`); return; } const task = handleMessage(message).catch((error) => log(`message failed: ${error?.message ?? error}`)); pendingMessages.add(task); void task.finally(() => pendingMessages.delete(task)); });
 reader.on('close', () => { void Promise.allSettled([...pendingMessages]).then(() => process.exit(0)); });

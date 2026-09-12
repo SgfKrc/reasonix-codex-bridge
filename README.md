@@ -22,10 +22,12 @@ node src/configure.mjs use <ref> # write it to bridge.config.json (a preset name
 node src/configure.mjs show      # effective configuration and where each value comes from
 node src/configure.mjs export    # print a redacted, path-free environment summary as JSON
 node src/configure.mjs import summary.json # compare a summary; use '-' to read stdin, never writes config
-node src/configure.mjs profile   # inspect the selected profile and report drift
-node src/configure.mjs profile --sync        # print the exact edit command (no write)
+node src/configure.mjs profile   # inspect the selected read profile and report drift
+node src/configure.mjs profile --sync        # print the exact read-profile edit command (no write)
 node src/configure.mjs profile --sync --write # execute edit, enforce read-only, then re-check
-node src/configure.mjs verify    # check CLI + model ref + subagent profile
+node src/configure.mjs profile --role write --create --write # create the separate write profile
+node src/configure.mjs verify    # check CLI + model ref + read profile
+node src/configure.mjs verify --role write # check the explicit write profile
 ```
 
 `presets.example.json` ships three editable examples (OpenCode Go, Shizi gateway, DeepSeek official) and `node src/configure.mjs presets` lists them once you copy it to `presets.json`. Provider ids are account-specific — always take the refs from `configure list` on the machine you are setting up instead of copying someone else's value.
@@ -90,7 +92,7 @@ npm run check:links # local README links only; no network access
 The repository CI repeats these three offline checks on Node 20; see the [CI workflow](.github/workflows/ci.yml).
 The link check resolves only relative paths in this repository and skips external URLs, anchors, and mail links.
 
-Create the named profile once in the global Reasonix profile directory. The bridge passes the target workspace with `--dir`, so a project-only profile will not be found when the bridge is copied to another repository:
+Create the named read profile once in the global Reasonix profile directory. The bridge passes the target workspace with `--dir`, so a project-only profile will not be found when the bridge is copied to another repository:
 
 ```powershell
 reasonix subagent create deepseek-worker --scope global --model "<ref shown by: node src/configure.mjs list>" --prompt-file .\prompts\deepseek-worker-prompt.md
@@ -98,16 +100,24 @@ reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_inde
 # `node src/configure.mjs profile --sync --write` can enforce read-only: true and re-check the profile.
 ```
 
-`configure profile` resolves the profile at `%APPDATA%/reasonix/skills/<name>/SKILL.md` on Windows (or `~/.config/reasonix/skills/<name>/SKILL.md` on POSIX). It compares the frontmatter `model` with the bridge model reference and requires `read-only: true`. The command is preview-only unless `--write` is explicit; after a write it re-reads the file and adds the read-only guard if the Reasonix CLI did not emit it. Set `REASONIX_SKILLS_DIR` to a temporary skills root for offline tests or isolated setup.
+`configure profile` resolves profiles at `%APPDATA%/reasonix/skills/<name>/SKILL.md` on Windows (or `~/.config/reasonix/skills/<name>/SKILL.md` on POSIX). The default `read` role uses the configured `deepseek-worker` name, requires `read-only: true`, and is preview-only unless `--write` is explicit. `--role write` targets a separate `<read-profile>-write` profile (or `REASONIX_WRITE_SUBAGENT`/`writeSubagent`), uses `prompts/deepseek-worker-write-prompt.md`, and requires that no `read-only` field is present. Both roles re-read the profile after an explicit write and fail closed on model or tool drift. Set `REASONIX_SKILLS_DIR` to a temporary skills root for offline tests or isolated setup.
 
 The canonical read-only profile tool set is `read_file, grep, glob, ls, code_index, git_log, git_diff`.
 `git_log` and `git_diff` are inspection-only viewers; no write, commit, checkout, reset, network, or
 shell tool is allowed. `configure verify` prints the installed `allowed-tools` list and fails when
 it differs from this documented set.
 
+The canonical write profile adds only `edit_file` and `write_file` to that read set. It has no
+`read-only` field and still has no shell, network, commit, checkout, reset, or delete tool. Creating
+the profile does not enable bridge writes: `allowWrite: true`, a non-empty `allowedPaths`, a clean
+tree, and `mode=implement` are still required. Set `REASONIX_SUBAGENT` to the write profile only
+for an explicitly authorized call. The operating workflow is: main agent gives a bounded task ->
+write subagent edits -> bridge returns structured change evidence -> main agent reviews the diff and
+tests, checks that out-of-scope paths are zero, then keeps or calls `reasonix_rollback`.
+
 ## Environment variables
 
-`REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable and always win over `bridge.config.json`. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. Any `<provider>/<model>` ref this machine reports is accepted for `REASONIX_MODEL_REF`; an empty value, whitespace, or a ref without `/` exits with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter. `BRIDGE_CONFIG`, `BRIDGE_PRESETS`, `CODEX_CONFIG`, and `CODEX_HOME` relocate the files the helper scripts read and write.
+`REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, `REASONIX_SUBAGENT_ROLE`, `REASONIX_WRITE_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable and always win over `bridge.config.json`. `REASONIX_SUBAGENT_ROLE` may explicitly be `read` or `write`; when omitted, a profile name ending in `-write` is treated as the write role. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. Any `<provider>/<model>` ref this machine reports is accepted for `REASONIX_MODEL_REF`; an empty value, whitespace, or a ref without `/` exits with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter. `BRIDGE_CONFIG`, `BRIDGE_PRESETS`, `CODEX_CONFIG`, and `CODEX_HOME` relocate the files the helper scripts read and write.
 
 Resource limits can be lowered per machine in `bridge.config.json`:
 
@@ -165,7 +175,8 @@ only a `qlh.reasonix.changes.v1` change set with repository-relative paths, add/
 `git diff --stat`, SHA-256 hashes, and a one-shot `rollback_id`; worker stdout and file contents are
 never returned. Call `reasonix_rollback` explicitly with that id to restore the call's changes.
 Rollback refuses to overwrite a file that changed after the implement call, and rollback records
-live only in the current bridge process. W3 will add a dedicated write profile.
+live only in the current bridge process. The dedicated write profile is separate from the default
+read profile; profile creation and bridge write authorization remain independent gates.
 
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,

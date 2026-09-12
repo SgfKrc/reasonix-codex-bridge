@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+### Added
+
+- Separate `read` and `write` profile contracts via `configure profile --role read|write`.
+- The write profile uses only `edit_file` and `write_file` beyond the canonical read tools, omits `read-only`, and has a dedicated implementation prompt.
+- Role-aware verification and status reporting for the explicit write profile workflow.
+
 ## [0.1.0] - 2026-09-12
 
 ### Added
