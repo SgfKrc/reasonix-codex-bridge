@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 export const SERVER_NAME = 'reasonix-local-bridge';
 export const DEFAULT_SUBAGENT = 'deepseek-worker';
+export const DEFAULT_MIN_REASONIX_VERSION = '1.38.6';
 export const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
 
@@ -29,6 +30,90 @@ export const CODEX_HOME = envPath('CODEX_HOME', path.join(os.homedir(), '.codex'
 export const CODEX_CONFIG_PATH = envPath('CODEX_CONFIG', path.join(CODEX_HOME, 'config.toml'));
 
 export class ConfigError extends Error {}
+
+/** Parse the numeric portion of a Reasonix/semver-like version string. */
+export function parseVersion(value) {
+  const match = String(value ?? '').match(/\bv?(\d+)\.(\d+)(?:\.(\d+))?(?:[-+][0-9A-Za-z.-]+)?\b/i);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3] ?? 0),
+    normalized: `${Number(match[1])}.${Number(match[2])}.${Number(match[3] ?? 0)}`,
+  };
+}
+
+export function compareVersions(left, right) {
+  const a = typeof left === 'string' ? parseVersion(left) : left;
+  const b = typeof right === 'string' ? parseVersion(right) : right;
+  if (!a || !b) return null;
+  for (const key of ['major', 'minor', 'patch']) {
+    if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
+  }
+  return 0;
+}
+
+export function resolveMinReasonixVersion() {
+  const configured = (process.env.REASONIX_MIN_VERSION ?? '').trim();
+  if (!configured) return { version: DEFAULT_MIN_REASONIX_VERSION, source: 'bridge default', warning: '' };
+  const parsed = parseVersion(configured);
+  if (!parsed) {
+    return {
+      version: DEFAULT_MIN_REASONIX_VERSION,
+      source: 'bridge default',
+      warning: `REASONIX_MIN_VERSION is invalid (${configured}); using ${DEFAULT_MIN_REASONIX_VERSION}`,
+    };
+  }
+  const version = parsed.normalized;
+  return {
+    version,
+    source: 'REASONIX_MIN_VERSION',
+    warning: compareVersions(version, DEFAULT_MIN_REASONIX_VERSION) < 0
+      ? `REASONIX_MIN_VERSION=${version} relaxes the documented minimum ${DEFAULT_MIN_REASONIX_VERSION}`
+      : '',
+  };
+}
+
+/** Spawn options shared by doctor/version/worker calls, including Windows shims. */
+export function cliSpawnOptions(cliPath, options = {}) {
+  return {
+    ...options,
+    shell: process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(cliPath),
+  };
+}
+
+export function readCliVersion(cliPath, timeoutMs = 30_000) {
+  if (!cliPath) return { status: 'unknown', version: null, raw: '', error: 'reasonix CLI is not available' };
+  const result = spawnSync(cliPath, ['--version'], cliSpawnOptions(cliPath, {
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  }));
+  const raw = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
+  if (result.error) return { status: 'unknown', version: null, raw, error: `cannot run reasonix --version: ${result.error.message}` };
+  if (result.status !== 0) return { status: 'unknown', version: null, raw, error: `reasonix --version exited with code ${result.status}` };
+  const parsed = parseVersion(raw);
+  if (!parsed) return { status: 'unknown', version: null, raw, error: 'reasonix --version output has no parseable semver' };
+  return { status: 'ok', version: parsed.normalized, raw, error: '' };
+}
+
+export function checkCliVersion(cliPath, { minimum } = {}) {
+  const configured = minimum ? { version: String(minimum), source: 'argument', warning: '' } : resolveMinReasonixVersion();
+  const minimumParsed = parseVersion(configured.version) ?? parseVersion(DEFAULT_MIN_REASONIX_VERSION);
+  const observed = readCliVersion(cliPath);
+  const base = {
+    ...observed,
+    minimum: minimumParsed.normalized,
+    minimumSource: configured.source,
+    warning: configured.warning,
+  };
+  if (observed.status !== 'ok') return base;
+  if (compareVersions(observed.version, minimumParsed) < 0) {
+    return { ...base, status: 'fail', error: `Reasonix ${observed.version} is below minimum ${minimumParsed.normalized}` };
+  }
+  return base;
+}
 
 export function isFile(candidate) {
   try { return statSync(candidate).isFile(); } catch { return false; }
@@ -73,20 +158,10 @@ function pathCandidates(names) {
   return dirs.flatMap((dir) => names.map((name) => path.join(dir, name)));
 }
 
-function compareVersions(left, right) {
-  const a = left.replace(/^v/i, '').split('.').map(Number);
-  const b = right.replace(/^v/i, '').split('.').map(Number);
-  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-    const delta = (a[index] ?? 0) - (b[index] ?? 0);
-    if (delta !== 0) return delta;
-  }
-  return 0;
-}
-
 /** Redacted machine inventory straight from the CLI: providers, models, default_model. */
 export function readDoctor(cliPath, timeoutMs = 30_000) {
   if (!cliPath) return { ok: false, error: 'reasonix CLI is not available', data: null };
-  const result = spawnSync(cliPath, ['doctor', '--json'], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+  const result = spawnSync(cliPath, ['doctor', '--json'], cliSpawnOptions(cliPath, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }));
   if (result.error) return { ok: false, error: `cannot run reasonix doctor: ${result.error.message}`, data: null };
   if (result.status !== 0) return { ok: false, error: `reasonix doctor exited with code ${result.status}`, data: null };
   try {

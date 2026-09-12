@@ -14,6 +14,7 @@ import {
   PRESETS_EXAMPLE_PATH,
   PRESETS_PATH,
   buildCodexBlock,
+  checkCliVersion,
   doctorRefs,
   isFile,
   readBridgeConfig,
@@ -37,7 +38,7 @@ const USAGE = `Usage: node src/configure.mjs <command>
   verify               check the CLI, the selected model ref, and the subagent profile
 
 Environment overrides: REASONIX_EXE, REASONIX_MODEL_REF, REASONIX_SUBAGENT, REASONIX_ROOT,
-BRIDGE_CONFIG, BRIDGE_PRESETS, CODEX_CONFIG, CODEX_HOME.`;
+REASONIX_MIN_VERSION, BRIDGE_CONFIG, BRIDGE_PRESETS, CODEX_CONFIG, CODEX_HOME.`;
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -181,9 +182,16 @@ function verifyCommand() {
   const context = loadContext();
   const results = [];
   if (context.cliPath) {
-    const version = spawnSync(context.cliPath, ['--version'], { encoding: 'utf8', timeout: 30_000, windowsHide: true });
-    const text = (version.stdout ?? '').trim();
-    results.push(['ok', `reasonix CLI: ${context.cliPath}${text ? ` (${text})` : ''}`]);
+    const version = checkCliVersion(context.cliPath);
+    if (version.status === 'fail') {
+      results.push(['fail', `reasonix CLI: ${context.cliPath} (${version.error}); upgrade Reasonix or deliberately set REASONIX_MIN_VERSION below the installed version`]);
+    } else if (version.status === 'unknown') {
+      results.push(['warn', `reasonix CLI: ${context.cliPath} (version unknown: ${version.error})`]);
+    } else if (version.warning) {
+      results.push(['warn', `reasonix CLI: ${context.cliPath} (${version.version}; ${version.warning})`]);
+    } else {
+      results.push(['ok', `reasonix CLI: ${context.cliPath} (${version.version}; minimum ${version.minimum})`]);
+    }
   } else {
     results.push(['fail', `reasonix CLI: ${context.cliError}`]);
   }

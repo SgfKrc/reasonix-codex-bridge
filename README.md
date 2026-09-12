@@ -6,7 +6,7 @@ Zero-dependency stdio MCP server for Codex. It exposes a narrow `reasonix_run` t
 
 - Node.js 20 or newer.
 - Reasonix 1.38.6 or newer, using the post-rewrite `reasonix subagent run` interface.
-- Lower Reasonix versions are intentionally unsupported.
+- Lower Reasonix versions are intentionally unsupported. The bridge requires `1.38.6` or newer by default; `configure verify` reports a failure and the MCP server refuses to start when the installed CLI is older.
 - The CLI path is resolved at startup and never hard-coded: `REASONIX_EXE` wins when set, otherwise the bridge probes `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`, the newest `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`, `/usr/local/bin|/usr/bin/reasonix-cli`, then `reasonix-cli(.exe)` on `PATH`. If nothing is found (or `REASONIX_EXE` points to a missing file) the server logs the reason and exits with code 2.
 
 ## Pick the subagent model
@@ -52,6 +52,15 @@ REASONIX_MODEL_REF = "<the ref you selected with: node src/configure.mjs list>"
 ```
 
 Restart Codex after changing MCP configuration. Run `npm run check` (or `node --check src/server.mjs src/config.mjs src/configure.mjs`) before connecting a new machine.
+
+The bridge performs a cheap `reasonix --version` gate before it calls `doctor` or starts a worker. If a deliberate compatibility test needs to run against an older CLI, set `REASONIX_MIN_VERSION` to an explicit lower value; `verify` and the server log a warning so the relaxed gate is visible. An unparseable or unavailable version is reported as `unknown` and does not block startup, while the normal CLI/model checks still apply.
+
+The offline regression suite has no model or network dependency:
+
+```bash
+npm test       # node --test: config, configure, MCP session and version stubs
+npm run check  # syntax checks for all bridge modules
+```
 
 Create the named profile once in the global Reasonix profile directory. The bridge passes the target workspace with `--dir`, so a project-only profile will not be found when the bridge is copied to another repository:
 
