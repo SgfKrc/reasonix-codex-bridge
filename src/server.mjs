@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 
 const SERVER_NAME = 'reasonix-local-bridge';
-const REQUIRED_MODEL_REF = 'shiziagent-e10b633ad8dc4d689ffd92c7074ef8e8/deepseek-flash';
+const REQUIRED_MODEL_REF = 'opencode-go-2ae356f685c508017d5aa065922ef663/deepseek-flash';
 const CLI_PATH = process.env.REASONIX_EXE ?? 'L:\\Reasonix\\versions\\v1.38.7\\reasonix-cli.exe';
 const WORKSPACE_ROOT = path.resolve(process.env.REASONIX_ROOT ?? process.cwd());
 const SUBAGENT_NAME = process.env.REASONIX_SUBAGENT ?? 'deepseek-worker';
