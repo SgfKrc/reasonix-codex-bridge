@@ -21,6 +21,13 @@ import {
   validateCodexBlock,
   validateModelRef,
 } from '../src/config.mjs';
+import {
+  ACP_COMPACT_TRIGGER_RATIO,
+  ACP_HISTORY_HARD_CAP_BYTES,
+  compactHistory,
+  historyBytes,
+  prepareSessionContinuation,
+} from '../src/acp-prototype.mjs';
 
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
@@ -467,6 +474,68 @@ describe('offline command contracts', () => {
     assert.equal(status.workerReadOnlyAssumed, true);
     assert.equal(status.historyHardCapBytes, 128 * 1024 * 1024);
     assert.equal(readdirSync(root).some((name) => name.endsWith('.jsonl')), false);
+  });
+});
+
+describe('ACP transport design prototype', () => {
+  test('compacts before the hard cap and preserves system plus recent messages', () => {
+    assert.equal(ACP_HISTORY_HARD_CAP_BYTES, 128 * 1024 * 1024);
+    assert.equal(ACP_COMPACT_TRIGGER_RATIO, 0.75);
+    const history = [
+      { role: 'system', content: 'system policy' },
+      { role: 'user', content: 'old question' },
+      { role: 'assistant', content: 'old answer' },
+      { role: 'user', content: 'recent question' },
+      { role: 'assistant', content: 'recent answer' },
+    ];
+    const decision = prepareSessionContinuation(history, { role: 'user', content: 'next' }, {
+      hardCapBytes: 512,
+      compactTriggerRatio: 0.25,
+      summarize: (messages) => messages.map((message) => message.content).join(' | '),
+    });
+    assert.equal(decision.action, 'compact');
+    assert.ok(decision.bytes < 512);
+    assert.equal(decision.summarizedCount, 3);
+    assert.equal(decision.persistentHistory[0].content, 'system policy');
+    assert.equal(decision.persistentHistory.at(-1).content, 'next');
+    assert.equal(history.some((message) => message.acpCompacted), false);
+  });
+
+  test('compact failure falls back per-call without mutating persistent history', () => {
+    const history = [
+      { role: 'user', content: 'old question', metadata: { source: 'fixture' } },
+      { role: 'assistant', content: 'old answer' },
+      { role: 'user', content: 'recent question' },
+    ];
+    const before = JSON.stringify(history);
+    const decision = prepareSessionContinuation(history, { role: 'user', content: 'next' }, {
+      hardCapBytes: 100,
+      summarize: (messages) => {
+        messages[0].metadata.source = 'mutated copy';
+        throw new Error('summary unavailable');
+      },
+    });
+    assert.equal(decision.action, 'per_call');
+    assert.equal(decision.reason, 'compact_failed');
+    assert.deepEqual(decision.persistentHistory, history);
+    assert.deepEqual(decision.callMessages, [{ role: 'user', content: 'next' }]);
+    assert.equal(JSON.stringify(history), before);
+  });
+
+  test('rotation starts a fresh session when a valid summary cannot fit', () => {
+    const history = [
+      { role: 'user', content: 'old question' },
+      { role: 'assistant', content: 'old answer' },
+      { role: 'user', content: 'recent question' },
+    ];
+    const next = { role: 'user', content: 'next' };
+    const decision = prepareSessionContinuation(history, next, {
+      hardCapBytes: historyBytes([next]) + 1,
+      summarize: () => 'summary remains large enough to force rotation',
+    });
+    assert.equal(decision.action, 'rotate');
+    assert.deepEqual(decision.persistentHistory, [next]);
+    assert.equal(decision.callMessages[0].content, 'next');
   });
 });
 
