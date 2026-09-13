@@ -39,6 +39,7 @@ import {
 import { AcpClient } from './acp-client.mjs';
 import { AcpSecurityPolicy } from './acp-security.mjs';
 import { AcpTransportManager } from './acp-transport.mjs';
+import { resolveWorkflowStage, stageForMode, workflowStatus } from './workflow.mjs';
 
 function log(message) { process.stderr.write(`[${SERVER_NAME}] ${message}\n`); }
 function refuse(reason, hint) {
@@ -64,11 +65,11 @@ const MODES = { inspect: { maxSteps: 80, timeoutSeconds: 600 }, review: { maxSte
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
-  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. max_steps is the raw Reasonix budget; tool_rounds is the preferred tool-call-round budget. Set parallel=true explicitly for concurrent read-only jobs. When transport=acp is enabled, pass session_id to opt into a persistent ACP session.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' }, parallel: { type: 'boolean' }, session_id: { type: 'string' } }, required: ['task'] } },
-  { name: 'reasonix_resume', description: 'Explicitly resume one durable checkpoint after workspace/configuration drift checks. A checkpoint is one-shot and is never replayed implicitly.', inputSchema: { type: 'object', properties: { checkpoint_id: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, timeout_seconds: { type: 'integer' } }, required: ['checkpoint_id'] } },
+  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. Budget: omit max_steps and tool_rounds to use the mode default (inspect 40 tool-call rounds, review/plan/implement 48); pass tool_rounds only when a task needs a different bound (1 round = 2 raw CLI steps, hard cap 128 rounds); max_steps is the raw CLI budget and is only for explicit CLI-compatible overrides. Set parallel=true explicitly for concurrent read-only jobs. Pass stage=plan|implement|review to make the main-agent workflow stage visible; the bridge never auto-advances stages. When transport=acp is enabled, pass session_id to opt into a persistent ACP session.', inputSchema: { type: 'object', properties: { task: { type: 'string', description: 'Self-contained task text for the worker.' }, cwd: { type: 'string', description: 'Workspace-relative directory inside the allowed roots; defaults to the workspace root.' }, max_steps: { type: 'integer', description: 'Raw Reasonix internal steps (2 per tool-call round). Omit to use the mode default (inspect 80, review/plan/implement 96); only pass for explicit CLI-compatible overrides. Hard cap 256.' }, tool_rounds: { type: 'integer', minimum: 1, description: 'Tool-call rounds (1 round = 2 raw steps). Omit to use the mode default (inspect 40, review/plan/implement 48); hard cap 128. Prefer this over max_steps.' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'], description: 'inspect/review/plan are read-only; implement requires an explicit write role plus the per-machine write policy.' }, stage: { type: 'string', enum: ['plan', 'implement', 'review'], description: 'Makes the main-agent workflow stage visible; the bridge never auto-advances stages.' }, timeout_seconds: { type: 'integer', description: 'Per-call timeout. Omit to use the mode default (inspect 600s, review/plan/implement 900s); hard cap 1800s.' }, parallel: { type: 'boolean', description: 'true opts into a concurrent read-only slot; implement/resume/rollback stay exclusive.' }, session_id: { type: 'string', description: 'Only when transport=acp is enabled, to opt into a persistent ACP session.' } }, required: ['task'] } },
+  { name: 'reasonix_resume', description: 'Explicitly resume one durable checkpoint after workspace/configuration drift checks. A checkpoint is one-shot and is never replayed implicitly.', inputSchema: { type: 'object', properties: { checkpoint_id: { type: 'string', description: 'Checkpoint id returned by a failed reasonix_run.' }, max_steps: { type: 'integer', description: 'Raw Reasonix internal steps; omit to reuse the checkpoint budget.' }, tool_rounds: { type: 'integer', minimum: 1, description: 'Tool-call rounds; omit to reuse the checkpoint budget.' }, timeout_seconds: { type: 'integer', description: 'Per-call timeout; omit to reuse the checkpoint budget.' } }, required: ['checkpoint_id'] } },
   { name: 'reasonix_cancel', description: 'Request cancellation of one queued or running job. Running workers are terminated and the terminal cancellation remains visible in reasonix_status.', inputSchema: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
-  { name: 'reasonix_exec', description: 'Run one explicitly configured command profile through a no-shell argv spawn. The policy is disabled by default, requires a clean Git workspace, and never accepts a caller-provided executable.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' }, maxItems: 128 }, cwd: { type: 'string' }, timeout_seconds: { type: 'integer', minimum: 1 }, output_char_cap: { type: 'integer', minimum: 1 } }, required: ['command'] } },
+  { name: 'reasonix_exec', description: 'Run one explicitly configured command profile through a no-shell argv spawn as the explicit exec/test workflow stage. The policy is disabled by default, requires a clean Git workspace, and never accepts a caller-provided executable.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' }, maxItems: 128 }, cwd: { type: 'string' }, stage: { type: 'string', enum: ['exec'] }, timeout_seconds: { type: 'integer', minimum: 1 }, output_char_cap: { type: 'integer', minimum: 1 } }, required: ['command'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
 
@@ -179,6 +180,13 @@ function resolveModelCapabilities(doctorResult = MODEL_DOCTOR) {
     base_url_host: host,
     error: null,
   };
+}
+function modeBudgetStatus() {
+  return Object.fromEntries(Object.entries(MODES).map(([mode, preset]) => [mode, {
+    maxSteps: preset.maxSteps,
+    toolRounds: Math.ceil(preset.maxSteps / REASONIX_STEPS_PER_TOOL_ROUND),
+    timeoutSeconds: preset.timeoutSeconds,
+  }]));
 }
 
 function allowedRoots() {
@@ -299,7 +307,7 @@ function checkpointWorkspaceDrift(expected, current) {
 function checkpointableOutcome(outcome) {
   return ['timeout', 'worker_exit', 'step_limit', 'cursor_error'].includes(outcome);
 }
-async function createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode, stepLimitRounds, cursorError, parentCheckpointId = null }) {
+async function createRunCheckpoint({ mode, stage = stageForMode(mode), task, cwd, maxSteps, timeoutSeconds, outcome, exitCode, stepLimitRounds, cursorError, parentCheckpointId = null }) {
   if (!CHECKPOINT_ENABLED || !isInside(WORKSPACE_ROOT, cwd)) return null;
   try {
     const workspace = await checkpointWorkspaceSnapshot();
@@ -307,6 +315,7 @@ async function createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, 
     const record = writeCheckpoint(CHECKPOINT_DIR, {
       createdAt: new Date().toISOString(),
       mode,
+      stage,
       task,
       cwd: relativeCwd,
       maxSteps,
@@ -553,6 +562,7 @@ function runSummary(entry) {
   return {
     timestamp: new Date().toISOString(),
     mode: entry.mode,
+    stage: entry.stage ?? stageForMode(entry.mode),
     operation: entry.operation ?? null,
     transport: entry.transport ?? 'per-call',
     transportFallback: entry.transportFallback ?? null,
@@ -588,14 +598,14 @@ function terminate(child) {
   child.kill('SIGKILL');
   return Promise.resolve();
 }
-function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true, checkpoint = mode !== 'implement', parentCheckpointId = null, cancelRef = null, transport = 'per-call', transportFallback = null } = {}) {
+function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode, stage = stageForMode(mode) }, { record = true, checkpoint = mode !== 'implement', parentCheckpointId = null, cancelRef = null, transport = 'per-call', transportFallback = null } = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
     const invocation = cliSpawnCommand(CLI_PATH, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     if (invocation.error) {
-      recordRun({ mode, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-      resolve({ isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', transport, transportFallback, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } });
+      recordRun({ mode, stage, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+      resolve({ isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', stage, transport, transportFallback, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } });
       return;
     }
     const child = spawn(invocation.file, invocation.args, invocation.options);
@@ -609,8 +619,8 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
       if (cancelRef) cancelRef.cancel = null;
       const finalOutcome = cancelRequested ? 'cancelled' : outcome;
       const finalResult = cancelRequested ? { isError: true, text: `worker cancelled after ${((Date.now() - startedAt) / 1000).toFixed(1)}s` } : result;
-      if (record) recordRun({ mode, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap });
-      resolve({ ...finalResult, meta: { outcome: finalOutcome, transport, transportFallback, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap } });
+      if (record) recordRun({ mode, stage, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap });
+      resolve({ ...finalResult, meta: { outcome: finalOutcome, stage, transport, transportFallback, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap } });
     };
     const timer = setTimeout(async () => {
       if (settled) return;
@@ -621,7 +631,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
         return;
       }
       const checkpointId = checkpoint
-        ? await createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome: 'timeout', exitCode: null, parentCheckpointId })
+        ? await createRunCheckpoint({ mode, stage, task, cwd, maxSteps, timeoutSeconds, outcome: 'timeout', exitCode: null, parentCheckpointId })
         : null;
       const suffix = checkpointId ? `\n\ncheckpoint_id=${checkpointId}; call reasonix_resume to continue explicitly.` : '';
       finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000, stderrChars)}${suffix}` }, 'timeout', null, checkpointId ? { checkpointId } : {});
@@ -664,7 +674,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
             ? `worker exited with code ${code} (${elapsed}s)`
             : `worker reached Reasonix max_steps=${maxSteps} after ${stepLimitRounds} tool-call rounds (${elapsed}s); timeout_seconds=${timeoutSeconds} was not reached. Increase max_steps or pass tool_rounds.`;
         const checkpointId = checkpoint
-          ? await createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: code, stepLimitRounds, cursorError, parentCheckpointId })
+          ? await createRunCheckpoint({ mode, stage, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: code, stepLimitRounds, cursorError, parentCheckpointId })
           : null;
         const extra = { ...(stepLimitRounds === null ? {} : { stepLimitRounds }), ...(cursorError ? { cursorError: true } : {}), ...(checkpointId ? { checkpointId } : {}) };
         const stderrBody = cursorError ? '[cursor diagnostic redacted]' : truncate(stderr, 2000, stderrChars);
@@ -676,26 +686,26 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
   });
 }
 
-async function runExec({ cwd, spec, args, timeoutSeconds, outputCharCap }, cancelRef = null) {
+async function runExec({ cwd, spec, args, timeoutSeconds, outputCharCap, stage = 'exec' }, cancelRef = null) {
   const startedAt = Date.now();
   const beforeStatus = await gitStatus(WORKSPACE_ROOT);
   if (!beforeStatus.ok) {
-    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'workspace_unverifiable', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-    return { isError: true, text: `reasonix_exec requires a verifiable Git workspace: ${beforeStatus.error}`, meta: { outcome: 'workspace_unverifiable', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    recordRun({ mode: 'exec', stage, operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'workspace_unverifiable', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: `reasonix_exec requires a verifiable Git workspace: ${beforeStatus.error}`, meta: { outcome: 'workspace_unverifiable', stage, transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
   }
   if (EXEC_POLICY.requireCleanTree && beforeStatus.entries.length) {
-    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'workspace_dirty', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-    return { isError: true, text: `reasonix_exec requires a clean Git workspace (${beforeStatus.entries.length} existing change(s)); use an isolated worktree or commit/stash them first.`, meta: { outcome: 'workspace_dirty', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    recordRun({ mode: 'exec', stage, operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'workspace_dirty', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: `reasonix_exec requires a clean Git workspace (${beforeStatus.entries.length} existing change(s)); use an isolated worktree or commit/stash them first.`, meta: { outcome: 'workspace_dirty', stage, transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
   }
   let executable;
   try { executable = resolveExecExecutable(spec); } catch (error) {
-    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-    return { isError: true, text: error.message, meta: { outcome: 'spawn_rejected', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    recordRun({ mode: 'exec', stage, operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: error.message, meta: { outcome: 'spawn_rejected', stage, transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
   }
   const invocation = cliSpawnCommand(executable, [...spec.argsPrefix, ...args], { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   if (invocation.error) {
-    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-    return { isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    recordRun({ mode: 'exec', stage, operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', stage, transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
   }
   return new Promise((resolve) => {
     const child = spawn(invocation.file, invocation.args, invocation.options);
@@ -716,8 +726,8 @@ async function runExec({ cwd, spec, args, timeoutSeconds, outputCharCap }, cance
         stdoutChars, stderrChars, truncated: truncatedOutput || stdoutChars > outputCharCap || stderrChars > outputCharCap, changedPaths: changed,
       };
       const outputBytes = Buffer.byteLength(stdout, 'utf8') + Buffer.byteLength(stderr, 'utf8');
-      recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: finalOutcome, exitCode, elapsedMs: payload.elapsedMs, outputBytes, truncated: payload.truncated });
-      resolve({ isError: finalOutcome !== 'success', text: JSON.stringify(payload), meta: { outcome: finalOutcome, transport: 'local-exec', exitCode, elapsedMs: payload.elapsedMs, outputBytes, truncated: payload.truncated } });
+      recordRun({ mode: 'exec', stage, operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: finalOutcome, exitCode, elapsedMs: payload.elapsedMs, outputBytes, truncated: payload.truncated });
+      resolve({ isError: finalOutcome !== 'success', text: JSON.stringify(payload), meta: { outcome: finalOutcome, stage, transport: 'local-exec', exitCode, elapsedMs: payload.elapsedMs, outputBytes, truncated: payload.truncated } });
     };
     const timer = setTimeout(async () => { await terminate(child); await finish('timeout'); }, timeoutSeconds * 1000);
     if (cancelRef && typeof cancelRef === 'object') {
@@ -730,10 +740,10 @@ async function runExec({ cwd, spec, args, timeoutSeconds, outputCharCap }, cance
     child.once('close', (code, signal) => { void finish(code === 0 ? 'success' : 'nonzero', code, signal); });
   });
 }
-async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task }, cancelRef = null) {
+async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, stage = 'implement' }, cancelRef = null) {
   const reject = (text, startedAt = Date.now()) => {
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-    return { isError: true, text, meta: { outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text, meta: { outcome: 'write_rejected', stage, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
   };
   const startedAt = Date.now();
   if (!WRITE_POLICY.allowWrite) return reject('mode=implement is disabled; set allowWrite=true in bridge.config.json and pass mode=implement explicitly.', startedAt);
@@ -747,11 +757,11 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   if (!WRITE_POLICY.requireCleanTree && beforeStatus.entries.some((entry) => pathMatchesAllowed(entry.path))) {
     return reject('mode=implement refuses to write an allowed path that is already dirty; restore or commit it first.', startedAt);
   }
-  const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement' }, { record: false, cancelRef });
+  const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement', stage }, { record: false, cancelRef });
   const afterStatus = await gitStatus(WORKSPACE_ROOT);
   if (!afterStatus.ok) {
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-    return { isError: true, text: `mode=implement could not verify post-write Git state: ${afterStatus.error}`, meta: { ...result.meta, outcome: 'write_rejected' } };
+    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    return { isError: true, text: `mode=implement could not verify post-write Git state: ${afterStatus.error}`, meta: { ...result.meta, stage, outcome: 'write_rejected' } };
   }
   const changed = changedEntries(beforeStatus.entries, afterStatus.entries);
   const disallowed = changed.filter((entry) => !pathMatchesAllowed(entry.path));
@@ -764,24 +774,24 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
     const rollbackText = rollback.ok ? 'rollback completed' : `rollback failed: ${rollback.error}`;
     const outcome = disallowed.length ? 'write_rejected' : (result.meta?.outcome ?? 'worker_exit');
     const checkpointId = !disallowed.length && rollback.ok && checkpointableOutcome(outcome)
-      ? await createRunCheckpoint({ mode: 'implement', task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, stepLimitRounds: result.meta?.stepLimitRounds, cursorError: result.meta?.cursorError })
+      ? await createRunCheckpoint({ mode: 'implement', stage, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, stepLimitRounds: result.meta?.stepLimitRounds, cursorError: result.meta?.cursorError })
       : null;
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, ...(checkpointId ? { checkpoint_id: checkpointId } : {}), outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, outcome, ...(checkpointId ? { checkpointId } : {}) } };
+    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, ...(checkpointId ? { checkpoint_id: checkpointId } : {}), outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, stage, outcome, ...(checkpointId ? { checkpointId } : {}) } };
   }
   if (result.isError) {
     const outcome = result.meta?.outcome ?? 'worker_exit';
     const checkpointId = checkpointableOutcome(outcome)
-      ? await createRunCheckpoint({ mode: 'implement', task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, stepLimitRounds: result.meta?.stepLimitRounds, cursorError: result.meta?.cursorError })
+      ? await createRunCheckpoint({ mode: 'implement', stage, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, stepLimitRounds: result.meta?.stepLimitRounds, cursorError: result.meta?.cursorError })
       : null;
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, ...(checkpointId ? { checkpoint_id: checkpointId } : {}), outcome, error: 'worker failed; no changes were retained', changes: [] }), meta: { ...result.meta, ...(checkpointId ? { checkpointId } : {}) } };
+    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, ...(checkpointId ? { checkpoint_id: checkpointId } : {}), outcome, error: 'worker failed; no changes were retained', changes: [] }), meta: { ...result.meta, stage, ...(checkpointId ? { checkpointId } : {}) } };
   }
   const changeSet = await buildChangeSet(WORKSPACE_ROOT, changed);
   const rollbackId = rememberRollback(WORKSPACE_ROOT, changeSet.changes);
   changeSet.rollback_id = rollbackId;
-  recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-  return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, outcome: 'success', rollbackId } };
+  recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+  return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, stage, outcome: 'success', rollbackId } };
 }
 
 const ACP_SECURITY = new AcpSecurityPolicy({
@@ -799,7 +809,7 @@ const ACP_TRANSPORT = new AcpTransportManager({
     timeoutMs: timeoutMs ?? 30_000,
   }),
   fallback: (request, context) => runWorker(
-    { cwd: request.cwd, maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outputCharCap: request.outputCharCap, task: request.task, mode: request.mode },
+    { cwd: request.cwd, maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outputCharCap: request.outputCharCap, task: request.task, mode: request.mode, stage: request.stage },
     { cancelRef: context.cancelRef, transport: 'per-call', transportFallback: context.reason },
   ),
   securityPolicy: ACP_SECURITY,
@@ -809,13 +819,13 @@ async function runAcp(request, cancelRef) {
   try {
     const result = await ACP_TRANSPORT.run({ ...request, cancelRef, timeoutMs: request.timeoutSeconds * 1000 });
     if (result.meta?.transport === 'acp') {
-      recordRun({ mode: request.mode, transport: result.meta.transport, transportFallback: result.meta.transportFallback ?? null, cwdRoot: cwdRootLabel(request.cwd), maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outcome: result.meta.outcome ?? (result.isError ? 'worker_exit' : 'success'), exitCode: result.meta.exitCode ?? null, elapsedMs: result.meta.elapsedMs ?? 0, outputBytes: result.meta.outputBytes ?? 0, truncated: result.meta.truncated === true });
+      recordRun({ mode: request.mode, stage: request.stage, transport: result.meta.transport, transportFallback: result.meta.transportFallback ?? null, cwdRoot: cwdRootLabel(request.cwd), maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outcome: result.meta.outcome ?? (result.isError ? 'worker_exit' : 'success'), exitCode: result.meta.exitCode ?? null, elapsedMs: result.meta.elapsedMs ?? 0, outputBytes: result.meta.outputBytes ?? 0, truncated: result.meta.truncated === true });
     }
     return result;
   } catch (error) {
     const outcome = error?.code?.startsWith?.('session_scope_') || error?.code?.startsWith?.('write_') || error?.code?.startsWith?.('read_mode_') ? 'rejected' : 'acp_error';
-    recordRun({ mode: request.mode, transport: 'acp', cwdRoot: cwdRootLabel(request.cwd), maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outcome, exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false });
-    return { isError: true, text: error instanceof Error ? error.message : String(error), meta: { outcome, transport: 'acp', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } };
+    recordRun({ mode: request.mode, stage: request.stage, transport: 'acp', cwdRoot: cwdRootLabel(request.cwd), maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outcome, exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false });
+    return { isError: true, text: error instanceof Error ? error.message : String(error), meta: { outcome, stage: request.stage, transport: 'acp', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } };
   }
 }
 async function resumeCheckpoint(checkpointId, args = {}, cancelRef = null) {
@@ -838,10 +848,11 @@ async function resumeCheckpoint(checkpointId, args = {}, cancelRef = null) {
     ? clampInteger(args.max_steps, checkpoint.maxSteps, LIMITS.maxStepsCap)
     : clampInteger(args.tool_rounds, Math.ceil(checkpoint.maxSteps / REASONIX_STEPS_PER_TOOL_ROUND), maxToolRounds) * REASONIX_STEPS_PER_TOOL_ROUND;
   const timeoutSeconds = clampInteger(args.timeout_seconds, checkpoint.timeoutSeconds, LIMITS.timeoutSecondsCap);
+  const stage = checkpoint.stage ?? stageForMode(checkpoint.mode);
   try { consumeCheckpoint(CHECKPOINT_DIR, checkpoint); } catch (error) { return { isError: true, text: `cannot resume checkpoint: could not mark it consumed (${error.message})` }; }
   return checkpoint.mode === 'implement'
-    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task }, cancelRef)
-    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode: checkpoint.mode }, { parentCheckpointId: checkpoint.id, cancelRef });
+    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, stage }, cancelRef)
+    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode: checkpoint.mode, stage }, { parentCheckpointId: checkpoint.id, cancelRef });
 }
 function estimateTaskTokens(task) {
   return Math.max(1, Math.ceil(Buffer.byteLength(task, 'utf8') / 4));
@@ -861,6 +872,7 @@ function jobSummary(record) {
   return {
     jobId: record.id,
     mode: record.mode,
+    stage: record.stage ?? stageForMode(record.mode),
     transport: record.transport ?? 'per-call',
     transportFallback: record.transportFallback ?? null,
     cwdRoot: record.cwdRoot,
@@ -953,6 +965,7 @@ function enqueue(job, meta, { parallel = false, exclusive = true } = {}) {
   const record = {
     id: randomUUID(),
     mode: meta.mode,
+    stage: meta.stage ?? stageForMode(meta.mode),
     transport: meta.transport ?? 'per-call',
     transportFallback: meta.transportFallback ?? null,
     cwdRoot: meta.cwdRoot,
@@ -1059,23 +1072,31 @@ async function callTool(name, args) {
   }
   if (name === 'reasonix_exec') {
     const startedAt = Date.now();
+    const operation = typeof args?.command === 'string' ? args.command.trim() : null;
+    const stageResult = resolveWorkflowStage(args?.stage, 'exec', operation);
+    if (stageResult.error) {
+      recordRun({ mode: 'exec', stage: 'exec', operation, transport: 'local-exec', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+      return { isError: true, text: stageResult.error, meta: { outcome: 'rejected', stage: 'exec', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    }
     let request;
     try { request = execRequest(args); } catch (error) {
-      recordRun({ mode: 'exec', operation: typeof args?.command === 'string' ? args.command.trim() : null, transport: 'local-exec', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-      return { isError: true, text: error.message, meta: { outcome: 'rejected', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+      recordRun({ mode: 'exec', stage: stageResult.stage, operation, transport: 'local-exec', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+      return { isError: true, text: error.message, meta: { outcome: 'rejected', stage: stageResult.stage, transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
     }
-    const meta = { mode: 'exec', transport: 'local-exec', cwdRoot: cwdRootLabel(request.cwd), maxSteps: null, timeoutSeconds: request.timeoutSeconds };
+    const meta = { mode: 'exec', stage: stageResult.stage, transport: 'local-exec', cwdRoot: cwdRootLabel(request.cwd), maxSteps: null, timeoutSeconds: request.timeoutSeconds };
     log(`exec command=${request.spec.name} cwd=${request.cwd} timeout=${request.timeoutSeconds}s`);
-    return enqueue((cancelRef) => runExec(request, cancelRef), meta, { exclusive: true });
+    return enqueue((cancelRef) => runExec({ ...request, stage: stageResult.stage }, cancelRef), meta, { exclusive: true });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, providerSearch: PROVIDER_SEARCH, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, errors: WRITE_POLICY.errors }, execPolicy: { configured: EXEC_POLICY.configured, enabled: EXEC_POLICY.enabled && EXEC_POLICY.errors.length === 0, allowedPaths: EXEC_POLICY.allowedPaths.map((entry) => entry || '.'), commands: EXEC_POLICY.commands.map((entry) => ({ name: entry.name, argsPrefix: entry.argsPrefix, maxArgs: entry.maxArgs })), requireCleanTree: EXEC_POLICY.requireCleanTree, timeoutSeconds: EXEC_POLICY.timeoutSeconds, outputCharCap: EXEC_POLICY.outputCharCap, errors: EXEC_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, providerSearch: PROVIDER_SEARCH, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, workflow: workflowStatus(jobStatus(), lastRun), modes: Object.keys(MODES), modeDefaults: modeBudgetStatus(), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, errors: WRITE_POLICY.errors }, execPolicy: { configured: EXEC_POLICY.configured, enabled: EXEC_POLICY.enabled && EXEC_POLICY.errors.length === 0, allowedPaths: EXEC_POLICY.allowedPaths.map((entry) => entry || '.'), commands: EXEC_POLICY.commands.map((entry) => ({ name: entry.name, argsPrefix: entry.argsPrefix, maxArgs: entry.maxArgs })), requireCleanTree: EXEC_POLICY.requireCleanTree, timeoutSeconds: EXEC_POLICY.timeoutSeconds, outputCharCap: EXEC_POLICY.outputCharCap, errors: EXEC_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
-  const logRejected = (error) => recordRun({ mode: ['inspect', 'review', 'implement', 'plan'].includes(mode) ? mode : 'invalid', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false, error });
+  const stageResult = resolveWorkflowStage(args?.stage, mode);
+  const logRejected = (error) => recordRun({ mode: ['inspect', 'review', 'implement', 'plan'].includes(mode) ? mode : 'invalid', stage: stageResult.stage, cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false, error });
   const task = typeof args?.task === 'string' ? args.task.trim() : '';
   if (!task) { logRejected('task_required'); throw new Error('task is required'); }
   if (task.length > TASK_CHAR_CAP) { logRejected('task_too_long'); throw new Error(`task exceeds ${TASK_CHAR_CAP} chars`); }
+  if (stageResult.error) { logRejected('stage_invalid'); throw new Error(stageResult.error); }
   if (mode === 'implement' && !WRITE_POLICY.allowWrite) { logRejected('implement_disabled'); return { isError: true, text: 'mode=implement is disabled; set allowWrite=true in bridge.config.json and pass mode=implement explicitly.' }; }
   if (MODEL_CAPABILITIES.contextWindow !== null) {
     const estimatedTokens = estimateTaskTokens(task);
@@ -1108,12 +1129,12 @@ async function callTool(name, args) {
   }
   const useAcp = TRANSPORT.mode === 'acp' && !parallel && mode !== 'implement';
   const transport = useAcp ? 'acp' : 'per-call';
-  const meta = { mode, transport, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
+  const meta = { mode, stage: stageResult.stage, transport, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
   log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s parallel=${parallel} transport=${transport}`); return enqueue((cancelRef) => useAcp
-    ? runAcp({ sessionId: args?.session_id, taskId: args?.session_id, owner: 'mcp-stdio', cwd, profile: SUBAGENT_NAME, model: MODEL_REF, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }, cancelRef)
+    ? runAcp({ sessionId: args?.session_id, taskId: args?.session_id, owner: 'mcp-stdio', cwd, profile: SUBAGENT_NAME, model: MODEL_REF, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode, stage: stageResult.stage }, cancelRef)
     : mode === 'implement'
-      ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task }, cancelRef)
-      : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }, { cancelRef }), { ...meta, parallel }, { parallel, exclusive: !parallel });
+      ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, stage: stageResult.stage }, cancelRef)
+      : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode, stage: stageResult.stage }, { cancelRef }), { ...meta, parallel }, { parallel, exclusive: !parallel });
 }
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 const handlers = { initialize: () => ({ capabilities: { tools: {} }, protocolVersion: '2024-11-05', serverInfo: { name: SERVER_NAME, version: '1.0.0' } }), ping: () => ({}), 'tools/list': () => ({ tools: TOOLS }), 'tools/call': async (params) => { const result = await callTool(params?.name, params?.arguments ?? {}); return { content: [{ type: 'text', text: result.text }], isError: result.isError }; } };

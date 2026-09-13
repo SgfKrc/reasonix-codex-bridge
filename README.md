@@ -121,6 +121,10 @@ worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必�
 
 `reasonix_status.providerSearch` 是 provider 原生 `web_search` 的 fail-closed 能力摘要。当前 provider 未显式声明搜索能力时返回 `status=unavailable` 与 `reason=provider_capability_not_advertised`；bridge 不自建搜索后端，也不把模型文本推断当作搜索结果。若将来 provider 明确接通，`reasonix_run` 仍只原样透传 Reasonix 返回的摘要/来源/截断状态。
 
+### 显式阶段编排（`plan -> implement -> exec -> review`）
+
+LOOP-01 是主 agent 的显式编排模板，不是 bridge 内的自动流水线。调用方按阶段分别调用现有工具，并在每次 `reasonix_run` 传 `stage=plan|implement|review`，在 `reasonix_exec` 传 `stage=exec`；不传时 bridge 按 mode 推导。`reasonix_status.workflow`、`modeDefaults`、`jobs[*].stage`、`lastRun.stage` 和 `BRIDGE_LOG` 会记录阶段、默认预算、job、checkpoint 与结果摘要。阶段不会自动推进、重试或扩大权限：`implement` 仍要求写 profile/白名单/clean tree，`exec` 仍要求命名命令策略与 clean tree，失败后由调用方显式取消、续跑、审查或回滚。
+
 `reasonix_run` 还接受只读的 `mode=plan`。该模式下桥接器**原样**返回 worker 的 stdout，便于调用方消费机器可读的改动清单，例如：
 
 ```json

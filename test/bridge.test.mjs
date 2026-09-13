@@ -44,6 +44,7 @@ import { AcpSessionCoordinator, summarizeAcpMessages } from '../src/acp-session.
 import { ACP_REGISTRY_SCHEMA, AcpSessionRegistry } from '../src/acp-registry.mjs';
 import { AcpSecurityPolicy, normalizeSessionScope, scrubAcpContent, scrubAcpMessages } from '../src/acp-security.mjs';
 import { AcpTransportManager } from '../src/acp-transport.mjs';
+import { WORKFLOW_STAGES, resolveWorkflowStage, stageForMode, workflowStatus } from '../src/workflow.mjs';
 
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
@@ -443,6 +444,21 @@ describe('configuration pure functions', () => {
     assert.equal(resolveProviderSearchCapability({ providers: [{ name: 'fixture', capabilities: { web_search: false } }] }).reason, 'provider_reported_unavailable');
   });
 
+  test('keeps workflow stages explicit and fail-closed', () => {
+    assert.deepEqual(WORKFLOW_STAGES, ['plan', 'implement', 'exec', 'review']);
+    assert.equal(stageForMode('plan'), 'plan');
+    assert.equal(stageForMode('inspect'), null);
+    assert.deepEqual(resolveWorkflowStage(undefined, 'review'), { stage: 'review', error: null });
+    assert.deepEqual(resolveWorkflowStage(undefined, 'exec', 'node-test'), { stage: 'exec', error: null });
+    assert.deepEqual(resolveWorkflowStage('exec', 'review'), { stage: null, error: 'stage=exec is reserved for reasonix_exec' });
+    assert.deepEqual(resolveWorkflowStage('plan', 'implement'), { stage: null, error: 'mode=implement only supports stage=implement' });
+    assert.deepEqual(workflowStatus([{ state: 'running', stage: 'plan' }, { state: 'running', stage: 'plan' }], { stage: 'review' }), {
+      template: ['plan', 'implement', 'exec', 'review'],
+      activeStages: ['plan'],
+      lastStage: 'review',
+    });
+  });
+
   test('resolves a fail-closed named execution policy', () => {
     assert.equal(resolveExecPolicy({ data: {} }).enabled, false);
     const policy = resolveExecPolicy({ data: { execPolicy: {
@@ -801,6 +817,13 @@ describe('offline command contracts', () => {
       status: 'unavailable',
       reason: 'provider_capability_not_advertised',
     });
+    assert.deepEqual(status.workflow, { template: ['plan', 'implement', 'exec', 'review'], activeStages: [], lastStage: null });
+    assert.deepEqual(status.modeDefaults, {
+      inspect: { maxSteps: 80, toolRounds: 40, timeoutSeconds: 600 },
+      review: { maxSteps: 96, toolRounds: 48, timeoutSeconds: 900 },
+      plan: { maxSteps: 96, toolRounds: 48, timeoutSeconds: 900 },
+      implement: { maxSteps: 96, toolRounds: 48, timeoutSeconds: 900 },
+    });
     assert.deepEqual(status.providerCapabilities, {
       available: true,
       provider: 'fixture',
@@ -823,6 +846,27 @@ describe('offline command contracts', () => {
     assert.match(response.result.content[0].text, /reasonix_exec is disabled/);
     child.stdin.end();
     assert.equal(await new Promise((resolve) => child.once('close', resolve)), 0);
+  });
+
+  test('workflow stage mismatch is rejected before spawning a worker', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const marker = path.join(root, 'spawned');
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.MARKER, 'spawned');
+`, 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { MARKER: marker }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    try {
+      const response = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'invalid stage', mode: 'plan', stage: 'review' } });
+      assert.equal(response.result.isError, true);
+      assert.match(response.result.content[0].text, /mode=plan only supports stage=plan/);
+      assert.equal(existsSync(marker), false);
+    } finally {
+      child.stdin.end();
+      await new Promise((resolve) => child.once('close', resolve));
+    }
   });
 
   test('reasonix_exec runs an allowlisted argv command and detects workspace mutations', async () => {
@@ -850,7 +894,7 @@ process.stderr.write(${JSON.stringify(root)});
     const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const client = mcpClient(child);
     try {
-      const success = await client.request(1, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-fixture', args: ['hello'] } });
+      const success = await client.request(1, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-fixture', stage: 'exec', args: ['hello'] } });
       assert.equal(success.result.isError, false);
       const payload = JSON.parse(success.result.content[0].text);
       assert.equal(payload.schema, 'qlh.reasonix.exec.v1');
@@ -869,6 +913,7 @@ process.stderr.write(${JSON.stringify(root)});
       const status = JSON.parse((await client.request(3, 'tools/call', { name: 'reasonix_status', arguments: {} })).result.content[0].text);
       assert.equal(status.lastRun.outcome, 'workspace_modified');
       assert.equal(status.lastRun.operation, 'node-fixture');
+      assert.equal(status.lastRun.stage, 'exec');
     } finally {
       rmSync(mutation, { force: true });
       child.stdin.end();
@@ -2220,6 +2265,7 @@ process.stdout.write('resumed-ok');
   assert.equal(checkpoint.schema, 'qlh.reasonix.checkpoint.v1');
   assert.equal(checkpoint.status, 'ready');
   assert.equal(checkpoint.outcome, 'step_limit');
+  assert.equal(checkpoint.stage, null);
   assert.match(checkpoint.task, /checkpoint task/);
   assert.doesNotMatch(JSON.stringify(checkpoint), /resumed-ok|paused after/);
 
@@ -2324,13 +2370,17 @@ process.stdout.write('round-budget-ok');
   });
   const responses = await readMcpSession(child, [
     { id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
-    { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'round-budget', cwd: '.', tool_rounds: 7, timeout_seconds: 120 } } },
+    { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'round-budget', cwd: '.', mode: 'plan', stage: 'plan', tool_rounds: 7, timeout_seconds: 120 } } },
+    { id: 3, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
   ]);
   const exit = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(exit, 0);
   const status = JSON.parse(responses[0].result.content[0].text);
   assert.equal(status.limits.toolRoundsCap, 128);
   assert.equal(responses[1].result.isError, false);
+  const afterStatus = JSON.parse(responses[2].result.content[0].text);
+  assert.equal(afterStatus.lastRun.stage, 'plan');
+  assert.equal(afterStatus.workflow.lastStage, 'plan');
   const args = JSON.parse(readFileSync(capturePath, 'utf8'));
   assert.equal(args[args.indexOf('--max-steps') + 1], '14');
 });
