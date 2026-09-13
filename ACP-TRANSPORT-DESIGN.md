@@ -1,7 +1,8 @@
 # ACP Transport Design (E2)
 
-Status: design-only. `src/server.mjs` remains stateless per call; this document and
-`src/acp-prototype.mjs` do not enable a persistent production transport.
+Status: ACP-01 client layer landed; production transport remains design-only. `src/server.mjs`
+remains stateless per call; the client and `src/acp-prototype.mjs` are not imported by the server
+until the later coexistence/switching ticket.
 
 The bridge now has a separate task-level checkpoint/`reasonix_resume` path. It is not ACP session
 resume: it starts a new Reasonix process with an explicit continuation instruction after validating
@@ -44,6 +45,16 @@ history, rotation is preferred when compaction succeeded, otherwise per-call fal
 The current bridge already enforces stateless per-call execution, output caps, timeouts, queue
 limits, and read-only mode. A future ACP adapter must reuse those limits and must not silently
 change `mode=implement` or turn a plan into a write.
+
+## ACP-01 client boundary
+
+`src/acp-client.mjs` owns one ACP child process and exposes newline-delimited JSON-RPC requests for
+`initialize`, `session/new`, `session/load`, `session/resume`, `session/prompt`, `session/cancel`,
+and `session/close`. It rejects load/resume when the agent does not advertise the corresponding
+capability, aggregates `session/update` notifications for a prompt, rejects permission requests by
+default, and sends `session/cancel` before surfacing a prompt timeout. It bounds captured stderr and
+terminates the child tree during shutdown. The module deliberately does not persist sessions,
+compact history, authorize writes, or alter the MCP server's default per-call path.
 
 ## Failure and observability contract
 
