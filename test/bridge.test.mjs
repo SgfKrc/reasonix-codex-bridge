@@ -587,9 +587,9 @@ describe('offline command contracts', () => {
 
   test('verify fails closed when the listed profile has no SKILL.md', () => {
     const root = tempRoot();
-    writeVersionStub(root, '1.38.7');
+    const stub = writeVersionStub(root, '1.38.7');
     writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
-    const result = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_EXE: path.join(root, 'reasonix-stub.cmd'), REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    const result = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_EXE: stub, REASONIX_SKILLS_DIR: path.join(root, 'skills') });
     assert.equal(result.status, 1);
     assert.match(result.stdout, /FAIL subagent profile: deepseek-worker/);
     assert.match(result.stdout, /SKILL\.md is missing/);
@@ -597,9 +597,9 @@ describe('offline command contracts', () => {
 
   test('invalid profile names fail with a concise diagnostic', () => {
     const root = tempRoot();
-    writeVersionStub(root, '1.38.7');
+    const stub = writeVersionStub(root, '1.38.7');
     writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', subagent: '../escape' }), 'utf8');
-    const result = runNode([CONFIGURE_PATH, 'profile'], root, { REASONIX_EXE: path.join(root, 'reasonix-stub.cmd'), REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    const result = runNode([CONFIGURE_PATH, 'profile'], root, { REASONIX_EXE: stub, REASONIX_SKILLS_DIR: path.join(root, 'skills') });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /invalid subagent profile name/);
     assert.doesNotMatch(result.stderr, /at .*configure\.mjs/);
