@@ -183,6 +183,16 @@ the selected provider does not explicitly advertise search, it returns `status=u
 model prose as search results. If a provider is later connected, `reasonix_run` continues to pass
 through only the Reasonix result, including any summary, sources, and truncation state.
 
+### Explicit stage orchestration (`plan -> implement -> exec -> review`)
+
+LOOP-01 is a main-agent template, not an automatic bridge pipeline. The caller invokes the existing
+tools one stage at a time, passing `stage=plan|implement|review` to `reasonix_run` and `stage=exec`
+to `reasonix_exec`; when omitted, the bridge derives the stage from the mode/tool. Stages are visible
+in `reasonix_status.workflow`, `reasonix_status.modeDefaults`, `jobs[*].stage`, `lastRun.stage`, and optional `BRIDGE_LOG` records.
+The bridge never advances or retries stages and never expands permissions: implement still requires the
+write profile, whitelist, and clean tree; exec still requires a named command policy and clean tree.
+After a failure, the caller must explicitly cancel, resume, review, or roll back.
+
 `reasonix_run` also accepts read-only `mode=plan`. In this mode the bridge returns worker stdout
 unchanged so callers can consume a machine-readable change list, for example:
 
