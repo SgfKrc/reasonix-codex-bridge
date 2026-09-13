@@ -119,7 +119,9 @@ tests, checks that out-of-scope paths are zero, then keeps or calls `reasonix_ro
 
 `REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, `REASONIX_SUBAGENT_ROLE`, `REASONIX_WRITE_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable and always win over `bridge.config.json`. `REASONIX_SUBAGENT_ROLE` may explicitly be `read` or `write`; when omitted, a profile name ending in `-write` is treated as the write role. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. Any `<provider>/<model>` ref this machine reports is accepted for `REASONIX_MODEL_REF`; an empty value, whitespace, or a ref without `/` exits with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter. `BRIDGE_CONFIG`, `BRIDGE_PRESETS`, `CODEX_CONFIG`, and `CODEX_HOME` relocate the files the helper scripts read and write.
 
-Resource limits can be lowered per machine in `bridge.config.json`:
+Resource limits can be lowered per machine in `bridge.config.json`. The bridge permits up to
+256 raw Reasonix steps (128 tool-call rounds) and 1800 seconds per call; these are finite code
+hard caps, not user-configurable limits:
 
 ```json
 {"limits":{"MAX_STEPS_CAP":20,"TIMEOUT_SECONDS_CAP":300,"OUTPUT_CHAR_CAP":12000,"queueCap":2}}
@@ -127,7 +129,8 @@ Resource limits can be lowered per machine in `bridge.config.json`:
 
 Each value must be a positive integer. Invalid values fall back to the defaults with one startup
 warning; values above the code hard caps are clamped with one warning. `reasonix_status.limits`
-always reports the effective values used for calls.
+always reports the effective values used for calls. Defaults for the mode presets remain unchanged;
+pass `tool_rounds` and `timeout_seconds` explicitly when a task needs the wider bounded budget.
 
 Reasonix's `--max-steps` is a raw internal step budget, not a tool-call-round count. With the
 current CLI, a normal assistant/tool exchange consumes two internal steps. Use `tool_rounds` on
