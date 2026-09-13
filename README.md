@@ -240,3 +240,8 @@ replacement sessions, records redacted decision telemetry, and leaves the old se
 when replacement fails. Persistent ACP remains opt-in and the server remains stateless; see
 `ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The fixed 128 MiB Reasonix
 history cap and 75% trigger are not configurable.
+
+`src/acp-registry.mjs` provides the ACP-03 opt-in session registry. It persists only session metadata,
+serializes prompts per session, marks crashed transports orphaned, supports capability-gated resume/
+load and delete, and closes live clients during explicit shutdown. It is not imported by the server
+until the lifecycle, security, and transport-switching tickets are accepted.

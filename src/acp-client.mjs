@@ -123,6 +123,7 @@ export class AcpClient {
       if (!this.closed) this.#failPending(new AcpError(`ACP process exited before completion (code=${code ?? 'null'}, signal=${signal ?? 'none'})`, { code: 'process_exit' }));
       this.closed = true;
       this.started = false;
+      this.sessions.clear();
     });
     let result;
     try {
@@ -240,6 +241,7 @@ export class AcpClient {
     if (this.child && this.child.exitCode === null && !this.child.signalCode) await terminateProcess(this.child);
     this.child = null;
     this.started = false;
+    this.sessions.clear();
   }
 
   #resumeLike(method, sessionId, { cwd, additionalDirectories, mcpServers }) {
