@@ -1095,6 +1095,35 @@ process.stdout.write('worker-visible-output');
   for (const record of records) assert.doesNotMatch(JSON.stringify(record), /[A-Za-z]:\\\\|\\\\Users\\\\|\/tmp\//);
 });
 
+test('Reasonix max_steps pauses are classified separately from bridge timeouts', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  writeFileSync(path.join(root, 'subagent'), `
+process.stderr.write('sub-agent: paused after 5 tool-call rounds (max_steps) — work saved');
+process.exit(1);
+`, 'utf8');
+  const logPath = path.join(root, 'step-limit.jsonl');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { BRIDGE_LOG: logPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const responses = await readMcpSession(child, [
+    { id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'step-limit', cwd: '.', mode: 'inspect', max_steps: 10, timeout_seconds: 120 } } },
+  ]);
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
+  assert.equal(responses[0].result.isError, true);
+  assert.match(responses[0].result.content[0].text, /max_steps=10/);
+  assert.match(responses[0].result.content[0].text, /5 tool-call rounds/);
+  assert.match(responses[0].result.content[0].text, /timeout_seconds=120 was not reached/);
+  const record = JSON.parse(readFileSync(logPath, 'utf8').trim());
+  assert.equal(record.outcome, 'step_limit');
+  assert.equal(record.stepLimitRounds, 5);
+  assert.equal(record.timeoutSeconds, 120);
+});
+
 test('bridge limit overrides affect worker calls and status', async () => {
   const root = tempRoot();
   writeCliFiles(root);
@@ -1121,11 +1150,39 @@ process.stdout.write('z'.repeat(64));
   const exit = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(exit, 0);
   const status = JSON.parse(responses[0].result.content[0].text);
-  assert.deepEqual(status.limits, { maxStepsCap: 3, taskCharCap: 8000, timeoutSecondsCap: 4, outputCharCap: 20, queueCap: 1 });
+  assert.deepEqual(status.limits, { maxStepsCap: 3, toolRoundsCap: 1, taskCharCap: 8000, timeoutSecondsCap: 4, outputCharCap: 20, queueCap: 1 });
   assert.equal(responses[1].result.isError, false);
   assert.match(responses[1].result.content[0].text, /\[output truncated; original 64 chars\]/);
   const args = JSON.parse(readFileSync(capturePath, 'utf8'));
   assert.equal(args[args.indexOf('--max-steps') + 1], '3');
+});
+
+test('tool_rounds maps to the raw Reasonix step budget', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const capturePath = path.join(root, 'worker-args.json');
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.CAPTURE, JSON.stringify(process.argv.slice(2)));
+process.stdout.write('round-budget-ok');
+`, 'utf8');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { CAPTURE: capturePath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const responses = await readMcpSession(child, [
+    { id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
+    { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'round-budget', cwd: '.', tool_rounds: 7, timeout_seconds: 120 } } },
+  ]);
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
+  const status = JSON.parse(responses[0].result.content[0].text);
+  assert.equal(status.limits.toolRoundsCap, 40);
+  assert.equal(responses[1].result.isError, false);
+  const args = JSON.parse(readFileSync(capturePath, 'utf8'));
+  assert.equal(args[args.indexOf('--max-steps') + 1], '14');
 });
 
 test('invalid bridge limits fall back or clamp with one warning each', async () => {
@@ -1148,7 +1205,7 @@ test('invalid bridge limits fall back or clamp with one warning each', async () 
   const exit = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(exit, 0);
   const status = JSON.parse(responses[0].result.content[0].text);
-  assert.deepEqual(status.limits, { maxStepsCap: 40, taskCharCap: 8000, timeoutSecondsCap: 600, outputCharCap: 24000, queueCap: 5 });
+  assert.deepEqual(status.limits, { maxStepsCap: 80, toolRoundsCap: 40, taskCharCap: 8000, timeoutSecondsCap: 600, outputCharCap: 24000, queueCap: 5 });
   for (const key of ['MAX_STEPS_CAP', 'TIMEOUT_SECONDS_CAP', 'OUTPUT_CHAR_CAP', 'queueCap']) {
     assert.equal((stderr.match(new RegExp(`bridge config ${key}`, 'g')) ?? []).length, 1);
   }
