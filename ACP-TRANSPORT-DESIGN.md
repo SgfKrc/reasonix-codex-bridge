@@ -72,8 +72,8 @@ history unchanged. Summarizer failure or an invalid summary follows the same per
 fallback receives only the next message and reason, never persistent history.
 
 This is an adapter-level implementation, not a claim that ACP history replacement is a native
-Reasonix operation. The coordinator remains opt-in and must be wired by the later ACP-03/04/05
-tickets after lifecycle, write-policy, and transport-switching tests are complete.
+Reasonix operation. The coordinator remains opt-in and must be wired by the later ACP-05
+tickets after lifecycle, security, and transport-switching tests are complete.
 
 ## ACP-03 session registry and lifecycle
 
@@ -89,7 +89,26 @@ client factory and successfully completes capability-gated `session/resume` (or 
 fallback). A crashed transport is detected before prompt dispatch and cannot be used until resumed.
 `shutdown` closes every live entry and reports failures, while `installProcessHandlers` exposes the
 embedding layer's signal/exit cleanup hook. The registry is not imported by `server.mjs`; process
-ownership, write-policy rechecks, and transport switching remain ACP-04/05 work.
+ownership, write-policy rechecks, and transport switching remain ACP-05 work. An embedding layer
+may attach the ACP-04 `AcpSecurityPolicy` to the registry; each queued prompt is then checked again
+before dispatch so a caller cannot bypass the session scope through queue timing.
+
+## ACP-04 security gate and history hygiene
+
+`src/acp-security.mjs` is the opt-in security layer for a persistent session. `AcpSecurityPolicy`
+binds each call to an opaque `owner` and `taskId`, requires the session cwd to remain unchanged and
+inside the configured workspace/allowed roots, and rejects profile/model drift. Implement calls
+must use the explicit write role and the same fail-closed `allowWrite`, `requireCleanTree`, and
+repository-relative `allowedPaths` policy resolved by `resolveWritePolicy`; a requested path outside
+that whitelist is rejected before transport dispatch. The existing server-side Git diff and rollback
+audit remains authoritative for actual writes, so this preflight does not weaken the write contract.
+
+`scrubAcpContent`/`scrubAcpMessages` redact `.env`-style file payloads, credential assignments,
+Bearer tokens, and private-key blocks. `AcpSessionCoordinator` accepts an opt-in `sanitizePrompt`
+function and always scrubs assistant responses before retaining local continuation history. The
+registry persists only the opaque scope metadata, never prompts or responses. ACP-04 remains opt-in:
+`server.mjs` is still stateless and does not import the registry, coordinator, or security gate until
+the ACP-05 coexistence switch is accepted.
 
 ## Failure and observability contract
 

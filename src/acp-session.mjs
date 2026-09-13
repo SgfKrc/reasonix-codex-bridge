@@ -12,6 +12,7 @@ import {
   historyBytes,
   prepareSessionContinuation,
 } from './acp-prototype.mjs';
+import { scrubAcpContent } from './acp-security.mjs';
 
 const DEFAULT_SUMMARY_MESSAGE_CAP = 512;
 const DEFAULT_SUMMARY_CAP = 12_000;
@@ -71,10 +72,12 @@ export class AcpSessionCoordinator {
     preserveRecent = 2,
     now = () => Date.now(),
     onDecision = null,
+    sanitizePrompt = (value) => value,
   } = {}) {
     if (!client || typeof client.newSession !== 'function' || typeof client.prompt !== 'function') throw new TypeError('client with newSession and prompt is required');
     if (typeof summarize !== 'function') throw new TypeError('summarize must be a function');
     if (fallbackPrompt !== null && typeof fallbackPrompt !== 'function') throw new TypeError('fallbackPrompt must be a function');
+    if (typeof sanitizePrompt !== 'function') throw new TypeError('sanitizePrompt must be a function');
     this.client = client;
     this.summarize = summarize;
     this.fallbackPrompt = fallbackPrompt;
@@ -83,6 +86,7 @@ export class AcpSessionCoordinator {
     this.preserveRecent = preserveRecent;
     this.now = now;
     this.onDecision = onDecision;
+    this.sanitizePrompt = sanitizePrompt;
     this.sessionId = null;
     this.history = [];
     this.decisionLog = [];
@@ -105,7 +109,7 @@ export class AcpSessionCoordinator {
 
   async prompt(text, { role = 'user', timeoutMs } = {}) {
     if (!this.started || !this.sessionId) throw new AcpError('ACP coordinator is not started', { code: 'not_started' });
-    const nextMessage = { role, content: String(text) };
+    const nextMessage = { role, content: String(this.sanitizePrompt(text)) };
     const beforeBytes = historyBytes(this.history);
     const candidateBytes = historyBytes([...this.history, nextMessage]);
     const startedAt = this.now();
@@ -203,7 +207,9 @@ export class AcpSessionCoordinator {
 
   #historyWithResult(messages, result) {
     const next = clone(messages);
-    const response = typeof result?.text === 'string' ? result.text : '';
+    const response = typeof result?.text === 'string'
+      ? scrubAcpContent(result.text, { sourcePath: result.sourcePath ?? result.path ?? '' })
+      : '';
     if (response) next.push({ role: 'assistant', content: response });
     return next;
   }
