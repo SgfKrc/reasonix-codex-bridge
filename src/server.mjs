@@ -68,6 +68,7 @@ const TOOLS = [
   { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. Budget: omit max_steps and tool_rounds to use the mode default (inspect 40 tool-call rounds, review/plan/implement 48); pass tool_rounds only when a task needs a different bound (1 round = 2 raw CLI steps, hard cap 128 rounds); max_steps is the raw CLI budget and is only for explicit CLI-compatible overrides. Set parallel=true explicitly for concurrent read-only jobs. Pass stage=plan|implement|review to make the main-agent workflow stage visible; the bridge never auto-advances stages. When transport=acp is enabled, pass session_id to opt into a persistent ACP session.', inputSchema: { type: 'object', properties: { task: { type: 'string', description: 'Self-contained task text for the worker.' }, cwd: { type: 'string', description: 'Workspace-relative directory inside the allowed roots; defaults to the workspace root.' }, max_steps: { type: 'integer', description: 'Raw Reasonix internal steps (2 per tool-call round). Omit to use the mode default (inspect 80, review/plan/implement 96); only pass for explicit CLI-compatible overrides. Hard cap 256.' }, tool_rounds: { type: 'integer', minimum: 1, description: 'Tool-call rounds (1 round = 2 raw steps). Omit to use the mode default (inspect 40, review/plan/implement 48); hard cap 128. Prefer this over max_steps.' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'], description: 'inspect/review/plan are read-only; implement requires an explicit write role plus the per-machine write policy.' }, stage: { type: 'string', enum: ['plan', 'implement', 'review'], description: 'Makes the main-agent workflow stage visible; the bridge never auto-advances stages.' }, timeout_seconds: { type: 'integer', description: 'Per-call timeout. Omit to use the mode default (inspect 600s, review/plan/implement 900s); hard cap 1800s.' }, parallel: { type: 'boolean', description: 'true opts into a concurrent read-only slot; implement/resume/rollback stay exclusive.' }, session_id: { type: 'string', description: 'Only when transport=acp is enabled, to opt into a persistent ACP session.' } }, required: ['task'] } },
   { name: 'reasonix_resume', description: 'Explicitly resume one durable checkpoint after workspace/configuration drift checks. A checkpoint is one-shot and is never replayed implicitly.', inputSchema: { type: 'object', properties: { checkpoint_id: { type: 'string', description: 'Checkpoint id returned by a failed reasonix_run.' }, max_steps: { type: 'integer', description: 'Raw Reasonix internal steps; omit to reuse the checkpoint budget.' }, tool_rounds: { type: 'integer', minimum: 1, description: 'Tool-call rounds; omit to reuse the checkpoint budget.' }, timeout_seconds: { type: 'integer', description: 'Per-call timeout; omit to reuse the checkpoint budget.' } }, required: ['checkpoint_id'] } },
   { name: 'reasonix_cancel', description: 'Request cancellation of one queued or running job. Running workers are terminated and the terminal cancellation remains visible in reasonix_status.', inputSchema: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'] } },
+  { name: 'reasonix_events', description: 'Poll a bounded, ordered lifecycle stream for one job. Events contain only job id, stage, state, terminal outcome, and bounded counters; task text, model references, paths, and worker output are never returned.', inputSchema: { type: 'object', properties: { job_id: { type: 'string' }, after_seq: { type: 'integer', minimum: 0, description: 'Return events after this per-job sequence number.' }, limit: { type: 'integer', minimum: 1, maximum: 64, description: 'Maximum number of events to return.' } }, required: ['job_id'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
   { name: 'reasonix_exec', description: 'Run one explicitly configured command profile through a no-shell argv spawn as the explicit exec/test workflow stage. The policy is disabled by default, requires a clean Git workspace, and never accepts a caller-provided executable.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' }, maxItems: 128 }, cwd: { type: 'string' }, stage: { type: 'string', enum: ['exec'] }, timeout_seconds: { type: 'integer', minimum: 1 }, output_char_cap: { type: 'integer', minimum: 1 } }, required: ['command'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
@@ -858,8 +859,10 @@ function estimateTaskTokens(task) {
   return Math.max(1, Math.ceil(Buffer.byteLength(task, 'utf8') / 4));
 }
 const MAX_JOB_RECORDS = 64;
+const MAX_JOB_EVENTS = 32;
 const jobQueue = [];
 const jobRecords = new Map();
+const jobEvents = new Map();
 let queueDepth = 0;
 let inFlight = 0;
 let parallelActive = 0;
@@ -891,6 +894,7 @@ function jobSummary(record) {
     stepLimitRounds: record.stepLimitRounds,
     cursorError: record.cursorError,
     checkpointId: record.checkpointId,
+    eventCount: jobEvents.get(record.id)?.length ?? 0,
   };
 }
 function pruneJobRecords() {
@@ -898,7 +902,32 @@ function pruneJobRecords() {
     const candidate = [...jobRecords.values()].find((record) => ['completed', 'failed', 'cancelled'].includes(record.state));
     if (!candidate) return;
     jobRecords.delete(candidate.id);
+    jobEvents.delete(candidate.id);
   }
+}
+function recordJobEvent(record, type) {
+  const events = jobEvents.get(record.id) ?? [];
+  const event = {
+    jobId: record.id,
+    seq: (events.at(-1)?.seq ?? 0) + 1,
+    type,
+    mode: record.mode,
+    stage: record.stage ?? stageForMode(record.mode),
+    state: record.state,
+    outcome: record.outcome,
+    maxSteps: record.maxSteps,
+    timeoutSeconds: record.timeoutSeconds,
+    stepLimitRounds: record.stepLimitRounds,
+    cancelRequested: record.cancelRequested === true,
+    queueDepth,
+    inFlight,
+    parallelActive,
+    exclusiveActive,
+    at: new Date().toISOString(),
+  };
+  events.push(event);
+  if (events.length > MAX_JOB_EVENTS) events.splice(0, events.length - MAX_JOB_EVENTS);
+  jobEvents.set(record.id, events);
 }
 function settleJobRecord(record, result) {
   const meta = result?.meta ?? {};
@@ -913,6 +942,7 @@ function settleJobRecord(record, result) {
   record.reclaimedAt = record.endedAt;
   record.reclaimed = true;
   record.cancel = null;
+  recordJobEvent(record, record.state === 'completed' ? 'completed' : record.state === 'cancelled' ? 'cancelled' : 'failed');
 }
 function attachJobMeta(result, record) {
   return { ...result, meta: { ...(result?.meta ?? {}), jobId: record.id } };
@@ -924,6 +954,7 @@ function startJob(item) {
   inFlight += 1;
   if (record.exclusive) exclusiveActive += 1;
   else parallelActive += 1;
+  recordJobEvent(record, 'started');
   const cancelRef = { requested: false, cancel: null };
   record.cancel = () => {
     record.cancelRequested = true;
@@ -992,8 +1023,10 @@ function enqueue(job, meta, { parallel = false, exclusive = true } = {}) {
   const item = { job, record, resolve: resolveResult };
   record.item = item;
   jobRecords.set(record.id, record);
+  jobEvents.set(record.id, []);
   queueDepth += 1;
   jobQueue.push(item);
+  recordJobEvent(record, 'queued');
   pumpJobs();
   return resultPromise;
 }
@@ -1005,6 +1038,7 @@ function cancelJob(jobId) {
   if (record.state !== 'queued' && record.state !== 'running') {
     return { isError: false, text: `job_id=${value} is already ${record.state}`, meta: { jobId: value, outcome: record.outcome } };
   }
+  const wasCancelRequested = record.cancelRequested === true;
   record.cancelRequested = true;
   if (record.state === 'queued') {
     const index = jobQueue.findIndex((item) => item.record.id === value);
@@ -1017,12 +1051,14 @@ function cancelJob(jobId) {
     record.reclaimedAt = record.endedAt;
     record.reclaimed = true;
     queueDepth -= 1;
+    recordJobEvent(record, 'cancelled');
     recordRun({ mode: record.mode, cwdRoot: record.cwdRoot, maxSteps: record.maxSteps, timeoutSeconds: record.timeoutSeconds, outcome: 'cancelled', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false });
     item.resolve(attachJobMeta(result, record));
     pumpJobs();
     return { isError: false, text: result.text, meta: { jobId: value, outcome: 'cancelled' } };
   }
   if (typeof record.cancel === 'function') {
+    if (!wasCancelRequested) recordJobEvent(record, 'cancellation_requested');
     record.cancel();
     return { isError: false, text: `cancellation requested (job_id=${value})`, meta: { jobId: value, outcome: 'cancellation_requested' } };
   }
@@ -1030,6 +1066,35 @@ function cancelJob(jobId) {
 }
 function jobStatus() {
   return [...jobRecords.values()].map(jobSummary);
+}
+function pollJobEvents(args = {}) {
+  const jobId = typeof args.job_id === 'string' ? args.job_id.trim() : '';
+  if (!jobId) return { isError: true, text: 'job_id is required' };
+  const record = jobRecords.get(jobId);
+  if (!record) return { isError: true, text: 'job_id is unknown or has expired' };
+  const afterSeq = args.after_seq === undefined ? 0 : args.after_seq;
+  if (!Number.isInteger(afterSeq) || afterSeq < 0) return { isError: true, text: 'after_seq must be a non-negative integer' };
+  const limit = args.limit === undefined ? 32 : args.limit;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 64) return { isError: true, text: 'limit must be an integer between 1 and 64' };
+  const events = jobEvents.get(jobId) ?? [];
+  const pending = events.filter((event) => event.seq > afterSeq);
+  const selected = pending.slice(0, limit);
+  const terminal = ['completed', 'failed', 'cancelled'].includes(record.state);
+  return {
+    isError: false,
+    text: JSON.stringify({
+      schema: 'qlh.reasonix.events.v1',
+      jobId,
+      events: selected,
+      nextSeq: selected.at(-1)?.seq ?? afterSeq,
+      latestSeq: events.at(-1)?.seq ?? 0,
+      hasMore: selected.length < pending.length,
+      terminal,
+      state: record.state,
+      eventCount: events.length,
+    }, null, 2),
+    meta: { jobId, outcome: terminal ? record.outcome : null },
+  };
 }
 
 function execRequest(args = {}) {
@@ -1063,6 +1128,9 @@ async function callTool(name, args) {
   }
   if (name === 'reasonix_cancel') {
     return cancelJob(args?.job_id);
+  }
+  if (name === 'reasonix_events') {
+    return pollJobEvents(args);
   }
   if (name === 'reasonix_rollback') {
     const rollbackId = typeof args?.rollback_id === 'string' ? args.rollback_id.trim() : '';
