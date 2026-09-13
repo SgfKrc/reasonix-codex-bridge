@@ -3,6 +3,10 @@
 Status: design-only. `src/server.mjs` remains stateless per call; this document and
 `src/acp-prototype.mjs` do not enable a persistent production transport.
 
+The bridge now has a separate task-level checkpoint/`reasonix_resume` path. It is not ACP session
+resume: it starts a new Reasonix process with an explicit continuation instruction after validating
+the saved configuration and workspace fingerprints. Persistent ACP history remains design-only.
+
 ## Goals and boundaries
 
 - Keep the current per-call MCP bridge as the canonical fallback.

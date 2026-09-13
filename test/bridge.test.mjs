@@ -53,6 +53,7 @@ function envFor(root, overrides = {}) {
     BRIDGE_CONFIG: path.join(root, 'bridge.config.json'),
     BRIDGE_PRESETS: path.join(root, 'presets.json'),
     CODEX_CONFIG: path.join(root, 'codex.config.toml'),
+    BRIDGE_CHECKPOINT_DIR: path.join(tmpdir(), 'reasonix-codex-bridge-checkpoints', path.basename(root)),
     REASONIX_EXE: process.execPath,
     REASONIX_ROOT: root,
     REASONIX_MODEL_REF: 'fixture/provider',
@@ -616,11 +617,12 @@ describe('offline command contracts', () => {
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
     assert.equal(responses[0].result.serverInfo.name, 'reasonix-local-bridge');
-    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_rollback', 'reasonix_status']);
+    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_resume', 'reasonix_rollback', 'reasonix_status']);
     const status = JSON.parse(responses[2].result.content[0].text);
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
     assert.equal(status.subagentRole, 'read');
+    assert.deepEqual(status.checkpoint, { enabled: true, readyCount: 0 });
     assert.equal(status.historyHardCapBytes, 128 * 1024 * 1024);
     assert.equal(status.contextWindow, 4096);
     assert.equal(status.vision, true);
@@ -670,6 +672,23 @@ describe('offline command contracts', () => {
     const responses = await readMcpSession(child, [
       { id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
     ]);
+    assert.equal(responses[0].result.isError, false);
+    const status = JSON.parse(responses[0].result.content[0].text);
+    assert.equal(status.subagent, 'deepseek-worker-write');
+    assert.equal(status.subagentRole, 'write');
+    assert.equal(status.workerReadOnlyAssumed, false);
+  });
+
+  test('write role environment selects the derived write profile', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      cwd: root,
+      env: envFor(root, { REASONIX_SUBAGENT_ROLE: 'write' }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } }]);
     assert.equal(responses[0].result.isError, false);
     const status = JSON.parse(responses[0].result.content[0].text);
     assert.equal(status.subagent, 'deepseek-worker-write');
@@ -1187,11 +1206,87 @@ process.exit(1);
   assert.match(responses[0].result.content[0].text, /malformed or invalid read_file continuation cursor/);
   assert.match(responses[0].result.content[0].text, /bridge did not retry the task/);
   assert.match(responses[0].result.content[0].text, /cursor diagnostic redacted/);
+  assert.match(responses[0].result.content[0].text, /checkpoint_id=[0-9a-f-]{36}/);
   assert.doesNotMatch(responses[0].result.content[0].text, /opaque-token-secret/);
   const record = JSON.parse(readFileSync(logPath, 'utf8').trim());
   assert.equal(record.outcome, 'cursor_error');
   assert.equal(record.cursorError, true);
   assert.equal(record.stepLimitRounds, null);
+});
+
+test('failed runs create durable one-shot checkpoints that resume across bridge processes', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const checkpointDir = path.join(tmpdir(), 'reasonix-codex-bridge-checkpoints', path.basename(root));
+  const callsPath = path.join(checkpointDir, 'calls');
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+const calls = fs.existsSync(process.env.CALLS) ? Number(fs.readFileSync(process.env.CALLS, 'utf8')) : 0;
+fs.mkdirSync(require('node:path').dirname(process.env.CALLS), { recursive: true });
+fs.writeFileSync(process.env.CALLS, String(calls + 1));
+if (calls === 0) { process.stderr.write('paused after 4 tool-call rounds (max_steps)'); process.exit(1); }
+process.stdout.write('resumed-ok');
+`, 'utf8');
+  commitFixture(root);
+  const env = envFor(root, { BRIDGE_CHECKPOINT_DIR: checkpointDir, CALLS: callsPath });
+  const first = spawn(process.execPath, [SERVER_PATH], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const firstResponses = await readMcpSession(first, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'checkpoint task', cwd: '.', mode: 'inspect', max_steps: 8 } } }]);
+  assert.equal(await new Promise((resolve) => first.once('close', resolve)), 0);
+  assert.equal(firstResponses[0].result.isError, true);
+  const checkpointId = firstResponses[0].result.content[0].text.match(/checkpoint_id=([0-9a-f-]{36})/)?.[1];
+  assert.ok(checkpointId);
+  const checkpointPath = path.join(checkpointDir, `${checkpointId}.json`);
+  const checkpoint = JSON.parse(readFileSync(checkpointPath, 'utf8'));
+  assert.equal(checkpoint.schema, 'qlh.reasonix.checkpoint.v1');
+  assert.equal(checkpoint.status, 'ready');
+  assert.equal(checkpoint.outcome, 'step_limit');
+  assert.match(checkpoint.task, /checkpoint task/);
+  assert.doesNotMatch(JSON.stringify(checkpoint), /resumed-ok|paused after/);
+
+  const second = spawn(process.execPath, [SERVER_PATH], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const secondResponses = await readMcpSession(second, [{ id: 2, method: 'tools/call', params: { name: 'reasonix_resume', arguments: { checkpoint_id: checkpointId, tool_rounds: 6 } } }]);
+  assert.equal(await new Promise((resolve) => second.once('close', resolve)), 0);
+  assert.equal(secondResponses[0].result.isError, false);
+  assert.match(secondResponses[0].result.content[0].text, /resumed-ok/);
+  assert.equal(readFileSync(callsPath, 'utf8'), '2');
+  const consumed = JSON.parse(readFileSync(checkpointPath, 'utf8'));
+  assert.equal(consumed.status, 'consumed');
+
+  const third = spawn(process.execPath, [SERVER_PATH], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const thirdResponses = await readMcpSession(third, [{ id: 3, method: 'tools/call', params: { name: 'reasonix_resume', arguments: { checkpoint_id: checkpointId } } }]);
+  assert.equal(await new Promise((resolve) => third.once('close', resolve)), 0);
+  assert.equal(thirdResponses[0].result.isError, true);
+  assert.match(thirdResponses[0].result.content[0].text, /already been consumed/);
+  assert.equal(readFileSync(callsPath, 'utf8'), '2');
+});
+
+test('checkpoint resume refuses workspace drift before spawning a worker', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const checkpointDir = path.join(tmpdir(), 'reasonix-codex-bridge-checkpoints', path.basename(root));
+  const callsPath = path.join(checkpointDir, 'calls');
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+const calls = fs.existsSync(process.env.CALLS) ? Number(fs.readFileSync(process.env.CALLS, 'utf8')) : 0;
+fs.mkdirSync(require('node:path').dirname(process.env.CALLS), { recursive: true });
+fs.writeFileSync(process.env.CALLS, String(calls + 1));
+process.stderr.write('paused after 3 tool-call rounds (max_steps)');
+process.exit(1);
+`, 'utf8');
+  commitFixture(root);
+  const env = envFor(root, { BRIDGE_CHECKPOINT_DIR: checkpointDir, CALLS: callsPath });
+  const first = spawn(process.execPath, [SERVER_PATH], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const firstResponses = await readMcpSession(first, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'drift task', cwd: '.', mode: 'inspect', max_steps: 6 } } }]);
+  assert.equal(await new Promise((resolve) => first.once('close', resolve)), 0);
+  const checkpointId = firstResponses[0].result.content[0].text.match(/checkpoint_id=([0-9a-f-]{36})/)?.[1];
+  assert.ok(checkpointId);
+  writeFileSync(path.join(root, 'drift.txt'), 'changed after checkpoint', 'utf8');
+  const second = spawn(process.execPath, [SERVER_PATH], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const secondResponses = await readMcpSession(second, [{ id: 2, method: 'tools/call', params: { name: 'reasonix_resume', arguments: { checkpoint_id: checkpointId } } }]);
+  assert.equal(await new Promise((resolve) => second.once('close', resolve)), 0);
+  assert.equal(secondResponses[0].result.isError, true);
+  assert.match(secondResponses[0].result.content[0].text, /working tree changed/);
+  assert.equal(readFileSync(callsPath, 'utf8'), '1');
 });
 
 test('bridge limit overrides affect worker calls and status', async () => {

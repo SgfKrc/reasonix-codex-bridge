@@ -145,7 +145,16 @@ returned byte-for-byte as received, never edited or reconstructed. If Reasonix r
 or malformed cursor, the bridge returns `cursor_error`, redacts the worker's cursor diagnostic, and
 does not replay the task; the worker should re-read the file from an explicit path/range instead.
 
-`reasonix_status` also reports the live `queueDepth` (accepted calls not yet completed), numeric
+Recoverable worker failures (`step_limit`, `timeout`, `worker_exit`, and `cursor_error`) create a
+durable checkpoint outside the workspace. The response includes a `checkpoint_id`; call
+`reasonix_resume` explicitly to continue. A checkpoint stores the original task, mode, bounded
+budget, Reasonix/config fingerprints, and a Git workspace snapshot, but never worker stdout/stderr.
+Resume refuses a changed workspace or configuration and consumes the checkpoint before starting the
+next worker, so failures are never retried implicitly. Checkpoints are one-shot; a failed resume
+creates a new id. Set `BRIDGE_CHECKPOINT_DIR` (or `checkpointDir` in `bridge.config.json`) to choose
+the storage directory; paths inside the workspace disable checkpointing to avoid dirtying Git.
+
+`reasonix_status` also reports checkpoint persistence (`checkpoint.enabled` and ready count), the live `queueDepth` (accepted calls not yet completed), numeric
 `inFlight` count, and a redacted `lastRun` summary. A full queue error includes the current depth,
 configured capacity, and a retry-after hint. The summary never contains task text, worker output,
 model references, or absolute paths.

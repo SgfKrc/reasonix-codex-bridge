@@ -11,6 +11,7 @@ All notable changes to this project are documented here.
 - Role-aware verification and status reporting for the explicit write profile workflow.
 - Run-mode authorization now rejects write profiles in inspect/review/plan and requires a write profile for implement.
 - Unsafe `requireCleanTree=false` write policies are rejected; controlled writes always require a clean Git tree.
+- Durable, one-shot `reasonix_resume` checkpoints for recoverable worker failures. Resume validates the selected profile/configuration and Git workspace snapshot, consumes the checkpoint before spawning, and never replays a task implicitly.
 
 ### Changed
 
