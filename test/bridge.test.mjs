@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, describe, test } from 'node:test';
+import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
 import {
   DEFAULT_MIN_REASONIX_VERSION,
   DEFAULT_DOCTOR_CACHE_TTL_MS,
@@ -32,6 +34,7 @@ import {
   historyBytes,
   prepareSessionContinuation,
 } from '../src/acp-prototype.mjs';
+import { AcpClient, collectAcpText } from '../src/acp-client.mjs';
 
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
@@ -140,6 +143,62 @@ exit 0
   // chmod is intentionally avoided in the Windows test path; POSIX runners use a shell script.
   spawnSync('chmod', ['+x', file]);
   return file;
+}
+
+function acpFixtureSpawn() {
+  const child = new EventEmitter();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const received = [];
+  let buffer = '';
+  let nextSession = 1;
+  const send = (message) => setTimeout(() => stdout.write(`${JSON.stringify(message)}\n`), 0);
+  const respond = (message, result) => send({ jsonrpc: '2.0', id: message.id, result });
+  const handle = (message) => {
+    received.push(message);
+    if (message.method === 'initialize') {
+      respond(message, { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { load: {}, resume: {}, close: {}, delete: {} } } });
+    } else if (message.method === 'session/new') {
+      respond(message, { sessionId: `fixture-session-${nextSession++}` });
+    } else if (message.method === 'session/load' || message.method === 'session/resume') {
+      respond(message, { sessionId: message.params.sessionId });
+    } else if (message.method === 'session/prompt') {
+      if (message.params.prompt?.[0]?.text === 'hang') return;
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'fixture-' } } } });
+      send({ jsonrpc: '2.0', id: 77, method: 'session/request_permission', params: { sessionId: message.params.sessionId, toolCall: { title: 'fixture' } } });
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answer' } } } });
+      setTimeout(() => respond(message, { stopReason: 'end_turn' }), 5);
+    } else if (message.method === 'session/cancel' || message.method === 'session/close') {
+      respond(message, {});
+    }
+  };
+  const stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      buffer += chunk.toString();
+      let index;
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (line) handle(JSON.parse(line));
+      }
+      callback();
+    },
+  });
+  child.stdin = stdin;
+  child.stdout = stdout;
+  child.stderr = stderr;
+  child.pid = 4242;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = (signal = 'SIGTERM') => {
+    if (child.exitCode !== null || child.signalCode) return false;
+    child.signalCode = signal;
+    stdout.end();
+    stderr.end();
+    child.emit('close', null, signal);
+    return true;
+  };
+  return { child, received, spawnImpl: () => child };
 }
 
 function runNode(args, root, overrides = {}) {
@@ -1040,6 +1099,50 @@ process.stdout.write('implemented');
     assert.equal(existsSync(target), false);
     const status = spawnSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8', windowsHide: true });
     assert.equal(status.stdout.trim(), '');
+  });
+});
+
+describe('ACP client transport', () => {
+  test('performs handshake, session lifecycle, update aggregation, and safe permission rejection', async () => {
+    const fixture = acpFixtureSpawn();
+    const updates = [];
+    const client = new AcpClient({
+      cliPath: 'reasonix-fixture',
+      modelRef: 'fixture/provider',
+      cwd: 'C:/fixture',
+      timeoutMs: 100,
+      spawnImpl: fixture.spawnImpl,
+      onUpdate: (update) => updates.push(update),
+    });
+    await client.start();
+    assert.equal(client.supportsSession('resume'), true);
+    const created = await client.newSession();
+    assert.equal(created.sessionId, 'fixture-session-1');
+    const loaded = await client.loadSession('persisted-session');
+    assert.equal(loaded.sessionId, 'persisted-session');
+    const resumed = await client.resumeSession('persisted-session');
+    assert.equal(resumed.sessionId, 'persisted-session');
+    const prompt = await client.prompt(created.sessionId, 'say hello');
+    assert.equal(prompt.stopReason, 'end_turn');
+    assert.equal(prompt.text, 'fixture-answer');
+    assert.equal(collectAcpText(prompt.updates), 'fixture-answer');
+    assert.equal(updates.length, 2);
+    const permissionResponse = fixture.received.find((message) => message.id === 77);
+    assert.deepEqual(permissionResponse.result, { outcome: { outcome: 'cancelled' } });
+    assert.deepEqual(fixture.received.find((message) => message.method === 'session/new').params, { cwd: 'C:/fixture', mcpServers: [] });
+    await client.close({ sessionId: created.sessionId });
+    assert.equal(client.child, null);
+  });
+
+  test('cancels an ACP prompt after timeout and closes the process', async () => {
+    const fixture = acpFixtureSpawn();
+    const client = new AcpClient({ cliPath: 'reasonix-fixture', modelRef: 'fixture/provider', cwd: 'C:/fixture', timeoutMs: 25, spawnImpl: fixture.spawnImpl });
+    await client.start();
+    const session = await client.newSession();
+    await assert.rejects(() => client.prompt(session.sessionId, 'hang', { timeoutMs: 10 }), (error) => error.code === 'timeout');
+    assert.ok(fixture.received.some((message) => message.method === 'session/cancel'));
+    await client.close({ sessionId: session.sessionId });
+    assert.equal(client.child, null);
   });
 });
 

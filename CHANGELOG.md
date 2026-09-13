@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- ACP-01 newline-delimited JSON-RPC client with capability-gated session lifecycle, prompt update aggregation, cancellation, and process cleanup; it is not enabled by the stateless server yet.
 - Separate `read` and `write` profile contracts via `configure profile --role read|write`.
 - The write profile uses only `edit_file` and `write_file` beyond the canonical read tools, omits `read-only`, and has a dedicated implementation prompt.
 - Role-aware verification and status reporting for the explicit write profile workflow.

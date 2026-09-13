@@ -228,4 +228,13 @@ process tree on timeout/cancel, and keeps write operations exclusive. Output bey
 jobs are independently spawned and reclaimed when they finish. This avoids accumulating one
 conversation beyond Reasonix's hard 128 MB history limit.
 
-Persistent ACP transport remains design-only; see `ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The offline prototype in `src/acp-prototype.mjs` triggers transactional compaction at 75% of the fixed 128 MiB Reasonix history cap, rotates when a compacted session still cannot fit, and falls back to per-call without mutating persistent history when compaction fails. `src/server.mjs` remains stateless and does not import the prototype.
+`src/acp-client.mjs` now provides the ACP-01 newline JSON-RPC client: it performs capability-gated
+initialize/session creation, load/resume, prompt update aggregation, cancellation and clean process
+shutdown. It is transport-only and does not persist session ids or decide write policy. The server
+still defaults to stateless per-call execution and does not import the client until the later
+coexistence/switching ticket is accepted.
+
+Persistent ACP history remains design-only; see `ACP-TRANSPORT-DESIGN.md` for the lifecycle and
+failure contract. The offline prototype in `src/acp-prototype.mjs` triggers transactional compaction
+at 75% of the fixed 128 MiB Reasonix history cap, rotates when a compacted session still cannot fit,
+and falls back to per-call without mutating persistent history when compaction fails.

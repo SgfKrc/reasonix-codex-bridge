@@ -6,7 +6,7 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node src/server.mjs",
-    "check": "node --check src/server.mjs && node --check src/config.mjs && node --check src/configure.mjs && node --check src/acp-prototype.mjs && node --check src/checkpoint.mjs && node --check scripts/check-readme-links.mjs",
+    "check": "node --check src/server.mjs && node --check src/config.mjs && node --check src/configure.mjs && node --check src/acp-prototype.mjs && node --check src/acp-client.mjs && node --check src/checkpoint.mjs && node --check scripts/check-readme-links.mjs",
     "check:links": "node scripts/check-readme-links.mjs",
     "test": "node --test"
   }
