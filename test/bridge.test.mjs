@@ -101,7 +101,7 @@ if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) 
   const model = modelIndex >= 0 ? args[modelIndex + 1] : (process.env.PROFILE_MODEL || 'fixture/provider');
   const name = args[2] || 'deepseek-worker';
   const toolsIndex = args.indexOf('--tools');
-  const tools = toolsIndex >= 0 ? args[toolsIndex + 1].split(',').join(', ') : 'read_file, grep, glob, ls, code_index';
+  const tools = toolsIndex >= 0 ? args[toolsIndex + 1].split(',').join(', ') : 'read_file, grep, glob, ls, code_index, web_fetch';
   const lines = ['---', 'name: ' + name, 'description: Fixture worker', 'model: ' + model, 'allowed-tools: [' + tools + ']'];
   if ((!name.endsWith('-write') && process.env.PROFILE_READ_ONLY !== '0') || (name.endsWith('-write') && process.env.PROFILE_WRITE_READ_ONLY === '1')) lines.push('read-only: true');
   lines.push('---', '', '# fixture');
@@ -115,7 +115,7 @@ if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) 
 function writeProfile(root, model = 'fixture/provider', readOnly = true) {
   const dir = path.join(root, 'skills', 'deepseek-worker');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, 'allowed-tools: [read_file, grep, glob, ls, code_index]', `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
+  writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, `allowed-tools: [${READ_ONLY_PROFILE_TOOLS.join(', ')}]`, `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
   return path.join(dir, 'SKILL.md');
 }
 
@@ -429,7 +429,7 @@ describe('configuration pure functions', () => {
     assert.deepEqual(profile.tools, ['read_file', 'grep']);
     assert.equal(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').fields.description, 'workers #1');
     assert.deepEqual(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').tools, ['read_file', 'grep']);
-    assert.deepEqual(READ_ONLY_PROFILE_TOOLS, ['read_file', 'grep', 'glob', 'ls', 'code_index']);
+    assert.deepEqual(READ_ONLY_PROFILE_TOOLS, ['read_file', 'grep', 'glob', 'ls', 'code_index', 'web_fetch']);
     assert.deepEqual(WRITE_PROFILE_TOOLS, [...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
   });
 
@@ -456,6 +456,9 @@ describe('configuration pure functions', () => {
   test('worker prompts require opaque continuation cursors', () => {
     const readPrompt = readFileSync(path.join(BRIDGE_ROOT, 'prompts', 'deepseek-worker-prompt.md'), 'utf8');
     const writePrompt = readFileSync(path.join(BRIDGE_ROOT, 'prompts', 'deepseek-worker-write-prompt.md'), 'utf8');
+    assert.match(readPrompt, /allowed-tools.*web_fetch/u);
+    assert.match(readPrompt, /bridge.*不提供任意 URL MCP 工具/isu);
+    assert.match(writePrompt, /native `web_fetch`/iu);
     assert.match(readPrompt, /continuation cursor.*不透明值/isu);
     assert.match(readPrompt, /逐字原样传回/isu);
     assert.match(readPrompt, /重新调用 `read_file`/u);
@@ -648,7 +651,7 @@ describe('offline command contracts', () => {
     const after = runNode([CONFIGURE_PATH, 'verify'], root, profileEnv);
     assert.equal(after.status, 0, after.stderr);
     assert.match(after.stdout, /installed and consistent/);
-    assert.match(after.stdout, /tools: read_file,grep,glob,ls,code_index/);
+    assert.match(after.stdout, /tools: read_file,grep,glob,ls,code_index,web_fetch/);
   });
 
   test('verify fails when Reasonix doctor reports an unknown tool for the selected profile', () => {

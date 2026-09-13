@@ -87,15 +87,15 @@ npm run check:links # 仅检查本仓库 README 的本地链接；不访问网�
 
 ```powershell
 reasonix subagent create deepseek-worker --scope global --model "<node src/configure.mjs list 显示的 ref>" --prompt-file .\prompts\deepseek-worker-prompt.md
-reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index"
+reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index,web_fetch"
 # 可用 `node src/configure.mjs profile --sync --write` 强制 read-only: true 并复检 profile。
 ```
 
 `configure profile` 在 Windows 上按 `%APPDATA%/reasonix/skills/<name>/SKILL.md` 解析 profile（POSIX 上是 `~/.config/reasonix/skills/<name>/SKILL.md`）。默认的 `read` 角色使用配置的 `deepseek-worker` 名称，要求 `read-only: true`，且在未显式 `--write` 时只做预览。`--role write` 指向独立的 `<读 profile 名>-write`（或 `REASONIX_WRITE_SUBAGENT`/`writeSubagent`），使用 `prompts/deepseek-worker-write-prompt.md`，并要求不得出现 `read-only` 字段。两种角色在显式写入后都会重新读取 profile，并在模型或工具漂移时 fail-closed。离线测试或隔离部署可用 `REASONIX_SKILLS_DIR` 指向临时 skills 根。
 
-规范的只读 profile 工具集是 `read_file, grep, glob, ls, code_index`。Reasonix v1.38.7 不识别 `git_log` 与 `git_diff` 这两个 profile 身份；Git 历史和差异由主 agent 通过 host/MCP 或受控命令执行通道审查。不允许任何写、commit、checkout、reset、网络或 shell 工具。`configure verify` 会同时检查 profile 漂移和 Reasonix doctor 报告的未知工具身份。
+规范的只读 profile 工具集是 `read_file, grep, glob, ls, code_index, web_fetch`。其中 `web_fetch` 是 Reasonix 原生的可选 URL 抓取能力，按 Reasonix 自己的策略执行；bridge 不提供任意 URL MCP 工具，也不自建网络栈。Reasonix v1.38.7 不识别 `git_log` 与 `git_diff` 这两个 profile 身份；Git 历史和差异由主 agent 通过 host/MCP 或受控命令执行通道审查。不允许任何写、commit、checkout、reset 或 shell 工具。`configure verify` 会同时检查 profile 漂移和 Reasonix doctor 报告的未知工具身份。
 
-规范的写 profile 只在上述只读集合上增加 `edit_file` 与 `write_file`。它没有 `read-only` 字段，同样没有 shell、网络、commit、checkout、reset 或删除类工具。**创建 profile 并不等于开启桥接写入**：仍然需要 `allowWrite: true`、非空 `allowedPaths`、干净工作区，以及调用方显式传 `mode=implement`。只有在明确授权的那次调用中才把 `REASONIX_SUBAGENT` 指向写 profile。工作流是：主 agent 下达有界任务 → 写子智能体执行编辑 → 桥接器返回结构化变更证据 → 主 agent 审查 diff 并跑测试、确认白名单外路径为零，然后保留改动或调用 `reasonix_rollback`。
+规范的写 profile 只在上述只读集合上增加 `edit_file` 与 `write_file`。它没有 `read-only` 字段，同样没有 shell、任意 socket/代理、commit、checkout、reset 或删除类工具；需要 URL 抓取时仍只能使用 Reasonix 原生 `web_fetch`。**创建 profile 并不等于开启桥接写入**：仍然需要 `allowWrite: true`、非空 `allowedPaths`、干净工作区，以及调用方显式传 `mode=implement`。只有在明确授权的那次调用中才把 `REASONIX_SUBAGENT` 指向写 profile。工作流是：主 agent 下达有界任务 → 写子智能体执行编辑 → 桥接器返回结构化变更证据 → 主 agent 审查 diff 并跑测试、确认白名单外路径为零，然后保留改动或调用 `reasonix_rollback`。
 
 ## 环境变量
 

@@ -17,8 +17,9 @@ export const DEFAULT_SUBAGENT = 'deepseek-worker';
 export const DEFAULT_MIN_REASONIX_VERSION = '1.38.6';
 // Keep this list aligned with Reasonix's actual tool identities. Git history/diff
 // inspection belongs to the host's MCP/exec surface until the CLI exposes names
-// that it recognizes in subagent profiles.
-export const READ_ONLY_PROFILE_TOOLS = Object.freeze(['read_file', 'grep', 'glob', 'ls', 'code_index']);
+// that it recognizes in subagent profiles. web_fetch remains Reasonix-owned; the
+// bridge does not expose a URL/network tool or implement a second network stack.
+export const READ_ONLY_PROFILE_TOOLS = Object.freeze(['read_file', 'grep', 'glob', 'ls', 'code_index', 'web_fetch']);
 export const WRITE_PROFILE_TOOLS = Object.freeze([...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
 export const DEFAULT_WRITE_SUBAGENT_SUFFIX = '-write';
 export const EXEC_HARD_TIMEOUT_SECONDS_CAP = 1800;
