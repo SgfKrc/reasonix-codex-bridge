@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -67,7 +67,19 @@ export function readCheckpoint(directory, id) {
 }
 
 export function consumeCheckpoint(directory, checkpoint) {
-  return writeCheckpoint(directory, { ...checkpoint, status: 'consumed', consumedAt: new Date().toISOString() });
+  ensureDirectory(directory);
+  const target = checkpointPath(directory, checkpoint.id);
+  const claim = `${target}.claim`;
+  try {
+    writeFileSync(claim, `${process.pid}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    throw new Error(error?.code === 'EEXIST' ? 'checkpoint is already being consumed' : `checkpoint claim failed: ${error.message}`);
+  }
+  try {
+    return writeCheckpoint(directory, { ...checkpoint, status: 'consumed', consumedAt: new Date().toISOString() });
+  } finally {
+    try { unlinkSync(claim); } catch { /* preserve the consumed record if cleanup is interrupted */ }
+  }
 }
 
 export function countReadyCheckpoints(directory) {
