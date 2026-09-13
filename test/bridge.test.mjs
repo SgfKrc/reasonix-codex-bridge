@@ -157,7 +157,7 @@ function acpFixtureSpawn() {
   const handle = (message) => {
     received.push(message);
     if (message.method === 'initialize') {
-      respond(message, { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { load: {}, resume: {}, close: {}, delete: {} } } });
+      respond(message, { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {}, delete: {} } } });
     } else if (message.method === 'session/new') {
       respond(message, { sessionId: `fixture-session-${nextSession++}` });
     } else if (message.method === 'session/load' || message.method === 'session/resume') {

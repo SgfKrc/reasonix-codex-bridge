@@ -40,6 +40,7 @@ function terminateProcess(child) {
 }
 
 function capability(result, name) {
+  if (name === 'load' && result?.agentCapabilities?.loadSession === true) return {};
   return result?.agentCapabilities?.sessionCapabilities?.[name] ?? null;
 }
 
