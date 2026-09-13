@@ -1149,7 +1149,7 @@ describe('ACP client transport', () => {
   });
 });
 
-function coordinatorFixture({ failReplacementPrompt = false } = {}) {
+function coordinatorFixture({ failReplacementPrompt = false, failOldClose = false } = {}) {
   const events = [];
   let nextSession = 1;
   const client = {
@@ -1165,7 +1165,7 @@ function coordinatorFixture({ failReplacementPrompt = false } = {}) {
       if (failReplacementPrompt && sessionId !== 'coordinator-session-1') throw Object.assign(new Error('replacement failed'), { code: 'replacement_failed' });
       return { stopReason: 'end_turn', text: `reply:${text.slice(0, 24)}` };
     },
-    async closeSession(sessionId) { events.push(['close', sessionId]); return {}; },
+    async closeSession(sessionId) { events.push(['close', sessionId]); if (failOldClose && sessionId === 'coordinator-session-1') throw Object.assign(new Error('old close raced'), { code: 'close_race' }); return {}; },
     async deleteSession(sessionId) { events.push(['delete', sessionId]); return {}; },
     supportsSession(name) { return name === 'delete'; },
   };
@@ -1281,6 +1281,26 @@ describe('ACP session budget coordinator', () => {
     assert.ok(events.some((event) => event[0] === 'close' && event[1] === 'coordinator-session-2'));
     assert.equal(coordinator.decisions[0].action, 'per_call');
     assert.equal(coordinator.decisions[0].reason, 'compact_failed');
+  });
+
+  test('keeps a successful replacement active when old-session cleanup races', async () => {
+    const { client, events } = coordinatorFixture({ failOldClose: true });
+    const coordinator = new AcpSessionCoordinator({
+      client,
+      hardCapBytes: 400,
+      compactTriggerRatio: 0.25,
+      preserveRecent: 1,
+      summarize: () => 'small summary',
+      fallbackPrompt: async () => { throw new Error('fallback must not run'); },
+    });
+    await coordinator.start();
+    coordinator.history = [{ role: 'user', content: 'old question '.repeat(3) }, { role: 'assistant', content: 'old answer '.repeat(3) }, { role: 'user', content: 'recent' }];
+    const result = await coordinator.prompt('next request');
+    assert.equal(result.transport, 'acp');
+    assert.equal(result.sessionId, 'coordinator-session-2');
+    assert.equal(coordinator.sessionId, 'coordinator-session-2');
+    assert.equal(coordinator.decisions[0].action, 'compact');
+    assert.ok(events.some((event) => event[0] === 'delete' && event[1] === 'coordinator-session-1'));
   });
 });
 
