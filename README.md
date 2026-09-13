@@ -1,6 +1,6 @@
 # Reasonix ↔ Codex MCP Bridge
 
-Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_rollback`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
+Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_resume`, `reasonix_cancel`, `reasonix_rollback`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
 
 Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited release contents.
 
@@ -154,10 +154,15 @@ next worker, so failures are never retried implicitly. Checkpoints are one-shot;
 creates a new id. Set `BRIDGE_CHECKPOINT_DIR` (or `checkpointDir` in `bridge.config.json`) to choose
 the storage directory; paths inside the workspace disable checkpointing to avoid dirtying Git.
 
-`reasonix_status` also reports checkpoint persistence (`checkpoint.enabled` and ready count), the live `queueDepth` (accepted calls not yet completed), numeric
-`inFlight` count, and a redacted `lastRun` summary. A full queue error includes the current depth,
-configured capacity, and a retry-after hint. The summary never contains task text, worker output,
-model references, or absolute paths.
+`reasonix_status` also reports checkpoint persistence (`checkpoint.enabled` and ready count), the live
+`queueDepth` (accepted calls not yet completed), numeric `inFlight` count, parallel/exclusive slot
+counts, per-job state, and a redacted `lastRun` summary. Calls remain serialized by default. A caller
+must pass `parallel=true` to `reasonix_run` to use a concurrent read-only inspect/review/plan slot;
+implement, resume, and rollback jobs remain exclusive to protect the workspace and write policy.
+`reasonix_cancel` accepts a visible `job_id`, terminates its worker tree, and reports the reclaimed
+slot; cancellation never creates a checkpoint. A full queue error includes the current depth,
+configured capacity, and a retry-after hint. Job and summary records never contain task text, worker
+output, model references, or absolute paths.
 
 The status also exposes the selected provider/model capabilities reported by `reasonix doctor`:
 `contextWindow`, `vision`, and the provider's redacted `base_url_host`. Before spawning a worker,
@@ -215,9 +220,10 @@ the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit co
 stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
 paths are never written. With `BRIDGE_LOG` unset, the bridge performs no log writes.
 
-The bridge is deliberately stateless per call. It serializes calls, confines `cwd` to allowed roots,
-rejects `implement` unless the write policy is enabled, limits task/budget/output sizes, and
-terminates the process tree on timeout. This avoids accumulating one conversation beyond Reasonix's
-hard 128 MB history limit.
+The bridge is deliberately stateless per call. It confines `cwd` to allowed roots, rejects
+`implement` unless the write policy is enabled, limits task/budget/output sizes, terminates the
+process tree on timeout/cancel, and keeps write operations exclusive. Explicit read-only parallel
+jobs are independently spawned and reclaimed when they finish. This avoids accumulating one
+conversation beyond Reasonix's hard 128 MB history limit.
 
 Persistent ACP transport remains design-only; see `ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The offline prototype in `src/acp-prototype.mjs` triggers transactional compaction at 75% of the fixed 128 MiB Reasonix history cap, rotates when a compacted session still cannot fit, and falls back to per-call without mutating persistent history when compaction fails. `src/server.mjs` remains stateless and does not import the prototype.

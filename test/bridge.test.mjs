@@ -617,7 +617,7 @@ describe('offline command contracts', () => {
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
     assert.equal(responses[0].result.serverInfo.name, 'reasonix-local-bridge');
-    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_resume', 'reasonix_rollback', 'reasonix_status']);
+    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_resume', 'reasonix_cancel', 'reasonix_rollback', 'reasonix_status']);
     const status = JSON.parse(responses[2].result.content[0].text);
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
@@ -1464,6 +1464,113 @@ setTimeout(() => process.stdout.write('slow-result'), 500);
   child.stdin.end();
   const exit = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(exit, 0);
+});
+
+test('explicit parallel read jobs overlap and status reclaims their worker slots', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const markerDir = path.join(root, 'parallel-markers');
+  mkdirSync(markerDir, { recursive: true });
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+const path = require('node:path');
+const task = process.argv.at(-1);
+const safe = task.replace(/[^a-z0-9-]/gi, '_');
+fs.writeFileSync(path.join(process.env.PARALLEL_DIR, safe + '.started'), 'started');
+setTimeout(() => {
+  fs.writeFileSync(path.join(process.env.PARALLEL_DIR, safe + '.done'), 'done');
+  process.stdout.write(task);
+}, 350);
+`, 'utf8');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { PARALLEL_DIR: markerDir }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const client = mcpClient(child);
+  try {
+    const first = client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'parallel-one', cwd: '.', parallel: true, timeout_seconds: 5 } });
+    const second = client.request(2, 'tools/call', { name: 'reasonix_run', arguments: { task: 'parallel-two', cwd: '.', parallel: true, timeout_seconds: 5 } });
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 3000;
+      const poll = () => {
+        if (existsSync(path.join(markerDir, 'parallel-one.started')) && existsSync(path.join(markerDir, 'parallel-two.started'))) resolve();
+        else if (Date.now() >= deadline) reject(new Error('parallel workers did not overlap'));
+        else setTimeout(poll, 10);
+      };
+      poll();
+    });
+    const during = await client.request(3, 'tools/call', { name: 'reasonix_status', arguments: {} });
+    const duringStatus = JSON.parse(during.result.content[0].text);
+    assert.equal(duringStatus.parallelActive, 2);
+    assert.equal(duringStatus.exclusiveActive, 0);
+    assert.equal(duringStatus.inFlight, 2);
+    assert.equal(duringStatus.jobs.filter((job) => job.state === 'running' && job.parallel).length, 2);
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+    assert.equal(firstResponse.result.isError, false);
+    assert.equal(secondResponse.result.isError, false);
+    assert.match(firstResponse.result.content[0].text, /parallel-one/);
+    assert.match(secondResponse.result.content[0].text, /parallel-two/);
+    const after = await client.request(4, 'tools/call', { name: 'reasonix_status', arguments: {} });
+    const afterStatus = JSON.parse(after.result.content[0].text);
+    assert.equal(afterStatus.parallelActive, 0);
+    assert.equal(afterStatus.inFlight, 0);
+    assert.equal(afterStatus.jobs.filter((job) => job.state === 'completed').length, 2);
+    assert.equal(afterStatus.jobs.filter((job) => job.reclaimedAt).length, 2);
+  } finally {
+    child.stdin.end();
+    await new Promise((resolve) => child.once('close', resolve));
+  }
+});
+
+test('cancelling a parallel worker terminates it and reclaims the slot without a checkpoint', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const startedPath = path.join(root, 'parallel-cancel-started');
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.STARTED, 'started');
+setTimeout(() => process.stdout.write('should-not-finish'), 5000);
+`, 'utf8');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { STARTED: startedPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const client = mcpClient(child);
+  try {
+    const run = client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'cancel-me', cwd: '.', parallel: true, timeout_seconds: 5 } });
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 3000;
+      const poll = () => {
+        if (existsSync(startedPath)) resolve();
+        else if (Date.now() >= deadline) reject(new Error('worker did not start'));
+        else setTimeout(poll, 10);
+      };
+      poll();
+    });
+    const during = await client.request(2, 'tools/call', { name: 'reasonix_status', arguments: {} });
+    const job = JSON.parse(during.result.content[0].text).jobs.find((entry) => entry.state === 'running');
+    assert.ok(job?.jobId);
+    const cancelled = await client.request(3, 'tools/call', { name: 'reasonix_cancel', arguments: { job_id: job.jobId } });
+    assert.equal(cancelled.result.isError, false);
+    assert.match(cancelled.result.content[0].text, /cancellation requested/);
+    const result = await run;
+    assert.equal(result.result.isError, true);
+    assert.match(result.result.content[0].text, /worker cancelled/);
+    const after = await client.request(4, 'tools/call', { name: 'reasonix_status', arguments: {} });
+    const status = JSON.parse(after.result.content[0].text);
+    const finished = status.jobs.find((entry) => entry.jobId === job.jobId);
+    assert.equal(finished.state, 'cancelled');
+    assert.equal(status.parallelActive, 0);
+    assert.equal(status.inFlight, 0);
+    assert.equal(status.checkpoint.readyCount, 0);
+  } finally {
+    child.stdin.end();
+    await new Promise((resolve) => child.once('close', resolve));
+  }
 });
 
 test('plan mode passes a machine-readable change list without enabling writes', async () => {
