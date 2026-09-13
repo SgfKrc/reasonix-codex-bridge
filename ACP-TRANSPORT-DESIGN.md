@@ -75,6 +75,22 @@ This is an adapter-level implementation, not a claim that ACP history replacemen
 Reasonix operation. The coordinator remains opt-in and must be wired by the later ACP-03/04/05
 tickets after lifecycle, write-policy, and transport-switching tests are complete.
 
+## ACP-03 session registry and lifecycle
+
+`src/acp-registry.mjs` provides the next opt-in layer: a durable metadata registry keyed by
+`sessionId`, with `cwd`, profile, model, state, and timestamps. The registry file never stores task
+or response bodies. `prompt` calls are chained per session, so concurrent callers cannot interleave
+requests or cross session state. `close` and `delete` are serialized behind pending prompts; delete
+sends ACP `session/delete` before closing the client process and removes the metadata only after
+success.
+
+On a new bridge process, persisted entries are loaded as `orphaned` until a caller supplies a
+client factory and successfully completes capability-gated `session/resume` (or `session/load` as a
+fallback). A crashed transport is detected before prompt dispatch and cannot be used until resumed.
+`shutdown` closes every live entry and reports failures, while `installProcessHandlers` exposes the
+embedding layer's signal/exit cleanup hook. The registry is not imported by `server.mjs`; process
+ownership, write-policy rechecks, and transport switching remain ACP-04/05 work.
+
 ## Failure and observability contract
 
 The adapter may record only enum outcomes (`append`, `compact`, `rotate`, `per_call`), bounded

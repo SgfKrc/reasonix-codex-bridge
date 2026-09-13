@@ -36,6 +36,7 @@ import {
 } from '../src/acp-prototype.mjs';
 import { AcpClient, collectAcpText } from '../src/acp-client.mjs';
 import { AcpSessionCoordinator, summarizeAcpMessages } from '../src/acp-session.mjs';
+import { ACP_REGISTRY_SCHEMA, AcpSessionRegistry } from '../src/acp-registry.mjs';
 
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
@@ -43,21 +44,34 @@ const CONFIGURE_PATH = path.join(BRIDGE_ROOT, 'src', 'configure.mjs');
 const CHECK_LINKS_PATH = path.join(BRIDGE_ROOT, 'scripts', 'check-readme-links.mjs');
 const PACKAGE_PATH = path.join(BRIDGE_ROOT, 'package.json');
 const CHANGELOG_PATH = path.join(BRIDGE_ROOT, 'CHANGELOG.md');
+const PROJECT_TEST_ROOT = path.resolve(BRIDGE_ROOT, '..', '..', 'build', 'bridge-test');
 const tempRoots = new Set();
+const tempArtifacts = new Set();
+
+function testArtifactRoot() {
+  try {
+    mkdirSync(PROJECT_TEST_ROOT, { recursive: true });
+    return PROJECT_TEST_ROOT;
+  } catch {
+    return tmpdir();
+  }
+}
 
 function tempRoot() {
-  const root = mkdtempSync(path.join(tmpdir(), 'reasonix-codex-bridge-'));
+  const root = mkdtempSync(path.join(testArtifactRoot(), 'case-'));
   tempRoots.add(root);
   return root;
 }
 
 function envFor(root, overrides = {}) {
+  const checkpointPath = path.join(testArtifactRoot(), 'checkpoints', path.basename(root));
+  tempArtifacts.add(checkpointPath);
   return {
     ...process.env,
     BRIDGE_CONFIG: path.join(root, 'bridge.config.json'),
     BRIDGE_PRESETS: path.join(root, 'presets.json'),
     CODEX_CONFIG: path.join(root, 'codex.config.toml'),
-    BRIDGE_CHECKPOINT_DIR: path.join(tmpdir(), 'reasonix-codex-bridge-checkpoints', path.basename(root)),
+    BRIDGE_CHECKPOINT_DIR: checkpointPath,
     REASONIX_EXE: process.execPath,
     REASONIX_ROOT: root,
     REASONIX_MODEL_REF: 'fixture/provider',
@@ -268,6 +282,7 @@ function mcpClient(child) {
 
 after(() => {
   for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
+  for (const artifact of tempArtifacts) rmSync(artifact, { recursive: true, force: true });
 });
 
 describe('configuration pure functions', () => {
@@ -947,8 +962,11 @@ fs.writeFileSync(process.env.WRITE_TARGET, 'after');
     const root = tempRoot();
     writeCliFiles(root);
     writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['first.txt', 'second.txt'] }), 'utf8');
-    const callCount = path.join(tmpdir(), `reasonix-call-count-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
-    const secondStarted = path.join(tmpdir(), `reasonix-second-started-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    const artifactRoot = testArtifactRoot();
+    const callCount = path.join(artifactRoot, `call-count-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    const secondStarted = path.join(artifactRoot, `second-started-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    tempArtifacts.add(callCount);
+    tempArtifacts.add(secondStarted);
     writeFileSync(path.join(root, 'subagent'), `
 const fs = require('node:fs');
 const path = require('node:path');
@@ -1304,6 +1322,135 @@ describe('ACP session budget coordinator', () => {
   });
 });
 
+function registryClient({ sessionId = 'registry-session-1', canResume = true, canLoad = true, delayMs = 0, failClose = false } = {}) {
+  const events = [];
+  const client = {
+    started: false,
+    closed: false,
+    async start() { this.started = true; this.closed = false; events.push(['start']); },
+    async newSession() { events.push(['new', sessionId]); return { sessionId }; },
+    supportsSession(name) { return name === 'resume' ? canResume : name === 'load' ? canLoad : name === 'delete'; },
+    async resumeSession(id) { events.push(['resume', id]); return { sessionId: id }; },
+    async loadSession(id) { events.push(['load', id]); return { sessionId: id }; },
+    async prompt(id, text) {
+      events.push(['prompt-start', id, text]);
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      events.push(['prompt-end', id, text]);
+      return { text: `reply:${text}` };
+    },
+    async closeSession(id) { events.push(['close-session', id]); if (failClose) throw Object.assign(new Error('close failed'), { code: 'close_failed' }); return {}; },
+    async deleteSession(id) { events.push(['delete-session', id]); return {}; },
+    async close() { this.closed = true; this.started = false; events.push(['close-client']); },
+  };
+  return { client, events };
+}
+
+describe('ACP session registry', () => {
+  test('uses the project build test root and persists metadata without task bodies', async () => {
+    const root = tempRoot();
+    assert.equal(path.dirname(root), PROJECT_TEST_ROOT);
+    const statePath = path.join(root, 'registry.json');
+    const { client } = registryClient();
+    const registry = new AcpSessionRegistry({ statePath, now: (() => { let tick = 100; return () => tick += 10; })() });
+    const entry = await registry.create({ client, cwd: root, profile: 'deepseek-worker', model: 'fixture/provider' });
+    assert.equal(entry.sessionId, 'registry-session-1');
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    assert.equal(saved.schema, ACP_REGISTRY_SCHEMA);
+    assert.equal(saved.sessions[0].cwd, root);
+    assert.equal(Object.hasOwn(saved.sessions[0], 'task'), false);
+    assert.equal(Object.hasOwn(saved.sessions[0], 'history'), false);
+  });
+
+  test('serializes concurrent prompts per session and updates last-used metadata', async () => {
+    const root = tempRoot();
+    const { client, events } = registryClient({ delayMs: 10 });
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json') });
+    await registry.create({ client, cwd: root, profile: 'read', model: 'fixture/provider' });
+    const results = await Promise.all([registry.prompt('registry-session-1', 'one'), registry.prompt('registry-session-1', 'two')]);
+    assert.deepEqual(results.map((result) => result.text), ['reply:one', 'reply:two']);
+    assert.deepEqual(events.filter((event) => event[0].startsWith('prompt')).map((event) => event[0] + ':' + event[2]), [
+      'prompt-start:one', 'prompt-end:one', 'prompt-start:two', 'prompt-end:two',
+    ]);
+    assert.ok(registry.list()[0].lastUsedAt > registry.list()[0].createdAt);
+  });
+
+  test('loads persisted sessions as orphaned and resumes with resume, then load fallback', async () => {
+    const root = tempRoot();
+    const statePath = path.join(root, 'registry.json');
+    const first = new AcpSessionRegistry({ statePath });
+    const original = registryClient({ sessionId: 'persisted-session' });
+    await first.create({ client: original.client, cwd: root, profile: 'read', model: 'fixture/provider' });
+    const restarted = new AcpSessionRegistry({ statePath });
+    assert.equal(restarted.list()[0].state, 'orphaned');
+    const resumed = registryClient({ sessionId: 'persisted-session', canResume: true, canLoad: false });
+    await restarted.resume('persisted-session', { clientFactory: async () => resumed.client });
+    assert.ok(resumed.events.some((event) => event[0] === 'resume'));
+    assert.equal(restarted.list()[0].state, 'active');
+    resumed.client.started = false;
+    resumed.client.closed = true;
+    const loaded = registryClient({ sessionId: 'persisted-session', canResume: false, canLoad: true });
+    await restarted.resume('persisted-session', { clientFactory: async () => loaded.client });
+    assert.ok(loaded.events.some((event) => event[0] === 'load'));
+  });
+
+  test('delete sends ACP delete before closing the client and removes persisted metadata', async () => {
+    const root = tempRoot();
+    const { client, events } = registryClient();
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json') });
+    await registry.create({ client, cwd: root, profile: 'read', model: 'fixture/provider' });
+    const result = await registry.delete('registry-session-1');
+    assert.deepEqual(result, { sessionId: 'registry-session-1', state: 'deleted' });
+    assert.deepEqual(events.slice(-3).map((event) => event[0]), ['close-session', 'delete-session', 'close-client']);
+    assert.deepEqual(registry.list(), []);
+    assert.deepEqual(JSON.parse(readFileSync(path.join(root, 'registry.json'), 'utf8')).sessions, []);
+  });
+
+  test('deletes a persisted orphan only after recreating its ACP client', async () => {
+    const root = tempRoot();
+    const statePath = path.join(root, 'registry.json');
+    const first = registryClient({ sessionId: 'orphan-session' });
+    const initial = new AcpSessionRegistry({ statePath });
+    await initial.create({ client: first.client, cwd: root, profile: 'read', model: 'fixture/provider' });
+    const restarted = new AcpSessionRegistry({ statePath });
+    const replacement = registryClient({ sessionId: 'orphan-session' });
+    await restarted.delete('orphan-session', { clientFactory: async () => replacement.client });
+    assert.ok(replacement.events.some((event) => event[0] === 'resume'));
+    assert.deepEqual(restarted.list(), []);
+  });
+
+  test('does not allow a prompt queued behind delete to run', async () => {
+    const root = tempRoot();
+    const { client, events } = registryClient({ delayMs: 10 });
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json') });
+    await registry.create({ client, cwd: root, profile: 'read', model: 'fixture/provider' });
+    const firstPrompt = registry.prompt('registry-session-1', 'first');
+    const deletion = registry.delete('registry-session-1');
+    const queuedPrompt = registry.prompt('registry-session-1', 'after-delete');
+    await firstPrompt;
+    await deletion;
+    await assert.rejects(() => queuedPrompt, (error) => error.code === 'session_not_active');
+    const promptEnd = events.findIndex((event) => event[0] === 'prompt-end');
+    const close = events.findIndex((event) => event[0] === 'close-session');
+    assert.ok(promptEnd >= 0 && close > promptEnd);
+  });
+
+  test('marks crashed transports orphaned and shutdown closes every live session', async () => {
+    const root = tempRoot();
+    const first = registryClient({ sessionId: 'crashed-session' });
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json') });
+    await registry.create({ client: first.client, cwd: root, profile: 'read', model: 'fixture/provider' });
+    first.client.started = false;
+    first.client.closed = true;
+    assert.equal(registry.list({ includeClosed: false })[0].state, 'orphaned');
+    await assert.rejects(() => registry.prompt('crashed-session', 'cannot run'), (error) => error.code === 'session_orphaned');
+    const second = registryClient({ sessionId: 'live-session' });
+    await registry.register({ client: second.client, sessionId: 'live-session', cwd: root, profile: 'read', model: 'fixture/provider' });
+    const result = await registry.shutdown();
+    assert.deepEqual(result.closed.sort(), ['crashed-session', 'live-session']);
+    assert.equal(registry.list().every((entry) => entry.state === 'closed'), true);
+  });
+});
+
 describe('ACP transport design prototype', () => {
   test('compacts before the hard cap and preserves system plus recent messages', () => {
     assert.equal(ACP_HISTORY_HARD_CAP_BYTES, 128 * 1024 * 1024);
@@ -1478,7 +1625,8 @@ process.exit(1);
 test('failed runs create durable one-shot checkpoints that resume across bridge processes', async () => {
   const root = tempRoot();
   writeCliFiles(root);
-  const checkpointDir = path.join(tmpdir(), 'reasonix-codex-bridge-checkpoints', path.basename(root));
+    const checkpointDir = path.join(testArtifactRoot(), 'checkpoints', path.basename(root));
+    tempArtifacts.add(checkpointDir);
   const callsPath = path.join(checkpointDir, 'calls');
   writeFileSync(path.join(root, 'subagent'), `
 const fs = require('node:fs');
@@ -1524,7 +1672,8 @@ process.stdout.write('resumed-ok');
 test('checkpoint resume refuses workspace drift before spawning a worker', async () => {
   const root = tempRoot();
   writeCliFiles(root);
-  const checkpointDir = path.join(tmpdir(), 'reasonix-codex-bridge-checkpoints', path.basename(root));
+    const checkpointDir = path.join(testArtifactRoot(), 'checkpoints', path.basename(root));
+    tempArtifacts.add(checkpointDir);
   const callsPath = path.join(checkpointDir, 'calls');
   writeFileSync(path.join(root, 'subagent'), `
 const fs = require('node:fs');
