@@ -2,7 +2,7 @@
 
 > **Language**: [English](README.en.md) · [简体中文](README.md)
 
-面向 Codex 的零依赖 stdio MCP 服务，暴露 `reasonix_run`、显式 `reasonix_resume`、`reasonix_cancel`、`reasonix_rollback` 与 `reasonix_status` 五个 MCP 工具。worker 默认保持只读；受控写入需要显式策略。
+面向 Codex 的零依赖 stdio MCP 服务，暴露 `reasonix_run`、显式 `reasonix_resume`、`reasonix_cancel`、`reasonix_rollback`、`reasonix_exec` 与 `reasonix_status` 六个 MCP 工具。worker 默认保持只读；受控写入需要显式策略。
 
 当前版本：`v0.1.0`，经审计的发布内容见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -141,6 +141,27 @@ worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必�
 ```
 
 调用方还必须显式传 `mode=implement`；inspect/review/plan 被强制为读角色调用，选中写 profile 会被拒绝。反过来，implement 要求显式写角色 profile。`allowedPaths` 条目是仓库相对路径的**精确文件或目录前缀**，绝不接受绝对路径或 `..` 逃逸。写入调用前，桥接器要求可验证的 Git 工作区且没有既存改动；`requireCleanTree=false` 会被判定为不安全策略而拒绝——clean-tree 门不可关闭。worker 退出后，桥接器把 Git 状态与调用前快照比对：白名单之外的任何路径、或任何失败的 worker，都会把该次调用的改动全部回滚。成功的写入只返回 `qlh.reasonix.changes.v1` 变更集，包含仓库相对路径、增删计数、`git diff --stat`、SHA-256 哈希、`hash_status`（`readable` / `missing` / `unreadable`）与一次性 `rollback_id`；**worker stdout 与文件内容永不返回**。用该 id 显式调用 `reasonix_rollback` 还原这次改动。回滚与 implement 调用同样被串行化，还原后会复核 Git/哈希状态，并拒绝目标已变化、缺失或不可读的情况。回滚记录只存在于当前桥接进程内。专用写 profile 与默认读 profile 相互独立：**创建 profile** 与 **桥接写授权** 是两个各自独立的门。
+
+### 受控命令执行（`reasonix_exec`）
+
+`reasonix_exec` 是第一阶段的写后验证通道，默认关闭。启用时必须在 `bridge.config.json` 中声明命名命令、参数前缀、工作区相对路径、超时和输出上限：
+
+```json
+{
+  "execPolicy": {
+    "enabled": true,
+    "allowedPaths": ["tools/reasonix-codex-bridge"],
+    "commands": [
+      { "name": "bridge-test", "executable": "node", "argsPrefix": ["--test"], "maxArgs": 8 }
+    ],
+    "requireCleanTree": true,
+    "timeoutSeconds": 300,
+    "outputCharCap": 12000
+  }
+}
+```
+
+调用方只能提交已声明的 `command` 名称和 `args` 数组，不能提交可执行文件、shell 字符串、环境变量或网络目标。桥接器以 `shell:false` 启动进程，要求 Git 工作区可验证且干净，执行后报告退出码、截断标记和变更路径；发现工作区变化时结果为 `workspace_modified`，不会自动替用户回滚。命令配置和输出均不包含在 worker 会话中，适合主 agent 在写入后显式运行测试/构建并复核结果。状态中的 `execPolicy` 只展示命令名、参数前缀和有界限制，不泄露可执行路径。
 
 当 `REASONIX_EXE` 指向 Windows 的 `.cmd` 或 `.bat` shim 时，桥接器以 `shell:false` 显式调用 `cmd.exe`。含 cmd 元字符的参数在创建进程前即被拒绝，从而在保持 shim 正常启动的同时，把任务文本挡在 shell 解释之外。
 

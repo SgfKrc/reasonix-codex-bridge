@@ -18,6 +18,8 @@ export const DEFAULT_MIN_REASONIX_VERSION = '1.38.6';
 export const READ_ONLY_PROFILE_TOOLS = Object.freeze(['read_file', 'grep', 'glob', 'ls', 'code_index', 'git_log', 'git_diff']);
 export const WRITE_PROFILE_TOOLS = Object.freeze([...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
 export const DEFAULT_WRITE_SUBAGENT_SUFFIX = '-write';
+export const EXEC_HARD_TIMEOUT_SECONDS_CAP = 1800;
+export const EXEC_HARD_OUTPUT_CHAR_CAP = 24000;
 export const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
 
@@ -465,6 +467,102 @@ export function resolveWritePolicy(bridgeConfig) {
     requireCleanTree,
     errors: Object.freeze(errors),
     enabled: allowWrite && errors.length === 0 && allowedPaths.length > 0,
+  });
+}
+
+const EXEC_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const EXEC_META = /[\0\r\n]/u;
+
+function resolveExecInteger(raw, fallback, cap, label, errors) {
+  if (raw === undefined) return fallback;
+  const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw.trim()) : NaN;
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    errors.push(`${label} must be a positive integer`);
+    return fallback;
+  }
+  if (parsed > cap) return cap;
+  return parsed;
+}
+
+function normalizeExecAllowedPath(value) {
+  if (typeof value !== 'string' || !value.trim()) return { path: '', error: 'execPolicy.allowedPaths entries must be non-empty strings' };
+  const original = value.trim().replaceAll('\\', '/');
+  if (original.startsWith('/') || /^[A-Za-z]:\//u.test(original)) return { path: '', error: `exec allowed path must be relative: ${value}` };
+  const normalized = path.posix.normalize(original);
+  if (normalized === '..' || normalized.startsWith('../')) return { path: '', error: `exec allowed path escapes the workspace: ${value}` };
+  return { path: normalized === '.' ? '' : normalized.replace(/\/$/u, ''), error: '' };
+}
+
+/** Resolve the opt-in command runner policy. Commands are named profiles, never caller-provided executables. */
+export function resolveExecPolicy(bridgeConfig) {
+  const raw = bridgeConfig?.data?.execPolicy;
+  const defaults = {
+    configured: raw !== undefined,
+    enabled: false,
+    allowedPaths: Object.freeze([]),
+    commands: Object.freeze([]),
+    requireCleanTree: true,
+    timeoutSeconds: 300,
+    outputCharCap: EXEC_HARD_OUTPUT_CHAR_CAP,
+    errors: Object.freeze([]),
+  };
+  if (raw === undefined) return Object.freeze(defaults);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return Object.freeze({ ...defaults, errors: Object.freeze(['execPolicy must be an object']) });
+  }
+  const errors = [];
+  const enabled = raw.enabled === true;
+  if (Object.hasOwn(raw, 'enabled') && typeof raw.enabled !== 'boolean') errors.push('execPolicy.enabled must be boolean');
+  const requireCleanTree = Object.hasOwn(raw, 'requireCleanTree') ? raw.requireCleanTree === true : true;
+  if (Object.hasOwn(raw, 'requireCleanTree') && typeof raw.requireCleanTree !== 'boolean') errors.push('execPolicy.requireCleanTree must be boolean');
+  if (raw.requireCleanTree === false) errors.push('execPolicy.requireCleanTree=false is unsupported; use an isolated clean worktree');
+
+  const allowedPaths = [];
+  if (!Array.isArray(raw.allowedPaths)) errors.push('execPolicy.allowedPaths must be an array');
+  else {
+    for (const value of raw.allowedPaths) {
+      const normalized = normalizeExecAllowedPath(value);
+      if (normalized.error) errors.push(normalized.error);
+      else if (!allowedPaths.includes(normalized.path)) allowedPaths.push(normalized.path);
+    }
+  }
+  if (!allowedPaths.length) errors.push('execPolicy.allowedPaths must contain at least one repository-relative path');
+
+  const commands = [];
+  if (!Array.isArray(raw.commands)) errors.push('execPolicy.commands must be an array');
+  else {
+    for (const item of raw.commands) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push('execPolicy.commands entries must be objects');
+        continue;
+      }
+      const name = typeof item.name === 'string' ? item.name.trim() : '';
+      const executable = typeof item.executable === 'string' ? item.executable.trim() : '';
+      if (!EXEC_NAME.test(name)) errors.push(`exec command name is invalid: ${name || '(empty)'}`);
+      if (!executable || executable.length > 512 || EXEC_META.test(executable)) errors.push(`exec command executable is invalid: ${name || '(unnamed)'}`);
+      if (commands.some((entry) => entry.name === name)) errors.push(`exec command name is duplicated: ${name}`);
+      const argsPrefix = item.argsPrefix === undefined ? [] : item.argsPrefix;
+      if (!Array.isArray(argsPrefix) || argsPrefix.some((arg) => typeof arg !== 'string' || arg.length > 4096 || EXEC_META.test(arg))) {
+        errors.push(`exec command argsPrefix is invalid: ${name || '(unnamed)'}`);
+      }
+      const maxArgs = resolveExecInteger(item.maxArgs, 32, 128, `exec command ${name || '(unnamed)'}.maxArgs`, errors);
+      if (EXEC_NAME.test(name) && executable && executable.length <= 512 && !EXEC_META.test(executable)
+        && Array.isArray(argsPrefix) && argsPrefix.every((arg) => typeof arg === 'string' && arg.length <= 4096 && !EXEC_META.test(arg))) {
+        commands.push(Object.freeze({ name, executable, argsPrefix: Object.freeze([...argsPrefix]), maxArgs }));
+      }
+    }
+  }
+  const timeoutSeconds = resolveExecInteger(raw.timeoutSeconds, 300, EXEC_HARD_TIMEOUT_SECONDS_CAP, 'execPolicy.timeoutSeconds', errors);
+  const outputCharCap = resolveExecInteger(raw.outputCharCap, EXEC_HARD_OUTPUT_CHAR_CAP, EXEC_HARD_OUTPUT_CHAR_CAP, 'execPolicy.outputCharCap', errors);
+  return Object.freeze({
+    configured: true,
+    enabled,
+    allowedPaths: Object.freeze(allowedPaths),
+    commands: Object.freeze(commands),
+    requireCleanTree,
+    timeoutSeconds,
+    outputCharCap,
+    errors: Object.freeze(errors),
   });
 }
 
