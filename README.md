@@ -1,68 +1,60 @@
-# Reasonix ↔ Codex MCP Bridge
+# Reasonix ↔ Codex MCP 桥
 
-Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_resume`, `reasonix_cancel`, `reasonix_rollback`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
+> **Language**: [English](README.en.md) · [简体中文](README.md)
 
-Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited release contents.
+面向 Codex 的零依赖 stdio MCP 服务，暴露 `reasonix_run`、显式 `reasonix_resume`、`reasonix_cancel`、`reasonix_rollback` 与 `reasonix_status` 五个 MCP 工具。worker 默认保持只读；受控写入需要显式策略。
 
-## Supported runtime
+当前版本：`v0.1.0`，经审计的发布内容见 [CHANGELOG.md](CHANGELOG.md)。
 
-- Node.js 20 or newer.
-- Reasonix 1.38.6 or newer, using the post-rewrite `reasonix subagent run` interface.
-- Lower Reasonix versions are intentionally unsupported. The bridge requires `1.38.6` or newer by default; `configure verify` reports a failure and the MCP server refuses to start when the installed CLI is older.
-- The CLI path is resolved at startup and never hard-coded: `REASONIX_EXE` wins when set, otherwise the bridge probes `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`, the newest `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`, `/usr/local/bin|/usr/bin/reasonix-cli`, then `reasonix-cli(.exe)` on `PATH`. If nothing is found (or `REASONIX_EXE` points to a missing file) the server logs the reason and exits with code 2.
+## 运行环境要求
 
-## Pick the subagent model
+- Node.js 20 或更高。
+- Reasonix 1.38.6 或更高（使用重写后的 `reasonix subagent run` 接口）。
+- 更低版本有意不支持：默认要求 `1.38.6+`；当安装的 CLI 更旧时，`configure verify` 报失败、MCP server 拒绝启动。
+- CLI 路径在启动时解析、从不硬编码：设置了 `REASONIX_EXE` 就用它，否则依次探测 `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`、最新的 `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`、`/usr/local/bin|/usr/bin/reasonix-cli`，最后是 `PATH` 上的 `reasonix-cli(.exe)`。全部落空（或 `REASONIX_EXE` 指向不存在的文件）时记录原因并以退出码 2 结束。
 
-Every machine may use a different provider, so no model reference is hard-coded. `node src/configure.mjs` reads this machine's redacted inventory from `reasonix doctor --json`:
+## 选择子智能体模型
 
-```bash
-node src/configure.mjs list      # every <provider>/<model> ref this machine reports (key present, Reasonix default, current)
-node src/configure.mjs list --refresh # bypass the doctor inventory cache and query the CLI
-node src/configure.mjs use <ref> # write it to bridge.config.json (a preset name works too)
-node src/configure.mjs show      # effective configuration and where each value comes from
-node src/configure.mjs export    # print a redacted, path-free environment summary as JSON
-node src/configure.mjs import summary.json # compare a summary; use '-' to read stdin, never writes config
-node src/configure.mjs profile   # inspect the selected read profile and report drift
-node src/configure.mjs profile --sync        # print the exact read-profile edit command (no write)
-node src/configure.mjs profile --sync --write # execute edit, enforce read-only, then re-check
-node src/configure.mjs profile --role write --create --write # create the separate write profile
-node src/configure.mjs verify    # check CLI + model ref + read profile
-node src/configure.mjs verify --role write # check the explicit write profile
-```
-
-`presets.example.json` ships three editable examples (OpenCode Go, Shizi gateway, DeepSeek official) and `node src/configure.mjs presets` lists them once you copy it to `presets.json`. Provider ids are account-specific — always take the refs from `configure list` on the machine you are setting up instead of copying someone else's value.
-
-Doctor inventory responses are cached beside `bridge.config.json` as
-`bridge.config.json.doctor-cache.json`. The cache stores only the redacted provider/model summary,
-CLI path, CLI mtime, version, and fetch timestamp. It is valid for 10 minutes; a changed CLI file,
-expired or malformed cache, or `--refresh` causes a live query. A failed live query is returned as an
-error and never replaced with stale inventory.
-
-`configure export` reports only platform, Node major, Reasonix version status, provider/model names,
-the current model ref, and profile name/model/read-only/tools metadata. It omits CLI/config/profile
-paths, keys, and endpoints. `configure import <file|->` validates that schema and prints only
-field-level differences; it never changes `bridge.config.json`, Codex config, or profiles.
-
-Resolution order for the model reference (first hit wins):
-
-1. `REASONIX_MODEL_REF` from the environment (for example the Codex MCP block)
-2. `modelRef` in `bridge.config.json`
-3. `config.default_model` reported by `reasonix doctor --json` (auto fallback; `reasonix_status` shows it as the source)
-4. nothing available → the bridge refuses to start with exit code 2 and points at `configure use`.
-
-## Configure Codex
-
-Generate the block instead of typing paths by hand:
+每台机器可能使用不同的 provider，因此不硬编码任何模型引用。`node src/configure.mjs` 从 `reasonix doctor --json` 读取本机脱敏清单：
 
 ```bash
-node src/configure.mjs codex          # print the TOML block
-node src/configure.mjs codex --write  # upsert it into the Codex config (timestamped backup first)
+node src/configure.mjs list      # 本机报告的每个 <provider>/<model>（是否已配 key、是否 Reasonix 默认、是否当前）
+node src/configure.mjs list --refresh # 绕过 doctor 清单缓存，直接查询 CLI
+node src/configure.mjs use <ref> # 写入 bridge.config.json（也可以填预设名）
+node src/configure.mjs show      # 生效配置，以及每个值的来源
+node src/configure.mjs export    # 打印脱敏、无路径的环境摘要（JSON）
+node src/configure.mjs import summary.json # 对照摘要文件；用 '-' 读 stdin，永不写配置
+node src/configure.mjs profile   # 检查所选读角色 profile 并报告漂移
+node src/configure.mjs profile --sync        # 打印读 profile 的精确编辑命令（不写入）
+node src/configure.mjs profile --sync --write # 执行编辑、强制 read-only，然后复检
+node src/configure.mjs profile --role write --create --write # 创建独立的写 profile
+node src/configure.mjs verify    # 校验 CLI + 模型 ref + 读 profile
+node src/configure.mjs verify --role write # 校验显式写 profile
 ```
 
-`codex --write` validates the required bridge and environment keys before writing, merges duplicate
-`mcp_servers.reasonix_local*` sections, preserves unrelated TOML sections and the existing LF/CRLF
-style, and replaces the file through a same-directory temporary. The timestamped backup remains the
-rollback point if the destination cannot be replaced.
+`presets.example.json` 附带三个可编辑示例（OpenCode Go、Shizi 网关、DeepSeek 官方）；把它复制成 `presets.json` 后，`node src/configure.mjs presets` 会列出它们。provider id 与账号绑定——请一律用目标机器上 `configure list` 给出的 ref，不要照抄别人的值。
+
+doctor 清单响应会缓存到 `bridge.config.json` 旁的 `bridge.config.json.doctor-cache.json`。缓存只保存脱敏的 provider/model 摘要、CLI 路径、CLI mtime、版本与抓取时间；有效期 10 分钟。CLI 文件变更、缓存过期或损坏、或显式 `--refresh` 都会触发实时查询；实时查询失败时直接报错，绝不回退到过期清单。
+
+`configure export` 只报告平台、Node 主版本、Reasonix 版本状态、provider/model 名称、当前模型 ref，以及 profile 的名称/模型/read-only/工具元数据；它省略 CLI/配置/profile 路径、密钥与端点。`configure import <file|->` 校验该 schema 并只打印字段级差异，永不改动 `bridge.config.json`、Codex 配置或 profile。
+
+模型引用的解析顺序（首个命中生效）：
+
+1. 环境变量 `REASONIX_MODEL_REF`（例如 Codex MCP 块里设置的值）
+2. `bridge.config.json` 里的 `modelRef`
+3. `reasonix doctor --json` 报告的 `config.default_model`（自动回退；`reasonix_status` 会标注该来源）
+4. 都没有 → 桥接器拒绝启动，退出码 2，并提示运行 `configure use`。
+
+## 配置 Codex
+
+不必手写路径，直接生成配置块：
+
+```bash
+node src/configure.mjs codex          # 打印 TOML 块
+node src/configure.mjs codex --write  # 合并进 Codex 配置（先做时间戳备份）
+```
+
+`codex --write` 在写入前校验必需的 bridge 与环境键，合并重复的 `mcp_servers.reasonix_local*` 段，保留无关 TOML 段与既有 LF/CRLF 风格，并通过同目录临时文件原子替换目标文件；目标无法替换时，时间戳备份就是回滚点。
 
 ```toml
 [mcp_servers.reasonix_local]
@@ -71,120 +63,73 @@ args = ["C:/path/to/reasonix-codex-bridge/src/server.mjs"]
 startup_timeout_sec = 30
 
 [mcp_servers.reasonix_local.env]
-REASONIX_EXE = "C:/path/to/reasonix-cli.exe"   # optional; omit to use the probe order
+REASONIX_EXE = "C:/path/to/reasonix-cli.exe"   # 可选；省略即使用探测顺序
 REASONIX_ROOT = "C:/path/to/workspace"
 REASONIX_SUBAGENT = "deepseek-worker"
-REASONIX_MODEL_REF = "<the ref you selected with: node src/configure.mjs list>"
+REASONIX_MODEL_REF = "<用 node src/configure.mjs list 选出的 ref>"
 ```
 
-Restart Codex after changing MCP configuration. Run `npm run check` (or `node --check src/server.mjs src/config.mjs src/configure.mjs`) before connecting a new machine.
+改动 MCP 配置后需重启 Codex。接入新机器前先跑 `npm run check`（或 `node --check src/server.mjs src/config.mjs src/configure.mjs`）。
 
-The bridge performs a cheap `reasonix --version` gate before it calls `doctor` or starts a worker. If a deliberate compatibility test needs to run against an older CLI, set `REASONIX_MIN_VERSION` to an explicit lower value; `verify` and the server log a warning so the relaxed gate is visible. An unparseable or unavailable version is reported as `unknown` and does not block startup, while the normal CLI/model checks still apply.
+桥接器在调用 `doctor` 或启动 worker 之前会做一次轻量的 `reasonix --version` 门。若确有兼容性测试需要针对旧版 CLI，可把 `REASONIX_MIN_VERSION` 显式调低；`verify` 与 server 日志都会给出警告，使放宽的门可见。版本无法解析或不可用时报告为 `unknown` 且不阻断启动，常规的 CLI/模型检查仍然生效。
 
-The offline regression suite has no model or network dependency:
+离线回归套件不依赖模型与网络：
 
 ```bash
-npm test       # node --test: config, configure, MCP session and version stubs
-npm run check  # syntax checks for all bridge modules
-npm run check:links # local README links only; no network access
+npm test       # node --test：配置、configure、MCP 会话与版本桩
+npm run check  # 所有 bridge 模块的语法检查
+npm run check:links # 仅检查本仓库 README 的本地链接；不访问网络
 ```
 
-The repository CI repeats these three offline checks on Node 20; see the [CI workflow](.github/workflows/ci.yml).
-The link check resolves only relative paths in this repository and skips external URLs, anchors, and mail links.
+仓库 CI 在 Node 20 上重复这三项离线检查，见 [CI workflow](.github/workflows/ci.yml)。链接检查只解析本仓库内的相对路径，跳过外部 URL、锚点与邮件链接。
 
-Create the named read profile once in the global Reasonix profile directory. The bridge passes the target workspace with `--dir`, so a project-only profile will not be found when the bridge is copied to another repository:
+读角色 profile 需要**一次**在 Reasonix 全局 profile 目录中创建。桥接器用 `--dir` 传入目标工作区，因此只存在于项目内的 profile 在桥接器被复制到别的仓库时找不到：
 
 ```powershell
-reasonix subagent create deepseek-worker --scope global --model "<ref shown by: node src/configure.mjs list>" --prompt-file .\prompts\deepseek-worker-prompt.md
+reasonix subagent create deepseek-worker --scope global --model "<node src/configure.mjs list 显示的 ref>" --prompt-file .\prompts\deepseek-worker-prompt.md
 reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index,git_log,git_diff"
-# `node src/configure.mjs profile --sync --write` can enforce read-only: true and re-check the profile.
+# 可用 `node src/configure.mjs profile --sync --write` 强制 read-only: true 并复检 profile。
 ```
 
-`configure profile` resolves profiles at `%APPDATA%/reasonix/skills/<name>/SKILL.md` on Windows (or `~/.config/reasonix/skills/<name>/SKILL.md` on POSIX). The default `read` role uses the configured `deepseek-worker` name, requires `read-only: true`, and is preview-only unless `--write` is explicit. `--role write` targets a separate `<read-profile>-write` profile (or `REASONIX_WRITE_SUBAGENT`/`writeSubagent`), uses `prompts/deepseek-worker-write-prompt.md`, and requires that no `read-only` field is present. Both roles re-read the profile after an explicit write and fail closed on model or tool drift. Set `REASONIX_SKILLS_DIR` to a temporary skills root for offline tests or isolated setup.
+`configure profile` 在 Windows 上按 `%APPDATA%/reasonix/skills/<name>/SKILL.md` 解析 profile（POSIX 上是 `~/.config/reasonix/skills/<name>/SKILL.md`）。默认的 `read` 角色使用配置的 `deepseek-worker` 名称，要求 `read-only: true`，且在未显式 `--write` 时只做预览。`--role write` 指向独立的 `<读 profile 名>-write`（或 `REASONIX_WRITE_SUBAGENT`/`writeSubagent`），使用 `prompts/deepseek-worker-write-prompt.md`，并要求不得出现 `read-only` 字段。两种角色在显式写入后都会重新读取 profile，并在模型或工具漂移时 fail-closed。离线测试或隔离部署可用 `REASONIX_SKILLS_DIR` 指向临时 skills 根。
 
-The canonical read-only profile tool set is `read_file, grep, glob, ls, code_index, git_log, git_diff`.
-`git_log` and `git_diff` are inspection-only viewers; no write, commit, checkout, reset, network, or
-shell tool is allowed. `configure verify` prints the installed `allowed-tools` list and fails when
-it differs from this documented set.
+规范的只读 profile 工具集是 `read_file, grep, glob, ls, code_index, git_log, git_diff`。`git_log` 与 `git_diff` 是只读查看器；不允许任何写、commit、checkout、reset、网络或 shell 工具。`configure verify` 会打印已安装的 `allowed-tools`，与这份文档化集合不一致即失败。
 
-The canonical write profile adds only `edit_file` and `write_file` to that read set. It has no
-`read-only` field and still has no shell, network, commit, checkout, reset, or delete tool. Creating
-the profile does not enable bridge writes: `allowWrite: true`, a non-empty `allowedPaths`, a clean
-tree, and `mode=implement` are still required. Set `REASONIX_SUBAGENT` to the write profile only
-for an explicitly authorized call. The operating workflow is: main agent gives a bounded task ->
-write subagent edits -> bridge returns structured change evidence -> main agent reviews the diff and
-tests, checks that out-of-scope paths are zero, then keeps or calls `reasonix_rollback`.
+规范的写 profile 只在上述只读集合上增加 `edit_file` 与 `write_file`。它没有 `read-only` 字段，同样没有 shell、网络、commit、checkout、reset 或删除类工具。**创建 profile 并不等于开启桥接写入**：仍然需要 `allowWrite: true`、非空 `allowedPaths`、干净工作区，以及调用方显式传 `mode=implement`。只有在明确授权的那次调用中才把 `REASONIX_SUBAGENT` 指向写 profile。工作流是：主 agent 下达有界任务 → 写子智能体执行编辑 → 桥接器返回结构化变更证据 → 主 agent 审查 diff 并跑测试、确认白名单外路径为零，然后保留改动或调用 `reasonix_rollback`。
 
-## Environment variables
+## 环境变量
 
-`REASONIX_EXE`, `REASONIX_ROOT`, `REASONIX_SUBAGENT`, `REASONIX_SUBAGENT_ROLE`, `REASONIX_WRITE_SUBAGENT`, and `REASONIX_MODEL_REF` are configurable and always win over `bridge.config.json`. `REASONIX_SUBAGENT_ROLE` may explicitly be `read` or `write`; when omitted, a profile name ending in `-write` is treated as the write role. `REASONIX_EXE` is optional: set it to pin a specific `reasonix-cli` executable (a path that does not exist exits with code 2), or omit it to use the probe order above. Any `<provider>/<model>` ref this machine reports is accepted for `REASONIX_MODEL_REF`; an empty value, whitespace, or a ref without `/` exits with code 2. `REASONIX_ADD_DIRS` may contain additional allowed roots separated by the platform path delimiter. `BRIDGE_CONFIG`, `BRIDGE_PRESETS`, `CODEX_CONFIG`, and `CODEX_HOME` relocate the files the helper scripts read and write.
+`REASONIX_EXE`、`REASONIX_ROOT`、`REASONIX_SUBAGENT`、`REASONIX_SUBAGENT_ROLE`、`REASONIX_WRITE_SUBAGENT` 与 `REASONIX_MODEL_REF` 均可配置，且始终优先于 `bridge.config.json`。`REASONIX_SUBAGENT_ROLE` 可显式取 `read` 或 `write`；省略时，名字以 `-write` 结尾的 profile 被当作写角色。`REASONIX_EXE` 可选：设置它可固定某个 `reasonix-cli` 可执行文件（路径不存在则退出码 2），省略则按上面的探测顺序。本机报告的任意 `<provider>/<model>` 都可作为 `REASONIX_MODEL_REF`；空值、含空白或不含 `/` 的 ref 以退出码 2 结束。`REASONIX_ADD_DIRS` 可包含额外的允许根，用平台路径分隔符隔开。`BRIDGE_CONFIG`、`BRIDGE_PRESETS`、`CODEX_CONFIG` 与 `CODEX_HOME` 用于改位辅助脚本读写的位置。
 
-Resource limits can be lowered per machine in `bridge.config.json`. The bridge permits up to
-256 raw Reasonix steps (128 tool-call rounds) and 1800 seconds per call; these are finite code
-hard caps, not user-configurable limits:
+资源限额可按机器在 `bridge.config.json` 中调低。桥接器允许每次调用最多 256 个 Reasonix 原始步（128 个工具调用轮）与 1800 秒；这些是**代码硬上限**，不是用户可配的限额：
 
 ```json
 {"limits":{"MAX_STEPS_CAP":20,"TIMEOUT_SECONDS_CAP":300,"OUTPUT_CHAR_CAP":12000,"queueCap":2}}
 ```
 
-Each value must be a positive integer. Invalid values fall back to the defaults with one startup
-warning; values above the code hard caps are clamped with one warning. `reasonix_status.limits`
-always reports the effective values used for calls. Defaults for the mode presets remain unchanged;
-pass `tool_rounds` and `timeout_seconds` explicitly when a task needs the wider bounded budget.
+每个值必须是正整数。非法值回退默认并给出一次启动警告；超过代码硬上限的值被夹紧并给出一次警告。`reasonix_status.limits` 始终报告调用实际生效的值。各模式的默认预设值保持不变；任务确实需要更宽的预算时，显式传 `tool_rounds` 与 `timeout_seconds`。
 
-Reasonix's `--max-steps` is a raw internal step budget, not a tool-call-round count. With the
-current CLI, a normal assistant/tool exchange consumes two internal steps. Use `tool_rounds` on
-`reasonix_run` when expressing a task-sized budget; the bridge converts it to `--max-steps` and
-reports the corresponding `toolRoundsCap`. `max_steps` remains available for raw CLI-compatible
-overrides. If Reasonix reports `paused after ... tool-call rounds (max_steps)`, the bridge records
-`step_limit` and explains that the bridge timeout was not reached; this is distinct from a
-`timeout` outcome.
+Reasonix 的 `--max-steps` 是内部原始步预算，不是工具调用轮数。在当前 CLI 下，一次常规的助手/工具往返消耗两个内部步。用 `reasonix_run` 的 `tool_rounds` 表达"任务级预算"更直观：桥接器把它换算成 `--max-steps`，并在状态里报告对应的 `toolRoundsCap`；`max_steps` 仍保留给需要与 CLI 原始口径对齐的场景。若 Reasonix 报告 `paused after ... tool-call rounds (max_steps)`，桥接器记为 `step_limit` 并说明**桥接超时并未触发**——这与 `timeout` 结果是两回事。
 
-The worker prompts also treat `read_file` continuation cursors as opaque values: they must be
-returned byte-for-byte as received, never edited or reconstructed. If Reasonix reports an invalid
-or malformed cursor, the bridge returns `cursor_error`, redacts the worker's cursor diagnostic, and
-does not replay the task; the worker should re-read the file from an explicit path/range instead.
+worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必须按收到的原样逐字节回传，不得编辑或重建。若 Reasonix 报告 cursor 无效或畸形，桥接器返回 `cursor_error`、对 worker 的 cursor 诊断做脱敏，且**不重放**任务；worker 应改用显式路径/区间重新读取文件。
 
-Recoverable worker failures (`step_limit`, `timeout`, `worker_exit`, and `cursor_error`) create a
-durable checkpoint outside the workspace. The response includes a `checkpoint_id`; call
-`reasonix_resume` explicitly to continue. A checkpoint stores the original task, mode, bounded
-budget, Reasonix/config fingerprints, and a Git workspace snapshot, but never worker stdout/stderr.
-Resume refuses a changed workspace or configuration and consumes the checkpoint before starting the
-next worker, so failures are never retried implicitly. Checkpoints are one-shot; a failed resume
-creates a new id. Set `BRIDGE_CHECKPOINT_DIR` (or `checkpointDir` in `bridge.config.json`) to choose
-the storage directory; paths inside the workspace disable checkpointing to avoid dirtying Git.
+可恢复的 worker 失败（`step_limit`、`timeout`、`worker_exit`、`cursor_error`）会在工作区之外创建持久 checkpoint。响应里带 `checkpoint_id`，需要续跑时显式调用 `reasonix_resume`。checkpoint 保存原始任务、模式、有界预算、Reasonix/配置指纹与 Git 工作区快照，但**绝不保存** worker 的 stdout/stderr。工作区或配置发生变化时 resume 会被拒绝；checkpoint 在启动下一个 worker 前即被消费，因此失败不会被隐式重试。checkpoint 是一次性的，失败的 resume 会生成新 id。用 `BRIDGE_CHECKPOINT_DIR`（或 `bridge.config.json` 的 `checkpointDir`）选择存储目录；落在工作区内的路径会禁用 checkpoint，以免弄脏 Git。
 
-`reasonix_status` also reports checkpoint persistence (`checkpoint.enabled` and ready count), the live
-`queueDepth` (accepted calls not yet completed), numeric `inFlight` count, parallel/exclusive slot
-counts, per-job state, and a redacted `lastRun` summary. Calls remain serialized by default. A caller
-must pass `parallel=true` to `reasonix_run` to use a concurrent read-only inspect/review/plan slot;
-implement, resume, and rollback jobs remain exclusive to protect the workspace and write policy.
-`reasonix_cancel` accepts a visible `job_id`, terminates its worker tree, and reports the reclaimed
-slot; cancellation never creates a checkpoint. A full queue error includes the current depth,
-configured capacity, and a retry-after hint. Job and summary records never contain task text, worker
-output, model references, or absolute paths.
+`reasonix_status` 还会报告 checkpoint 持久化（`checkpoint.enabled` 与就绪数）、实时 `queueDepth`（已接受未完成的调用数）、数值型 `inFlight`、并行/独占槽位计数、单任务状态，以及脱敏的 `lastRun` 摘要。调用默认串行；只有显式给 `reasonix_run` 传 `parallel=true` 才会占用并发的只读 inspect/review/plan 槽位；implement、resume 与 rollback 仍为独占，以保护工作区与写策略。`reasonix_cancel` 接受可见的 `job_id`，终止其 worker 进程树并报告回收的槽位；取消**不会**创建 checkpoint。队列满的错误会带当前深度、配置容量与建议重试时间。任务与摘要记录绝不包含任务正文、worker 输出、模型引用或绝对路径。
 
-The status also exposes the selected provider/model capabilities reported by `reasonix doctor`:
-`contextWindow`, `vision`, and the provider's redacted `base_url_host`. Before spawning a worker,
-the bridge estimates task tokens from UTF-8 bytes and rejects a task whose estimate exceeds the
-reported context window, with the concrete estimate and limit in the error. Capability discovery
-is read-only and does not write the doctor cache during bridge startup.
+状态里还会暴露 `reasonix doctor` 报告的选中 provider/model 能力：`contextWindow`、`vision` 与 provider 的脱敏 `base_url_host`。启动 worker 之前，桥接器按 UTF-8 字节估算任务 token 量，超过报告的上下文窗口即拒绝，并在错误里给出具体估算与上限。能力探测是只读的，桥接器启动时不会写 doctor 缓存。
 
-`reasonix_run` also accepts read-only `mode=plan`. In this mode the bridge returns worker stdout
-unchanged so callers can consume a machine-readable change list, for example:
+`reasonix_run` 还接受只读的 `mode=plan`。该模式下桥接器**原样**返回 worker 的 stdout，便于调用方消费机器可读的改动清单，例如：
 
 ```json
 {"schema":"qlh.reasonix.plan.v1","changes":[{"file":"src/server.mjs","location":"line 1","reason":"...","patch":"..."}]}
 ```
 
-The plan is advisory only: the bridge does not parse or apply it. Use repository-relative file names
-and omit file contents from plan entries.
+该清单仅供参考：桥接器不解析也不应用。请使用仓库相对路径，并在清单条目不包含文件内容。
 
-### Controlled implement mode
+### 受控 implement 模式
 
-`mode=implement` is disabled unless the per-machine `bridge.config.json` explicitly opts in. The
-minimum policy is an exact boolean `allowWrite: true`, a non-empty `allowedPaths` array, and the
-default `requireCleanTree: true`:
+除非机器的 `bridge.config.json` 显式选择加入，`mode=implement` 处于关闭状态。最小策略是布尔值恰为 `allowWrite: true`、非空的 `allowedPaths` 数组，以及默认的 `requireCleanTree: true`：
 
 ```json
 {
@@ -195,59 +140,18 @@ default `requireCleanTree: true`:
 }
 ```
 
-The caller must also pass `mode=implement`; inspect/review/plan are enforced as read-role calls and
-reject a selected write profile. Conversely, implement requires an explicit write-role profile.
-`allowedPaths` entries
-are repository-relative exact files or directory prefixes, never absolute paths or `..` escapes.
-Before a write call the bridge requires a verifiable Git workspace and no existing changes.
-`requireCleanTree=false` is rejected as an unsafe policy; the clean-tree gate cannot be disabled.
-After the worker exits it compares Git status with the pre-call snapshot. Any path outside
-the whitelist, or any failed worker, causes the changes from that call to be rolled back. A successful write returns
-only a `qlh.reasonix.changes.v1` change set with repository-relative paths, add/delete counts,
-`git diff --stat`, SHA-256 hashes, `hash_status` (`readable`, `missing`, or `unreadable`), and a one-shot `rollback_id`; worker stdout and file contents are
-never returned. Call `reasonix_rollback` explicitly with that id to restore the call's changes.
-Rollback is serialized with implement calls, rechecks the target Git/hash state after restore, and
-refuses changed, missing, or unreadable targets. Rollback records live only in the current bridge
-process. The dedicated write profile is separate from the default read profile; profile creation and
-bridge write authorization remain independent gates.
+调用方还必须显式传 `mode=implement`；inspect/review/plan 被强制为读角色调用，选中写 profile 会被拒绝。反过来，implement 要求显式写角色 profile。`allowedPaths` 条目是仓库相对路径的**精确文件或目录前缀**，绝不接受绝对路径或 `..` 逃逸。写入调用前，桥接器要求可验证的 Git 工作区且没有既存改动；`requireCleanTree=false` 会被判定为不安全策略而拒绝——clean-tree 门不可关闭。worker 退出后，桥接器把 Git 状态与调用前快照比对：白名单之外的任何路径、或任何失败的 worker，都会把该次调用的改动全部回滚。成功的写入只返回 `qlh.reasonix.changes.v1` 变更集，包含仓库相对路径、增删计数、`git diff --stat`、SHA-256 哈希、`hash_status`（`readable` / `missing` / `unreadable`）与一次性 `rollback_id`；**worker stdout 与文件内容永不返回**。用该 id 显式调用 `reasonix_rollback` 还原这次改动。回滚与 implement 调用同样被串行化，还原后会复核 Git/哈希状态，并拒绝目标已变化、缺失或不可读的情况。回滚记录只存在于当前桥接进程内。专用写 profile 与默认读 profile 相互独立：**创建 profile** 与 **桥接写授权** 是两个各自独立的门。
 
-When `REASONIX_EXE` points to a Windows `.cmd` or `.bat` shim, the bridge invokes `cmd.exe` explicitly
-with `shell:false`. Arguments containing cmd metacharacters are rejected before process creation;
-this keeps task text out of shell interpretation while preserving normal shim startup.
+当 `REASONIX_EXE` 指向 Windows 的 `.cmd` 或 `.bat` shim 时，桥接器以 `shell:false` 显式调用 `cmd.exe`。含 cmd 元字符的参数在创建进程前即被拒绝，从而在保持 shim 正常启动的同时，把任务文本挡在 shell 解释之外。
 
-Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
-the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
-stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
-paths are never written. With `BRIDGE_LOG` unset, the bridge performs no log writes.
+设置 `BRIDGE_LOG` 可为每次 `reasonix_run` 输出一行 JSON。每条记录只含时间戳、模式、工作区根标签、步数/超时限额、结果、退出码、耗时、stdout 字节数与截断标记；任务正文、worker stdout/stderr、模型引用与绝对路径永不写入。未设置 `BRIDGE_LOG` 时桥接器不写任何日志。
 
-The bridge is deliberately stateless per call. It confines `cwd` to allowed roots, rejects
-`implement` unless the write policy is enabled, limits task/budget/output sizes, terminates the
-process tree on timeout/cancel, and keeps write operations exclusive. Output beyond
-`OUTPUT_CHAR_CAP` is bounded in memory and returned as a successful result with
-`truncated=true`; output overflow alone does not kill the worker. Explicit read-only parallel
-jobs are independently spawned and reclaimed when they finish. This avoids accumulating one
-conversation beyond Reasonix's hard 128 MB history limit.
+桥接器有意保持**每次调用无状态**：把 `cwd` 限制在允许根内；写策略未启用时拒绝 `implement`；限制任务/预算/输出规模；超时或取消时终止进程树；写操作保持独占。超出 `OUTPUT_CHAR_CAP` 的输出在内存中有界，并作为**成功结果**返回且 `truncated=true`——输出超限本身不会杀死 worker。显式的只读并行任务各自独立启动并在完成后回收。这一切是为了避免把单一对话累积超过 Reasonix 的 128 MB 历史硬上限。
 
-`src/acp-client.mjs` now provides the ACP-01 newline JSON-RPC client: it performs capability-gated
-initialize/session creation, load/resume, prompt update aggregation, cancellation and clean process
-shutdown. It is transport-only and does not persist session ids or decide write policy. The server
-still defaults to stateless per-call execution and does not import the client until the later
-coexistence/switching ticket is accepted.
+`src/acp-client.mjs` 现已提供 ACP-01 的换行 JSON-RPC 客户端：在能力探测通过后执行 initialize/会话创建、load/resume、prompt 更新聚合、取消与进程干净关闭。它只负责传输，不持久化会话 id、也不决定写策略。server 仍默认按调用无状态执行，在后续的共存/切换票被接受之前不会 import 该客户端。
 
-`src/acp-session.mjs` provides the ACP-02 opt-in session budget coordinator. It uses a bounded
-deterministic summarizer, connects the prototype's append/compact/rotate/per-call decisions to
-replacement sessions, records redacted decision telemetry, and leaves the old session untouched
-when replacement fails. Persistent ACP remains opt-in and the server remains stateless; see
-`ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The fixed 128 MiB Reasonix
-history cap and 75% trigger are not configurable.
+`src/acp-session.mjs` 提供 ACP-02 的可选会话预算协调器：使用有界确定性摘要器，把原型的 append/compact/rotate/per-call 决策接到替换会话，记录脱敏的决策遥测，并在替换失败时**保持旧会话原样**。持久 ACP 仍为 opt-in，server 仍保持无状态；生命周期与失败契约见 `ACP-TRANSPORT-DESIGN.md`。128 MiB 历史硬上限与 75% 触发比不可配置。
 
-`src/acp-registry.mjs` provides the ACP-03 opt-in session registry. It persists only session metadata,
-serializes prompts per session, marks crashed transports orphaned, supports capability-gated resume/
-load and delete, and closes live clients during explicit shutdown. It is not imported by the server
-until the lifecycle, security, and transport-switching tickets are accepted.
+`src/acp-registry.mjs` 提供 ACP-03 的可选会话注册表：只持久化会话元数据，按会话串行化 prompt，把崩溃的传输标记为 orphaned，支持能力门控的 resume/load 与删除，并在显式关闭时关掉活跃客户端。在生命周期、安全与传输切换票被接受之前，server 不会 import 它。
 
-`src/acp-security.mjs` provides the ACP-04 opt-in security gate. It binds persistent calls to an
-opaque caller/task scope, keeps the session cwd inside the configured workspace roots, reuses the
-fail-closed write whitelist for implement preflight, and redacts credential-like content before it
-is retained in continuation history. The server remains stateless and does not import this module
-until ACP-05 transport coexistence is accepted.
+`src/acp-security.mjs` 提供 ACP-04 的可选安全门：把持久调用绑定到不透明的调用方/任务作用域，把会话 cwd 限制在配置的工作区根内，在 implement 预检复用 fail-closed 写白名单，并在内容进入续接历史前脱敏凭据类信息。server 仍保持无状态，在 ACP-05 传输共存被接受之前不会 import 该模块。
