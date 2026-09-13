@@ -217,6 +217,12 @@ export class AcpClient {
     try { return await this.request('session/close', { sessionId }, timeoutMs); } finally { this.sessions.delete(sessionId); }
   }
 
+  async deleteSession(sessionId, timeoutMs = Math.min(this.timeoutMs, 5_000)) {
+    if (!this.child || this.closed || !sessionId) return null;
+    this.#requireSessionCapability('delete', 'session/delete');
+    try { return await this.request('session/delete', { sessionId }, timeoutMs); } finally { this.sessions.delete(sessionId); }
+  }
+
   async close({ sessionId = null, timeoutMs = Math.min(this.timeoutMs, 5_000) } = {}) {
     if (this.closed && !this.child) return;
     if (sessionId && this.child?.stdin?.writable) {

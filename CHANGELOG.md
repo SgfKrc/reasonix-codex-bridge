@@ -7,6 +7,8 @@ All notable changes to this project are documented here.
 ### Added
 
 - ACP-01 newline-delimited JSON-RPC client with capability-gated session lifecycle, prompt update aggregation, cancellation, and process cleanup; it is not enabled by the stateless server yet.
+- ACP-02 opt-in `AcpSessionCoordinator` with bounded deterministic summaries, transactional replacement sessions for compact/rotate, redacted decision telemetry, and explicit stateless fallback; it is not enabled by the stateless server yet.
+- ACP client `session/delete` support with capability gating and local session-set cleanup.
 - Separate `read` and `write` profile contracts via `configure profile --role read|write`.
 - The write profile uses only `edit_file` and `write_file` beyond the canonical read tools, omits `read-only`, and has a dedicated implementation prompt.
 - Role-aware verification and status reporting for the explicit write profile workflow.
