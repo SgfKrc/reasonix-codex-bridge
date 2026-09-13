@@ -21,6 +21,7 @@
 
 profile 的 `allowed-tools` 固定为 `read_file, grep, glob, ls, code_index, web_fetch`。
 `web_fetch` 是 Reasonix 自带的可选抓取能力：只有任务明确需要指定 URL 时才调用，并遵守 Reasonix 自己的 URL、重定向、大小和内容类型策略。bridge 不提供任意 URL MCP 工具，也不允许自行使用 socket、代理或 shell。
+`web_search` 不属于本 profile 的 host 工具；它是 provider 侧可选能力。若 provider 未明确提供，必须报告 unavailable，不得编造搜索结果、来源或引用，也不得把 `web_fetch` 当作无 URL 授权的搜索替代。
 Reasonix v1.38.7 不识别 `git_log` 与 `git_diff` 这两个 profile 身份；Git 历史和差异由主 agent 通过 host/MCP 或受控命令执行通道审查。不得使用写入、提交、checkout 或 reset 工具。
 
 ## continuation cursor 约束

@@ -25,6 +25,7 @@ import {
   readDoctor,
   resolveExecPolicy,
   resolveModelRef,
+  resolveProviderSearchCapability,
   resolveSubagentRole,
   resolveTransport,
   upsertReasonixBlock,
@@ -431,6 +432,15 @@ describe('configuration pure functions', () => {
     assert.deepEqual(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').tools, ['read_file', 'grep']);
     assert.deepEqual(READ_ONLY_PROFILE_TOOLS, ['read_file', 'grep', 'glob', 'ls', 'code_index', 'web_fetch']);
     assert.deepEqual(WRITE_PROFILE_TOOLS, [...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
+    assert.deepEqual(resolveProviderSearchCapability({ providers: [{ name: 'fixture', models: ['provider'] }] }), {
+      owner: 'provider',
+      tool: 'web_search',
+      available: false,
+      status: 'unavailable',
+      reason: 'provider_capability_not_advertised',
+    });
+    assert.equal(resolveProviderSearchCapability({ providers: [{ name: 'fixture', web_search: true }] }).available, true);
+    assert.equal(resolveProviderSearchCapability({ providers: [{ name: 'fixture', capabilities: { web_search: false } }] }).reason, 'provider_reported_unavailable');
   });
 
   test('resolves a fail-closed named execution policy', () => {
@@ -458,7 +468,9 @@ describe('configuration pure functions', () => {
     const writePrompt = readFileSync(path.join(BRIDGE_ROOT, 'prompts', 'deepseek-worker-write-prompt.md'), 'utf8');
     assert.match(readPrompt, /allowed-tools.*web_fetch/u);
     assert.match(readPrompt, /bridge.*不提供任意 URL MCP 工具/isu);
+    assert.match(readPrompt, /web_search.*provider.*unavailable/isu);
     assert.match(writePrompt, /native `web_fetch`/iu);
+    assert.match(writePrompt, /web_search.*provider-owned.*unavailable/iu);
     assert.match(readPrompt, /continuation cursor.*不透明值/isu);
     assert.match(readPrompt, /逐字原样传回/isu);
     assert.match(readPrompt, /重新调用 `read_file`/u);
@@ -782,6 +794,13 @@ describe('offline command contracts', () => {
     assert.equal(status.execPolicy.enabled, false);
     assert.deepEqual(status.execPolicy.commands, []);
     assert.equal(status.base_url_host, 'fixture.invalid');
+    assert.deepEqual(status.providerSearch, {
+      owner: 'provider',
+      tool: 'web_search',
+      available: false,
+      status: 'unavailable',
+      reason: 'provider_capability_not_advertised',
+    });
     assert.deepEqual(status.providerCapabilities, {
       available: true,
       provider: 'fixture',
