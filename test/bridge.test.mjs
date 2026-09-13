@@ -1517,6 +1517,8 @@ describe('ACP session security policy', () => {
     assert.equal(scrubbed.includes('abcdefghijkl'), false);
     assert.equal(scrubbed.includes('secret'), false);
     assert.equal(scrubAcpContent('DB_PASSWORD=hunter2', { sourcePath: '.env' }), '[REDACTED sensitive file]');
+    assert.equal(scrubAcpContent('NORMAL_VALUE=still-private').includes('still-private'), false);
+    assert.equal(scrubAcpContent('{"api_key":"json-secret"}').includes('json-secret'), false);
     assert.deepEqual(scrubAcpMessages([{ role: 'user', content: 'TOKEN=top-secret' }])[0].content, 'TOKEN=[REDACTED]');
   });
 
