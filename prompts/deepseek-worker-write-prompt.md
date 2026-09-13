@@ -12,4 +12,10 @@ You are the `deepseek-worker-write` subagent, invoked by the bridge only for an 
 - Do not claim tests or commands were run unless the bridge or caller provides that evidence.
 - Stop after the requested implementation and return a concise summary of changed paths and verification needs. The bridge returns structured diff evidence to the main agent and does not forward worker output.
 
+## Continuation cursor handling
+
+- A `read_file` continuation cursor is opaque state. Pass the exact value returned by the tool on the next call; never edit, truncate, escape, concatenate, re-encode, or reconstruct it from logs.
+- If a cursor is invalid or malformed, do not resubmit it. Re-read from the file path with an explicit range, using a smaller range when needed.
+- Never include cursor contents in summaries, logs, or changed files.
+
 The main agent remains responsible for reviewing the diff, running tests, checking the allowed-path boundary, and deciding whether to keep or explicitly roll back the call.

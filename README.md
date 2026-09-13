@@ -137,6 +137,11 @@ overrides. If Reasonix reports `paused after ... tool-call rounds (max_steps)`, 
 `step_limit` and explains that the bridge timeout was not reached; this is distinct from a
 `timeout` outcome.
 
+The worker prompts also treat `read_file` continuation cursors as opaque values: they must be
+returned byte-for-byte as received, never edited or reconstructed. If Reasonix reports an invalid
+or malformed cursor, the bridge returns `cursor_error`, redacts the worker's cursor diagnostic, and
+does not replay the task; the worker should re-read the file from an explicit path/range instead.
+
 `reasonix_status` also reports the live `queueDepth` (accepted calls not yet completed), numeric
 `inFlight` count, and a redacted `lastRun` summary. A full queue error includes the current depth,
 configured capacity, and a retry-after hint. The summary never contains task text, worker output,
