@@ -765,6 +765,35 @@ process.stdout.write('implemented');
     assert.equal(status.stdout.trim(), '');
   });
 
+  test('implement preserves step-limit diagnostics in the redacted run log', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'allowed.txt'), 'before', 'utf8');
+    writeFileSync(path.join(root, 'subagent'), `
+process.stderr.write('sub-agent: paused after 5 tool-call rounds (max_steps) — work saved');
+process.exit(1);
+`, 'utf8');
+    commitFixture(root);
+    const logPath = path.join(root, 'calls.jsonl');
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      cwd: root,
+      env: envFor(root, { BRIDGE_LOG: logPath, REASONIX_SUBAGENT: 'deepseek-worker-write' }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const response = await mcpClient(child).request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'step-limit write', mode: 'implement', max_steps: 10, timeout_seconds: 120 } });
+    child.stdin.end();
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(response.result.isError, true);
+    const changeSet = JSON.parse(response.result.content[0].text);
+    assert.equal(changeSet.outcome, 'step_limit');
+    const record = JSON.parse(readFileSync(logPath, 'utf8').trim());
+    assert.equal(record.outcome, 'step_limit');
+    assert.equal(record.stepLimitRounds, 5);
+  });
+
   test('implement refuses an existing dirty tree by default', async () => {
     const root = tempRoot();
     writeCliFiles(root);

@@ -388,6 +388,9 @@ function parseStepLimit(stderr) {
   const match = String(stderr ?? '').match(/paused after\s+(\d+)\s+tool-call rounds?\s+\(max_steps\)/iu);
   return match ? Number(match[1]) : null;
 }
+function stepLimitExtra(meta) {
+  return Number.isInteger(meta?.stepLimitRounds) ? { stepLimitRounds: meta.stepLimitRounds } : {};
+}
 function cwdRootLabel(cwd) {
   const roots = allowedRoots();
   const index = roots.findIndex((root) => isInside(root, cwd));
@@ -493,7 +496,7 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement' }, { record: false });
   const afterStatus = await gitStatus(WORKSPACE_ROOT);
   if (!afterStatus.ok) {
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, ...stepLimitExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: `mode=implement could not verify post-write Git state: ${afterStatus.error}`, meta: { ...result.meta, outcome: 'write_rejected' } };
   }
   const changed = changedEntries(beforeStatus.entries, afterStatus.entries);
@@ -506,11 +509,11 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
       : `worker failed: ${result.text}`;
     const rollbackText = rollback.ok ? 'rollback completed' : `rollback failed: ${rollback.error}`;
     const outcome = disallowed.length ? 'write_rejected' : (result.meta?.outcome ?? 'worker_exit');
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...stepLimitExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, outcome } };
   }
   if (result.isError) {
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: result.meta?.outcome ?? 'worker_exit', exitCode: result.meta?.exitCode ?? null, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: result.meta?.outcome ?? 'worker_exit', exitCode: result.meta?.exitCode ?? null, ...stepLimitExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome: result.meta?.outcome ?? 'worker_exit', error: 'worker failed; no changes were retained', changes: [] }), meta: result.meta };
   }
   const changeSet = await buildChangeSet(WORKSPACE_ROOT, changed);
