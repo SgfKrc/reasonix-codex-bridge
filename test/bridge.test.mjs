@@ -798,7 +798,7 @@ describe('offline command contracts', () => {
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
     assert.equal(responses[0].result.serverInfo.name, 'reasonix-local-bridge');
-    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_resume', 'reasonix_cancel', 'reasonix_rollback', 'reasonix_exec', 'reasonix_status']);
+    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_resume', 'reasonix_cancel', 'reasonix_events', 'reasonix_rollback', 'reasonix_exec', 'reasonix_status']);
     const status = JSON.parse(responses[2].result.content[0].text);
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
@@ -2499,6 +2499,124 @@ setTimeout(() => process.stdout.write('slow-result'), 500);
   child.stdin.end();
   const exit = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(exit, 0);
+});
+
+test('reasonix_events returns ordered redacted lifecycle events and supports incremental polling', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const startedPath = path.join(root, 'events-started');
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.STARTED, 'started');
+setTimeout(() => process.stdout.write('worker-output-secret'), 150);
+`, 'utf8');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { STARTED: startedPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const client = mcpClient(child);
+  try {
+    const run = client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'task-secret-events', cwd: '.', timeout_seconds: 5 } });
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 3000;
+      const poll = () => {
+        if (existsSync(startedPath)) resolve();
+        else if (Date.now() >= deadline) reject(new Error('worker did not start'));
+        else setTimeout(poll, 10);
+      };
+      poll();
+    });
+    const during = await client.request(2, 'tools/call', { name: 'reasonix_status', arguments: {} });
+    const job = JSON.parse(during.result.content[0].text).jobs.find((entry) => entry.state === 'running');
+    assert.ok(job?.jobId);
+    assert.equal(job.eventCount, 2);
+    const inFlight = await client.request(3, 'tools/call', { name: 'reasonix_events', arguments: { job_id: job.jobId, limit: 2 } });
+    const inFlightPayload = JSON.parse(inFlight.result.content[0].text);
+    assert.equal(inFlight.result.isError, false);
+    assert.equal(inFlightPayload.schema, 'qlh.reasonix.events.v1');
+    assert.equal(inFlightPayload.jobId, job.jobId);
+    assert.deepEqual(inFlightPayload.events.map((event) => event.type), ['queued', 'started']);
+    assert.equal(inFlightPayload.terminal, false);
+    assert.equal(inFlightPayload.nextSeq, 2);
+    assert.equal(inFlightPayload.latestSeq, 2);
+
+    const result = await run;
+    assert.equal(result.result.isError, false);
+    const all = await client.request(4, 'tools/call', { name: 'reasonix_events', arguments: { job_id: job.jobId } });
+    const payload = JSON.parse(all.result.content[0].text);
+    assert.deepEqual(payload.events.map((event) => event.type), ['queued', 'started', 'completed']);
+    assert.deepEqual(payload.events.map((event) => event.seq), [1, 2, 3]);
+    assert.equal(payload.terminal, true);
+    assert.equal(payload.state, 'completed');
+    assert.equal(payload.nextSeq, 3);
+    assert.equal(payload.latestSeq, 3);
+    assert.equal(payload.hasMore, false);
+    const eventKeys = ['jobId', 'seq', 'type', 'mode', 'stage', 'state', 'outcome', 'maxSteps', 'timeoutSeconds', 'stepLimitRounds', 'cancelRequested', 'queueDepth', 'inFlight', 'parallelActive', 'exclusiveActive', 'at'];
+    for (const event of payload.events) {
+      assert.deepEqual(Object.keys(event).sort(), [...eventKeys].sort());
+    }
+    const serialized = JSON.stringify(payload);
+    assert.doesNotMatch(serialized, /task-secret-events|worker-output-secret/);
+    assert.doesNotMatch(serialized, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    const incremental = await client.request(5, 'tools/call', { name: 'reasonix_events', arguments: { job_id: job.jobId, after_seq: 2 } });
+    const incrementalPayload = JSON.parse(incremental.result.content[0].text);
+    assert.deepEqual(incrementalPayload.events.map((event) => event.type), ['completed']);
+    assert.equal(incrementalPayload.nextSeq, 3);
+  } finally {
+    child.stdin.end();
+    await new Promise((resolve) => child.once('close', resolve));
+  }
+});
+
+test('reasonix_events reports cancellation as an ordered terminal lifecycle without worker text', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  const startedPath = path.join(root, 'events-cancel-started');
+  writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.STARTED, 'started');
+setTimeout(() => process.stdout.write('cancelled-worker-secret'), 5000);
+`, 'utf8');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { STARTED: startedPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const client = mcpClient(child);
+  try {
+    const run = client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'task-secret-cancel', cwd: '.', timeout_seconds: 5 } });
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 3000;
+      const poll = () => {
+        if (existsSync(startedPath)) resolve();
+        else if (Date.now() >= deadline) reject(new Error('worker did not start'));
+        else setTimeout(poll, 10);
+      };
+      poll();
+    });
+    const during = await client.request(2, 'tools/call', { name: 'reasonix_status', arguments: {} });
+    const job = JSON.parse(during.result.content[0].text).jobs.find((entry) => entry.state === 'running');
+    assert.ok(job?.jobId);
+    const cancelled = await client.request(3, 'tools/call', { name: 'reasonix_cancel', arguments: { job_id: job.jobId } });
+    assert.equal(cancelled.result.isError, false);
+    await run;
+    const events = await client.request(4, 'tools/call', { name: 'reasonix_events', arguments: { job_id: job.jobId } });
+    const payload = JSON.parse(events.result.content[0].text);
+    assert.deepEqual(payload.events.map((event) => event.type), ['queued', 'started', 'cancellation_requested', 'cancelled']);
+    assert.equal(payload.terminal, true);
+    assert.equal(payload.state, 'cancelled');
+    assert.equal(payload.events[2].state, 'running');
+    assert.equal(payload.events[2].cancelRequested, true);
+    assert.equal(payload.events[3].outcome, 'cancelled');
+    assert.doesNotMatch(JSON.stringify(payload), /task-secret-cancel|cancelled-worker-secret/);
+    assert.doesNotMatch(JSON.stringify(payload), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally {
+    child.stdin.end();
+    await new Promise((resolve) => child.once('close', resolve));
+  }
 });
 
 test('explicit parallel read jobs overlap and status reclaims their worker slots', async () => {

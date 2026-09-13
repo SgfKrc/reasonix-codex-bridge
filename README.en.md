@@ -2,7 +2,7 @@
 
 > **Language**: [English](README.en.md) · [简体中文](README.md)
 
-Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_resume`, `reasonix_cancel`, `reasonix_rollback`, `reasonix_exec`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
+Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_resume`, `reasonix_cancel`, `reasonix_events`, `reasonix_rollback`, `reasonix_exec`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
 
 Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited release contents.
 
@@ -170,6 +170,13 @@ implement, resume, and rollback jobs remain exclusive to protect the workspace a
 slot; cancellation never creates a checkpoint. A full queue error includes the current depth,
 configured capacity, and a retry-after hint. Job and summary records never contain task text, worker
 output, model references, or absolute paths.
+
+`reasonix_events` polls a bounded, ordered lifecycle stream for one `job_id`. Optional `after_seq`
+and `limit` parameters support incremental reads after reconnecting. The
+`qlh.reasonix.events.v1` response contains only the job id, stage, state, terminal outcome, and
+bounded counters; it never returns task text, worker output, model references, or paths. The stream
+covers queued, started, cancellation-requested, and terminal transitions, and expires with the
+in-process job record.
 
 The status also exposes the selected provider/model capabilities reported by `reasonix doctor`:
 `contextWindow`, `vision`, and the provider's redacted `base_url_host`. Before spawning a worker,

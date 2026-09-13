@@ -2,7 +2,7 @@
 
 > **Language**: [English](README.en.md) · [简体中文](README.md)
 
-面向 Codex 的零依赖 stdio MCP 服务，暴露 `reasonix_run`、显式 `reasonix_resume`、`reasonix_cancel`、`reasonix_rollback`、`reasonix_exec` 与 `reasonix_status` 六个 MCP 工具。worker 默认保持只读；受控写入需要显式策略。
+面向 Codex 的零依赖 stdio MCP 服务，暴露 `reasonix_run`、显式 `reasonix_resume`、`reasonix_cancel`、`reasonix_events`、`reasonix_rollback`、`reasonix_exec` 与 `reasonix_status` 七个 MCP 工具。worker 默认保持只读；受控写入需要显式策略。
 
 当前版本：`v0.1.0`，经审计的发布内容见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -120,6 +120,8 @@ worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必�
 状态里还会暴露 `reasonix doctor` 报告的选中 provider/model 能力：`contextWindow`、`vision` 与 provider 的脱敏 `base_url_host`。启动 worker 之前，桥接器按 UTF-8 字节估算任务 token 量，超过报告的上下文窗口即拒绝，并在错误里给出具体估算与上限。能力探测是只读的，桥接器启动时不会写 doctor 缓存。
 
 `reasonix_status.providerSearch` 是 provider 原生 `web_search` 的 fail-closed 能力摘要。当前 provider 未显式声明搜索能力时返回 `status=unavailable` 与 `reason=provider_capability_not_advertised`；bridge 不自建搜索后端，也不把模型文本推断当作搜索结果。若将来 provider 明确接通，`reasonix_run` 仍只原样透传 Reasonix 返回的摘要/来源/截断状态。
+
+`reasonix_events` 按 `job_id` 轮询一个有界、按序的生命周期事件流。可选的 `after_seq` 与 `limit` 支持断点式增量读取；响应 schema 为 `qlh.reasonix.events.v1`，事件只包含 job id、阶段、状态、终态结果和有界计数，不返回任务正文、worker 输出、模型引用或路径。事件流覆盖排队、启动、取消请求和终态，进程内 job 记录被清理后对应事件也会过期。
 
 ### 显式阶段编排（`plan -> implement -> exec -> review`）
 
