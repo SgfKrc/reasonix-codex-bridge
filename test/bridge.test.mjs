@@ -21,6 +21,7 @@ import {
   READ_ONLY_PROFILE_TOOLS,
   WRITE_PROFILE_TOOLS,
   readDoctor,
+  resolveExecPolicy,
   resolveModelRef,
   resolveSubagentRole,
   resolveTransport,
@@ -415,6 +416,26 @@ describe('configuration pure functions', () => {
     assert.deepEqual(WRITE_PROFILE_TOOLS, [...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
   });
 
+  test('resolves a fail-closed named execution policy', () => {
+    assert.equal(resolveExecPolicy({ data: {} }).enabled, false);
+    const policy = resolveExecPolicy({ data: { execPolicy: {
+      enabled: true,
+      allowedPaths: ['.', 'tools'],
+      commands: [{ name: 'node-test', executable: 'node', argsPrefix: ['--test'], maxArgs: 4 }],
+      timeoutSeconds: 12,
+      outputCharCap: 800,
+    } } });
+    assert.equal(policy.enabled, true);
+    assert.deepEqual(policy.allowedPaths, ['', 'tools']);
+    assert.deepEqual(policy.commands[0], { name: 'node-test', executable: 'node', argsPrefix: ['--test'], maxArgs: 4 });
+    assert.equal(policy.timeoutSeconds, 12);
+    assert.equal(policy.outputCharCap, 800);
+    const unsafe = resolveExecPolicy({ data: { execPolicy: { enabled: true, allowedPaths: ['..'], commands: [], requireCleanTree: false } } });
+    assert.equal(unsafe.enabled, true);
+    assert.match(unsafe.errors.join('; '), /escapes the workspace/);
+    assert.match(unsafe.errors.join('; '), /requireCleanTree=false/);
+  });
+
   test('worker prompts require opaque continuation cursors', () => {
     const readPrompt = readFileSync(path.join(BRIDGE_ROOT, 'prompts', 'deepseek-worker-prompt.md'), 'utf8');
     const writePrompt = readFileSync(path.join(BRIDGE_ROOT, 'prompts', 'deepseek-worker-write-prompt.md'), 'utf8');
@@ -716,7 +737,7 @@ describe('offline command contracts', () => {
     const exit = await new Promise((resolve) => child.once('close', resolve));
     assert.equal(exit, 0);
     assert.equal(responses[0].result.serverInfo.name, 'reasonix-local-bridge');
-    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_resume', 'reasonix_cancel', 'reasonix_rollback', 'reasonix_status']);
+    assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['reasonix_run', 'reasonix_resume', 'reasonix_cancel', 'reasonix_rollback', 'reasonix_exec', 'reasonix_status']);
     const status = JSON.parse(responses[2].result.content[0].text);
     assert.equal(status.versionCheck, 'ok');
     assert.equal(status.workerReadOnlyAssumed, true);
@@ -725,6 +746,8 @@ describe('offline command contracts', () => {
     assert.equal(status.historyHardCapBytes, 128 * 1024 * 1024);
     assert.equal(status.contextWindow, 4096);
     assert.equal(status.vision, true);
+    assert.equal(status.execPolicy.enabled, false);
+    assert.deepEqual(status.execPolicy.commands, []);
     assert.equal(status.base_url_host, 'fixture.invalid');
     assert.deepEqual(status.providerCapabilities, {
       available: true,
@@ -736,6 +759,179 @@ describe('offline command contracts', () => {
       error: null,
     });
     assert.equal(readdirSync(root).some((name) => name.endsWith('.jsonl')), false);
+  });
+
+  test('reasonix_exec is fail-closed until a named command policy is enabled', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const response = await mcpClient(child).request(1, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-test' } });
+    assert.equal(response.result.isError, true);
+    assert.match(response.result.content[0].text, /reasonix_exec is disabled/);
+    child.stdin.end();
+    assert.equal(await new Promise((resolve) => child.once('close', resolve)), 0);
+  });
+
+  test('reasonix_exec runs an allowlisted argv command and detects workspace mutations', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const script = path.join(root, 'exec-fixture.js');
+    const mutation = path.join(root, 'exec-dirty.txt');
+    writeFileSync(script, `
+const fs = require('node:fs');
+if (process.argv.includes('mutate')) fs.writeFileSync(${JSON.stringify(mutation)}, 'dirty');
+process.stdout.write('exec-ok TOKEN=secret ' + process.argv.slice(2).join(','));
+process.stderr.write(${JSON.stringify(root)});
+`, 'utf8');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({
+      modelRef: 'fixture/provider',
+      execPolicy: {
+        enabled: true,
+        allowedPaths: ['.'],
+        commands: [{ name: 'node-fixture', executable: process.execPath, argsPrefix: [script], maxArgs: 2 }],
+        timeoutSeconds: 5,
+        outputCharCap: 120,
+      },
+    }), 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    try {
+      const success = await client.request(1, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-fixture', args: ['hello'] } });
+      assert.equal(success.result.isError, false);
+      const payload = JSON.parse(success.result.content[0].text);
+      assert.equal(payload.schema, 'qlh.reasonix.exec.v1');
+      assert.equal(payload.outcome, 'success');
+      assert.equal(payload.exitCode, 0);
+      assert.equal(payload.cwd, '.');
+      assert.match(payload.stdout, /exec-ok/);
+      assert.doesNotMatch(payload.stdout, /TOKEN=secret/);
+      assert.equal(payload.stderr.includes(root), false);
+      const mutationResult = await client.request(2, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-fixture', args: ['mutate'] } });
+      assert.equal(mutationResult.result.isError, true);
+      const mutationPayload = JSON.parse(mutationResult.result.content[0].text);
+      assert.equal(mutationPayload.outcome, 'workspace_modified');
+      assert.deepEqual(mutationPayload.changedPaths, ['exec-dirty.txt']);
+      rmSync(mutation, { force: true });
+      const status = JSON.parse((await client.request(3, 'tools/call', { name: 'reasonix_status', arguments: {} })).result.content[0].text);
+      assert.equal(status.lastRun.outcome, 'workspace_modified');
+      assert.equal(status.lastRun.operation, 'node-fixture');
+    } finally {
+      rmSync(mutation, { force: true });
+      child.stdin.end();
+      await new Promise((resolve) => child.once('close', resolve));
+    }
+  });
+
+  test('reasonix_exec bounds cwd, arguments, dirty trees, output, and timeouts', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const script = path.join(root, 'exec-boundary.js');
+    const dirtyTarget = path.join(root, 'dirty-target.txt');
+    writeFileSync(dirtyTarget, 'clean\n', 'utf8');
+    writeFileSync(script, `
+const mode = process.argv[2];
+if (mode === 'spam') process.stdout.write('x'.repeat(256));
+else if (mode === 'sleep') setTimeout(() => process.stdout.write('late'), 5000);
+else process.stdout.write('ok');
+`, 'utf8');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({
+      modelRef: 'fixture/provider',
+      execPolicy: {
+        enabled: true,
+        allowedPaths: ['.'],
+        commands: [{ name: 'node-boundary', executable: process.execPath, argsPrefix: [script], maxArgs: 2 }],
+        timeoutSeconds: 1,
+        outputCharCap: 32,
+      },
+    }), 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    try {
+      const outside = await client.request(1, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-boundary', cwd: '..' } });
+      assert.equal(outside.result.isError, true);
+      assert.match(outside.result.content[0].text, /outside allowed workspace|outside execPolicy/);
+      const tooMany = await client.request(2, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-boundary', args: ['a', 'b', 'c'] } });
+      assert.equal(tooMany.result.isError, true);
+      assert.match(tooMany.result.content[0].text, /exceeds command maxArgs=2/);
+      const spam = await client.request(3, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-boundary', args: ['spam'] } });
+      const spamPayload = JSON.parse(spam.result.content[0].text);
+      assert.equal(spam.result.isError, false);
+      assert.equal(spamPayload.outcome, 'success');
+      assert.equal(spamPayload.truncated, true);
+      assert.equal(spamPayload.stdoutChars, 256);
+      assert.ok(spamPayload.stdout.length <= 64);
+      const timeout = await client.request(4, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-boundary', args: ['sleep'], timeout_seconds: 1 } });
+      const timeoutPayload = JSON.parse(timeout.result.content[0].text);
+      assert.equal(timeout.result.isError, true);
+      assert.equal(timeoutPayload.outcome, 'timeout');
+      writeFileSync(dirtyTarget, 'dirty\n', 'utf8');
+      const dirty = await client.request(5, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-boundary', args: ['ok'] } });
+      assert.equal(dirty.result.isError, true);
+      assert.match(dirty.result.content[0].text, /requires a clean Git workspace/);
+    } finally {
+      child.stdin.end();
+      await new Promise((resolve) => child.once('close', resolve));
+    }
+  });
+
+  test('reasonix_exec cancellation terminates the process and reclaims its exclusive slot', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    const script = path.join(root, 'exec-cancel.js');
+    const startedPath = path.join(root, 'exec-cancel-started');
+    writeFileSync(script, `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(startedPath)}, 'started');
+setTimeout(() => process.stdout.write('should-not-finish'), 5000);
+`, 'utf8');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({
+      modelRef: 'fixture/provider',
+      execPolicy: {
+        enabled: true,
+        allowedPaths: ['.'],
+        commands: [{ name: 'node-cancel', executable: process.execPath, argsPrefix: [script], maxArgs: 1 }],
+        timeoutSeconds: 5,
+        outputCharCap: 200,
+      },
+    }), 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    try {
+      const run = client.request(1, 'tools/call', { name: 'reasonix_exec', arguments: { command: 'node-cancel' } });
+      const during = await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 3000;
+        const poll = () => {
+          if (existsSync(startedPath)) {
+            client.request(2, 'tools/call', { name: 'reasonix_status', arguments: {} }).then(resolve, reject);
+          } else if (Date.now() >= deadline) reject(new Error('exec worker did not start'));
+          else setTimeout(poll, 10);
+        };
+        poll();
+      });
+      const status = JSON.parse(during.result.content[0].text);
+      const job = status.jobs.find((entry) => entry.state === 'running' && entry.mode === 'exec');
+      assert.ok(job?.jobId);
+      const cancelled = await client.request(3, 'tools/call', { name: 'reasonix_cancel', arguments: { job_id: job.jobId } });
+      assert.equal(cancelled.result.isError, false);
+      assert.match(cancelled.result.content[0].text, /cancellation requested/);
+      const result = await run;
+      const payload = JSON.parse(result.result.content[0].text);
+      assert.equal(result.result.isError, true);
+      assert.equal(payload.outcome, 'cancelled');
+      const after = await client.request(4, 'tools/call', { name: 'reasonix_status', arguments: {} });
+      const afterStatus = JSON.parse(after.result.content[0].text);
+      const finished = afterStatus.jobs.find((entry) => entry.jobId === job.jobId);
+      assert.equal(finished.state, 'cancelled');
+      assert.equal(afterStatus.exclusiveActive, 0);
+      assert.equal(afterStatus.inFlight, 0);
+    } finally {
+      child.stdin.end();
+      await new Promise((resolve) => child.once('close', resolve));
+    }
   });
 
   test('explicit ACP transport reuses a session and reports bounded transport status', async () => {

@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- `reasonix_exec` controlled command runner: named executable profiles, argv-only invocation with `shell:false`, clean-tree/workspace guards, bounded output, cancellation, mutation detection, redacted structured results, and disabled-by-default policy.
 - ACP-01 newline-delimited JSON-RPC client with capability-gated session lifecycle, prompt update aggregation, cancellation, and process cleanup.
 - ACP-02 opt-in `AcpSessionCoordinator` with bounded deterministic summaries, transactional replacement sessions for compact/rotate, redacted decision telemetry, and explicit stateless fallback.
 - ACP client `session/delete` support with capability gating and local session-set cleanup.

@@ -2,7 +2,7 @@
 
 > **Language**: [English](README.en.md) · [简体中文](README.md)
 
-Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_resume`, `reasonix_cancel`, `reasonix_rollback`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
+Zero-dependency stdio MCP server for Codex. It exposes `reasonix_run`, explicit `reasonix_resume`, `reasonix_cancel`, `reasonix_rollback`, `reasonix_exec`, and `reasonix_status` MCP tools. The worker remains read-only by default; controlled writes require an explicit policy.
 
 Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited release contents.
 
@@ -216,6 +216,30 @@ bridge write authorization remain independent gates.
 When `REASONIX_EXE` points to a Windows `.cmd` or `.bat` shim, the bridge invokes `cmd.exe` explicitly
 with `shell:false`. Arguments containing cmd metacharacters are rejected before process creation;
 this keeps task text out of shell interpretation while preserving normal shim startup.
+
+### Controlled command execution (`reasonix_exec`)
+
+`reasonix_exec` is the first write-then-verify channel and is disabled by default. Enabling it requires
+named command profiles, argument prefixes, workspace-relative paths, and bounded timeout/output values:
+
+```json
+{
+  "execPolicy": {
+    "enabled": true,
+    "allowedPaths": ["tools/reasonix-codex-bridge"],
+    "commands": [{ "name": "bridge-test", "executable": "node", "argsPrefix": ["--test"], "maxArgs": 8 }],
+    "requireCleanTree": true,
+    "timeoutSeconds": 300,
+    "outputCharCap": 12000
+  }
+}
+```
+
+Callers may submit only an allowlisted `command` name and an `args` array. They cannot submit an
+executable, shell string, environment override, or network target. The bridge spawns with
+`shell:false`, requires a verifiable clean Git workspace, and reports exit status, truncation, and
+changed paths after execution. A workspace change returns `workspace_modified` and is never rolled
+back automatically. Status exposes command names, prefixes, and bounded limits, not executable paths.
 
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,

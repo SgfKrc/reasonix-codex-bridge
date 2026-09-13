@@ -13,8 +13,11 @@ import {
   cliSpawnOptions,
   readBridgeConfig,
   doctorRefs,
+  EXEC_HARD_OUTPUT_CHAR_CAP,
+  EXEC_HARD_TIMEOUT_SECONDS_CAP,
   readDoctor,
   resolveCliPath,
+  resolveExecPolicy,
   resolveModelRef,
   resolveSubagent,
   resolveSubagentRole,
@@ -64,6 +67,7 @@ const TOOLS = [
   { name: 'reasonix_resume', description: 'Explicitly resume one durable checkpoint after workspace/configuration drift checks. A checkpoint is one-shot and is never replayed implicitly.', inputSchema: { type: 'object', properties: { checkpoint_id: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, timeout_seconds: { type: 'integer' } }, required: ['checkpoint_id'] } },
   { name: 'reasonix_cancel', description: 'Request cancellation of one queued or running job. Running workers are terminated and the terminal cancellation remains visible in reasonix_status.', inputSchema: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
+  { name: 'reasonix_exec', description: 'Run one explicitly configured command profile through a no-shell argv spawn. The policy is disabled by default, requires a clean Git workspace, and never accepts a caller-provided executable.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' }, maxItems: 128 }, cwd: { type: 'string' }, timeout_seconds: { type: 'integer', minimum: 1 }, output_char_cap: { type: 'integer', minimum: 1 } }, required: ['command'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
 
@@ -149,6 +153,7 @@ const SUBAGENT_NAME = SUBAGENT_ROLE.name ?? SUBAGENT.name;
 const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
 const MODEL_CAPABILITIES = resolveModelCapabilities();
 const WRITE_POLICY = resolveWritePolicy(bridgeConfig);
+const EXEC_POLICY = resolveExecPolicy(bridgeConfig);
 const TRANSPORT = resolveTransport(bridgeConfig);
 if (TRANSPORT.error) log(`warning: ${TRANSPORT.error}; using per-call transport`);
 const rollbackRecords = new Map();
@@ -186,6 +191,50 @@ function resolveCwd(raw) {
   if (!statSync(real).isDirectory()) throw new Error(`cwd is not a directory: ${real}`);
   if (!roots.some((root) => isInside(root, real))) throw new Error(`cwd outside allowed workspace: ${real}`);
   return real;
+}
+
+function execPathLabel(cwd) {
+  const relative = path.relative(WORKSPACE_ROOT, cwd).replaceAll('\\', '/');
+  return relative || '.';
+}
+
+function execCwdAllowed(cwd) {
+  const relative = execPathLabel(cwd);
+  return EXEC_POLICY.allowedPaths.some((allowed) => !allowed || relative === allowed || relative.startsWith(`${allowed}/`));
+}
+
+function gitStatusChanged(before, after) {
+  if (!before?.ok || !after?.ok) return true;
+  const beforeMap = new Map(before.entries.map((entry) => [entry.path, entry.status]));
+  const afterMap = new Map(after.entries.map((entry) => [entry.path, entry.status]));
+  const paths = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+  return [...paths].filter((entry) => beforeMap.get(entry) !== afterMap.get(entry));
+}
+
+function redactExecOutput(value) {
+  let text = String(value ?? '');
+  for (const candidate of [WORKSPACE_ROOT, process.env.USERPROFILE, process.env.HOME]) {
+    if (candidate) text = text.replaceAll(candidate, candidate === WORKSPACE_ROOT ? '<workspace>' : '<user>');
+  }
+  return text.replace(/((?:api[_-]?key|token|secret|password)\s*[=:]\s*)([^\s"'&]+)/giu, '$1[REDACTED]');
+}
+
+function executableCandidates(value) {
+  const text = String(value);
+  if (path.isAbsolute(text) || text.includes('/') || text.includes('\\')) return [path.isAbsolute(text) ? text : path.resolve(WORKSPACE_ROOT, text)];
+  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  if (process.platform !== 'win32') return dirs.map((dir) => path.join(dir, text));
+  const extensions = ['', ...(process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)];
+  return dirs.flatMap((dir) => extensions.map((extension) => path.join(dir, text + extension)));
+}
+
+function resolveExecExecutable(spec) {
+  for (const candidate of executableCandidates(spec.executable)) {
+    try {
+      if (statSync(candidate).isFile()) return realpathSync.native(candidate);
+    } catch { /* try the next PATH candidate */ }
+  }
+  throw new Error(`configured executable is not available for command=${spec.name}`);
 }
 
 function gitStatus(root) {
@@ -501,6 +550,7 @@ function runSummary(entry) {
   return {
     timestamp: new Date().toISOString(),
     mode: entry.mode,
+    operation: entry.operation ?? null,
     transport: entry.transport ?? 'per-call',
     transportFallback: entry.transportFallback ?? null,
     cwdRoot: entry.cwdRoot,
@@ -620,6 +670,61 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
       }
       else finish({ isError: false, text: mode === 'plan' ? body : `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
+  });
+}
+
+async function runExec({ cwd, spec, args, timeoutSeconds, outputCharCap }, cancelRef = null) {
+  const startedAt = Date.now();
+  const beforeStatus = await gitStatus(WORKSPACE_ROOT);
+  if (!beforeStatus.ok) {
+    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'workspace_unverifiable', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: `reasonix_exec requires a verifiable Git workspace: ${beforeStatus.error}`, meta: { outcome: 'workspace_unverifiable', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+  }
+  if (EXEC_POLICY.requireCleanTree && beforeStatus.entries.length) {
+    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'workspace_dirty', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: `reasonix_exec requires a clean Git workspace (${beforeStatus.entries.length} existing change(s)); use an isolated worktree or commit/stash them first.`, meta: { outcome: 'workspace_dirty', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+  }
+  let executable;
+  try { executable = resolveExecExecutable(spec); } catch (error) {
+    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: error.message, meta: { outcome: 'spawn_rejected', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+  }
+  const invocation = cliSpawnCommand(executable, [...spec.argsPrefix, ...args], { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  if (invocation.error) {
+    recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+  }
+  return new Promise((resolve) => {
+    const child = spawn(invocation.file, invocation.args, invocation.options);
+    let stdout = ''; let stderr = ''; let stdoutChars = 0; let stderrChars = 0; let truncatedOutput = false; let settled = false; let cancelRequested = false;
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+    const finish = async (outcome, exitCode = null, signal = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (cancelRef) cancelRef.cancel = null;
+      const afterStatus = await gitStatus(WORKSPACE_ROOT);
+      const changed = gitStatusChanged(beforeStatus, afterStatus);
+      const workspaceModified = changed.length > 0;
+      const finalOutcome = cancelRequested ? 'cancelled' : workspaceModified ? 'workspace_modified' : outcome;
+      const payload = {
+        schema: 'qlh.reasonix.exec.v1', command: spec.name, args: [...args], cwd: execPathLabel(cwd), outcome: finalOutcome,
+        exitCode, signal, elapsedMs: Date.now() - startedAt, stdout: redactExecOutput(stdout), stderr: redactExecOutput(stderr),
+        stdoutChars, stderrChars, truncated: truncatedOutput || stdoutChars > outputCharCap || stderrChars > outputCharCap, changedPaths: changed,
+      };
+      const outputBytes = Buffer.byteLength(stdout, 'utf8') + Buffer.byteLength(stderr, 'utf8');
+      recordRun({ mode: 'exec', operation: spec.name, transport: 'local-exec', cwdRoot: cwdRootLabel(cwd), maxSteps: null, timeoutSeconds, outcome: finalOutcome, exitCode, elapsedMs: payload.elapsedMs, outputBytes, truncated: payload.truncated });
+      resolve({ isError: finalOutcome !== 'success', text: JSON.stringify(payload), meta: { outcome: finalOutcome, transport: 'local-exec', exitCode, elapsedMs: payload.elapsedMs, outputBytes, truncated: payload.truncated } });
+    };
+    const timer = setTimeout(async () => { await terminate(child); await finish('timeout'); }, timeoutSeconds * 1000);
+    if (cancelRef && typeof cancelRef === 'object') {
+      cancelRef.cancel = () => { if (settled || cancelRequested) return; cancelRequested = true; void terminate(child); };
+      if (cancelRef.requested) cancelRef.cancel();
+    }
+    child.stdout.on('data', (chunk) => { stdoutChars += chunk.length; const remaining = Math.max(0, outputCharCap * 2 - stdout.length); if (remaining > 0) stdout += chunk.slice(0, remaining); if (stdoutChars > outputCharCap) truncatedOutput = true; });
+    child.stderr.on('data', (chunk) => { stderrChars += chunk.length; const remaining = Math.max(0, outputCharCap * 2 - stderr.length); if (remaining > 0) stderr += chunk.slice(0, remaining); if (stderrChars > outputCharCap) truncatedOutput = true; });
+    child.once('error', () => { void finish('spawn_error'); });
+    child.once('close', (code, signal) => { void finish(code === 0 ? 'success' : 'nonzero', code, signal); });
   });
 }
 async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task }, cancelRef = null) {
@@ -910,6 +1015,31 @@ function cancelJob(jobId) {
 function jobStatus() {
   return [...jobRecords.values()].map(jobSummary);
 }
+
+function execRequest(args = {}) {
+  const command = typeof args.command === 'string' ? args.command.trim() : '';
+  if (!command) throw new Error('command is required');
+  if (!EXEC_POLICY.enabled) throw new Error('reasonix_exec is disabled; set execPolicy.enabled=true with an explicit command allowlist.');
+  if (EXEC_POLICY.errors.length) throw new Error(`reasonix_exec policy is invalid: ${EXEC_POLICY.errors.join('; ')}`);
+  const spec = EXEC_POLICY.commands.find((entry) => entry.name === command);
+  if (!spec) throw new Error(`reasonix_exec command is not allowlisted: ${command}`);
+  const rawArgs = args.args === undefined ? [] : args.args;
+  if (!Array.isArray(rawArgs)) throw new Error('args must be an array of strings');
+  if (rawArgs.length > spec.maxArgs) throw new Error(`args exceeds command maxArgs=${spec.maxArgs}`);
+  if (rawArgs.some((value) => typeof value !== 'string' || value.length > 4096 || value.includes('\0'))) throw new Error('args must contain strings up to 4096 characters without NUL');
+  let cwd;
+  try {
+    const defaultCwd = EXEC_POLICY.allowedPaths[0] ? path.join(WORKSPACE_ROOT, EXEC_POLICY.allowedPaths[0]) : WORKSPACE_ROOT;
+    cwd = resolveCwd(args.cwd === undefined ? defaultCwd : args.cwd);
+  } catch (error) { throw new Error(`invalid exec cwd: ${error.message}`); }
+  if (!execCwdAllowed(cwd)) throw new Error(`exec cwd is outside execPolicy.allowedPaths: ${execPathLabel(cwd)}`);
+  const timeoutCap = Math.min(EXEC_POLICY.timeoutSeconds, LIMITS.timeoutSecondsCap, EXEC_HARD_TIMEOUT_SECONDS_CAP);
+  const outputCap = Math.min(EXEC_POLICY.outputCharCap, LIMITS.outputCharCap, EXEC_HARD_OUTPUT_CHAR_CAP);
+  const timeoutSeconds = clampInteger(args.timeout_seconds, timeoutCap, timeoutCap);
+  const outputCharCap = clampInteger(args.output_char_cap, outputCap, outputCap);
+  return { cwd, spec, args: [...rawArgs], timeoutSeconds, outputCharCap };
+}
+
 async function callTool(name, args) {
   if (name === 'reasonix_resume') {
     const checkpointId = typeof args?.checkpoint_id === 'string' ? args.checkpoint_id.trim() : '';
@@ -924,7 +1054,18 @@ async function callTool(name, args) {
     if (!record) return explicitRollback(rollbackId);
     return enqueue(() => explicitRollback(rollbackId), { mode: 'rollback', cwdRoot: cwdRootLabel(record.root), maxSteps: null, timeoutSeconds: null });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_exec') {
+    const startedAt = Date.now();
+    let request;
+    try { request = execRequest(args); } catch (error) {
+      recordRun({ mode: 'exec', operation: typeof args?.command === 'string' ? args.command.trim() : null, transport: 'local-exec', cwdRoot: 'unknown', maxSteps: null, timeoutSeconds: null, outcome: 'rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+      return { isError: true, text: error.message, meta: { outcome: 'rejected', transport: 'local-exec', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    }
+    const meta = { mode: 'exec', transport: 'local-exec', cwdRoot: cwdRootLabel(request.cwd), maxSteps: null, timeoutSeconds: request.timeoutSeconds };
+    log(`exec command=${request.spec.name} cwd=${request.cwd} timeout=${request.timeoutSeconds}s`);
+    return enqueue((cancelRef) => runExec(request, cancelRef), meta, { exclusive: true });
+  }
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, errors: WRITE_POLICY.errors }, execPolicy: { configured: EXEC_POLICY.configured, enabled: EXEC_POLICY.enabled && EXEC_POLICY.errors.length === 0, allowedPaths: EXEC_POLICY.allowedPaths.map((entry) => entry || '.'), commands: EXEC_POLICY.commands.map((entry) => ({ name: entry.name, argsPrefix: entry.argsPrefix, maxArgs: entry.maxArgs })), requireCleanTree: EXEC_POLICY.requireCleanTree, timeoutSeconds: EXEC_POLICY.timeoutSeconds, outputCharCap: EXEC_POLICY.outputCharCap, errors: EXEC_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
