@@ -125,7 +125,7 @@ const MODEL_REF_PROBLEM = validateModelRef(MODEL_REF);
 if (MODEL_REF_PROBLEM) {
   refuse(`${MODEL_REF_PROBLEM}: ${MODEL_REF}`, 'fix with: node src/configure.mjs use <provider>/<model>');
 }
-const SUBAGENT_NAME = SUBAGENT.name;
+const SUBAGENT_NAME = SUBAGENT_ROLE.name ?? SUBAGENT.name;
 const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
 const MODEL_CAPABILITIES = resolveModelCapabilities();
 const WRITE_POLICY = resolveWritePolicy(bridgeConfig);
