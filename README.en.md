@@ -98,16 +98,18 @@ Create the named read profile once in the global Reasonix profile directory. The
 
 ```powershell
 reasonix subagent create deepseek-worker --scope global --model "<ref shown by: node src/configure.mjs list>" --prompt-file .\prompts\deepseek-worker-prompt.md
-reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index,git_log,git_diff"
+reasonix subagent edit deepseek-worker --tools "read_file,grep,glob,ls,code_index"
 # `node src/configure.mjs profile --sync --write` can enforce read-only: true and re-check the profile.
 ```
 
 `configure profile` resolves profiles at `%APPDATA%/reasonix/skills/<name>/SKILL.md` on Windows (or `~/.config/reasonix/skills/<name>/SKILL.md` on POSIX). The default `read` role uses the configured `deepseek-worker` name, requires `read-only: true`, and is preview-only unless `--write` is explicit. `--role write` targets a separate `<read-profile>-write` profile (or `REASONIX_WRITE_SUBAGENT`/`writeSubagent`), uses `prompts/deepseek-worker-write-prompt.md`, and requires that no `read-only` field is present. Both roles re-read the profile after an explicit write and fail closed on model or tool drift. Set `REASONIX_SKILLS_DIR` to a temporary skills root for offline tests or isolated setup.
 
-The canonical read-only profile tool set is `read_file, grep, glob, ls, code_index, git_log, git_diff`.
-`git_log` and `git_diff` are inspection-only viewers; no write, commit, checkout, reset, network, or
-shell tool is allowed. `configure verify` prints the installed `allowed-tools` list and fails when
-it differs from this documented set.
+The canonical read-only profile tool set is `read_file, grep, glob, ls, code_index`.
+Reasonix v1.38.7 does not recognize `git_log` or `git_diff` as profile tool identities; the host
+agent reviews Git history and diffs through its MCP or controlled command channel. No write, commit,
+checkout, reset, network, or shell tool is allowed. `configure verify` prints the installed
+`allowed-tools` list and fails when it differs from this documented set or when Reasonix doctor
+reports an unknown profile tool identity.
 
 The canonical write profile adds only `edit_file` and `write_file` to that read set. It has no
 `read-only` field and still has no shell, network, commit, checkout, reset, or delete tool. Creating

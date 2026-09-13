@@ -16,6 +16,8 @@ import {
   cliSpawnCommand,
   doctorCachePath,
   doctorRefs,
+  doctorUnknownToolReferences,
+  doctorWarnings,
   parseProfileFrontmatter,
   parseVersion,
   READ_ONLY_PROFILE_TOOLS,
@@ -84,11 +86,11 @@ function envFor(root, overrides = {}) {
   };
 }
 
-function writeCliFiles(root, { version = '1.38.7', contextWindow = 4096, vision = true } = {}) {
+function writeCliFiles(root, { version = '1.38.7', contextWindow = 4096, vision = true, warnings = [] } = {}) {
   writeFileSync(path.join(root, 'doctor'), `
 const args = process.argv.slice(2);
 if (args.includes('--json')) {
-  process.stdout.write(JSON.stringify({ version: ${JSON.stringify(version)}, config: { default_model: 'fixture/provider' }, providers: [{ name: 'fixture', models: ['provider'], key_present: true, base_url_host: 'fixture.invalid', context_window: ${contextWindow}, vision: ${vision} }] }));
+  process.stdout.write(JSON.stringify({ version: ${JSON.stringify(version)}, config: { default_model: 'fixture/provider' }, providers: [{ name: 'fixture', models: ['provider'], key_present: true, base_url_host: 'fixture.invalid', context_window: ${contextWindow}, vision: ${vision} }], warnings: ${JSON.stringify(warnings)} }));
 }
 `, 'utf8');
   writeFileSync(path.join(root, 'subagent'), `
@@ -99,7 +101,7 @@ if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) 
   const model = modelIndex >= 0 ? args[modelIndex + 1] : (process.env.PROFILE_MODEL || 'fixture/provider');
   const name = args[2] || 'deepseek-worker';
   const toolsIndex = args.indexOf('--tools');
-  const tools = toolsIndex >= 0 ? args[toolsIndex + 1].split(',').join(', ') : 'read_file, grep, glob, ls, code_index, git_log, git_diff';
+  const tools = toolsIndex >= 0 ? args[toolsIndex + 1].split(',').join(', ') : 'read_file, grep, glob, ls, code_index';
   const lines = ['---', 'name: ' + name, 'description: Fixture worker', 'model: ' + model, 'allowed-tools: [' + tools + ']'];
   if ((!name.endsWith('-write') && process.env.PROFILE_READ_ONLY !== '0') || (name.endsWith('-write') && process.env.PROFILE_WRITE_READ_ONLY === '1')) lines.push('read-only: true');
   lines.push('---', '', '# fixture');
@@ -113,7 +115,7 @@ if ((args[0] === 'edit' || args[0] === 'create') && process.env.PROFILE_TARGET) 
 function writeProfile(root, model = 'fixture/provider', readOnly = true) {
   const dir = path.join(root, 'skills', 'deepseek-worker');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, 'allowed-tools: [read_file, grep, glob, ls, code_index, git_log, git_diff]', `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
+  writeFileSync(path.join(dir, 'SKILL.md'), ['---', 'name: deepseek-worker', 'description: Fixture worker', `model: ${model}`, 'allowed-tools: [read_file, grep, glob, ls, code_index]', `read-only: ${readOnly}`, '---', '', '# fixture'].join('\n'), 'utf8');
   return path.join(dir, 'SKILL.md');
 }
 
@@ -374,6 +376,20 @@ describe('configuration pure functions', () => {
     assert.equal(result.refs[2].keyPresent, false);
   });
 
+  test('preserves and scopes Reasonix unknown-tool diagnostics', () => {
+    const doctor = {
+      warnings: [
+        'skill "deepseek-worker" allowed-tools reference "git_log" is not a known tool identity',
+        'skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known tool identity',
+        'unrelated warning',
+      ],
+    };
+    assert.equal(doctorWarnings(doctor).length, 3);
+    assert.deepEqual(doctorUnknownToolReferences(doctor, 'deepseek-worker'), [doctor.warnings[0]]);
+    assert.deepEqual(doctorUnknownToolReferences(doctor, 'deepseek-worker-write'), [doctor.warnings[1]]);
+    assert.deepEqual(doctorUnknownToolReferences(doctor, 'other'), []);
+  });
+
   test('caches doctor inventory, expires it, and invalidates on CLI changes', () => {
     const root = tempRoot();
     const cli = writeVersionStub(root, '1.38.7');
@@ -382,6 +398,7 @@ describe('configuration pure functions', () => {
     assert.equal(first.cache, 'miss');
     assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).schema, 1);
     assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).data.providers[0].name, 'fixture');
+    assert.deepEqual(JSON.parse(readFileSync(cachePath, 'utf8')).data.warnings, []);
     const second = readDoctor(cli, 30_000, { cachePath });
     assert.equal(second.cache, 'hit');
 
@@ -412,7 +429,7 @@ describe('configuration pure functions', () => {
     assert.deepEqual(profile.tools, ['read_file', 'grep']);
     assert.equal(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').fields.description, 'workers #1');
     assert.deepEqual(parseProfileFrontmatter('---\ndescription: "workers #1"\nallowed-tools:\n  - read_file\n  - grep\n---\n').tools, ['read_file', 'grep']);
-    assert.deepEqual(READ_ONLY_PROFILE_TOOLS, ['read_file', 'grep', 'glob', 'ls', 'code_index', 'git_log', 'git_diff']);
+    assert.deepEqual(READ_ONLY_PROFILE_TOOLS, ['read_file', 'grep', 'glob', 'ls', 'code_index']);
     assert.deepEqual(WRITE_PROFILE_TOOLS, [...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
   });
 
@@ -631,7 +648,20 @@ describe('offline command contracts', () => {
     const after = runNode([CONFIGURE_PATH, 'verify'], root, profileEnv);
     assert.equal(after.status, 0, after.stderr);
     assert.match(after.stdout, /installed and consistent/);
-    assert.match(after.stdout, /tools: read_file,grep,glob,ls,code_index,git_log,git_diff/);
+    assert.match(after.stdout, /tools: read_file,grep,glob,ls,code_index/);
+  });
+
+  test('verify fails when Reasonix doctor reports an unknown tool for the selected profile', () => {
+    const root = tempRoot();
+    writeCliFiles(root, {
+      warnings: ['skill "deepseek-worker" allowed-tools reference "git_log" is not a known tool identity'],
+    });
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider' }), 'utf8');
+    writeProfile(root);
+    const result = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_SKILLS_DIR: path.join(root, 'skills') });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /FAIL Reasonix capability diagnostics: .*git_log/);
+    assert.match(result.stdout, /OK   subagent profile: deepseek-worker/);
   });
 
   test('write profile is separate, explicit, and has no read-only guard', () => {
@@ -682,10 +712,10 @@ describe('offline command contracts', () => {
     const root = tempRoot();
     writeCliFiles(root);
     const profileFile = writeProfile(root);
-    writeFileSync(profileFile, readFileSync(profileFile, 'utf8').replace(', git_log, git_diff', ''), 'utf8');
+    writeFileSync(profileFile, readFileSync(profileFile, 'utf8').replace(', code_index', ''), 'utf8');
     const result = runNode([CONFIGURE_PATH, 'verify'], root, { REASONIX_SKILLS_DIR: path.join(root, 'skills') });
     assert.equal(result.status, 1);
-    assert.match(result.stdout, /subagent profile drift: allowed-tools=.*expected .*git_diff,git_log/);
+    assert.match(result.stdout, /subagent profile drift: allowed-tools=.*expected .*code_index/);
   });
 
   test('profile --create --write adds the read-only guard after CLI creation', () => {

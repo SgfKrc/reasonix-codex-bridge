@@ -19,8 +19,8 @@
 
 ## 允许的只读工具
 
-profile 的 `allowed-tools` 固定为 `read_file, grep, glob, ls, code_index, git_log, git_diff`。
-其中 `git_log` 与 `git_diff` 只用于查看历史和差异；不得使用写入、提交、checkout、reset、网络或 shell 工具。
+profile 的 `allowed-tools` 固定为 `read_file, grep, glob, ls, code_index`。
+Reasonix v1.38.7 不识别 `git_log` 与 `git_diff` 这两个 profile 身份；Git 历史和差异由主 agent 通过 host/MCP 或受控命令执行通道审查。不得使用写入、提交、checkout、reset、网络或 shell 工具。
 
 ## continuation cursor 约束
 

@@ -7,6 +7,7 @@ All notable changes to this project are documented here.
 ### Added
 
 - `reasonix_exec` controlled command runner: named executable profiles, argv-only invocation with `shell:false`, clean-tree/workspace guards, bounded output, cancellation, mutation detection, redacted structured results, and disabled-by-default policy.
+- Aligned the canonical read/write profile tool sets with Reasonix v1.38.7 by removing unknown `git_log`/`git_diff` identities; `configure verify` now fails on matching doctor warnings.
 - ACP-01 newline-delimited JSON-RPC client with capability-gated session lifecycle, prompt update aggregation, cancellation, and process cleanup.
 - ACP-02 opt-in `AcpSessionCoordinator` with bounded deterministic summaries, transactional replacement sessions for compact/rotate, redacted decision telemetry, and explicit stateless fallback.
 - ACP client `session/delete` support with capability gating and local session-set cleanup.
@@ -38,7 +39,7 @@ All notable changes to this project are documented here.
 - Read-only `plan` mode with machine-readable worker output and hard-disabled `implement` mode.
 - ACP transport design prototype with transactional compact, rotate, and per-call fallback rules.
 - Provider capability status with context-window preflight rejection.
-- Canonical read-only profile tools: `read_file`, `grep`, `glob`, `ls`, `code_index`, `git_log`, and `git_diff`.
+- Canonical read-only profile tools: `read_file`, `grep`, `glob`, `ls`, and `code_index`.
 - Offline CI checks and local README link validation.
 
 ### Security
