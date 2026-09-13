@@ -22,6 +22,15 @@ import {
   resolveWorkspaceRoot,
   validateModelRef,
 } from './config.mjs';
+import {
+  consumeCheckpoint,
+  countReadyCheckpoints,
+  fingerprint,
+  isCheckpointId,
+  readCheckpoint,
+  resolveCheckpointDir,
+  writeCheckpoint,
+} from './checkpoint.mjs';
 
 function log(message) { process.stderr.write(`[${SERVER_NAME}] ${message}\n`); }
 function refuse(reason, hint) {
@@ -46,6 +55,7 @@ const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(pro
 
 const TOOLS = [
   { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. max_steps is the raw Reasonix budget; tool_rounds is the preferred tool-call-round budget.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
+  { name: 'reasonix_resume', description: 'Explicitly resume one durable checkpoint after workspace/configuration drift checks. A checkpoint is one-shot and is never replayed implicitly.', inputSchema: { type: 'object', properties: { checkpoint_id: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, timeout_seconds: { type: 'integer' } }, required: ['checkpoint_id'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
@@ -106,6 +116,9 @@ if (VERSION_CHECK.warning) log(`warning: ${VERSION_CHECK.warning}`);
 if (VERSION_CHECK.status === 'unknown') log(`warning: Reasonix CLI version check unknown (${VERSION_CHECK.error})`);
 
 const WORKSPACE_ROOT = resolveWorkspaceRoot(bridgeConfig);
+const CHECKPOINT_DIR = resolveCheckpointDir(process.env.BRIDGE_CHECKPOINT_DIR || bridgeConfig.data?.checkpointDir);
+const CHECKPOINT_ENABLED = !isInside(WORKSPACE_ROOT, CHECKPOINT_DIR);
+if (!CHECKPOINT_ENABLED) log('warning: checkpoint directory is inside the workspace; durable checkpoints disabled to avoid dirtying the Git tree');
 const SUBAGENT = resolveSubagent(bridgeConfig);
 let SUBAGENT_ROLE;
 try {
@@ -195,6 +208,71 @@ function gitStatus(root) {
       resolve({ ok: true, entries, error: '' });
     });
   });
+}
+function checkpointConfigFingerprint() {
+  return fingerprint({
+    modelRef: MODEL_REF,
+    subagent: SUBAGENT_NAME,
+    role: SUBAGENT_ROLE.role,
+    reasonixVersion: VERSION_CHECK.version || 'unknown',
+    limits: LIMITS,
+  });
+}
+async function checkpointWorkspaceSnapshot() {
+  const status = await gitStatus(WORKSPACE_ROOT);
+  const head = runGitSync(WORKSPACE_ROOT, ['rev-parse', 'HEAD']);
+  return {
+    rootFingerprint: fingerprint(WORKSPACE_ROOT),
+    gitAvailable: status.ok && head.ok,
+    gitHead: status.ok && head.ok ? head.stdout.trim() : null,
+    gitStatusFingerprint: status.ok ? fingerprint(status.entries) : null,
+  };
+}
+function checkpointWorkspaceDrift(expected, current) {
+  if (!expected || expected.rootFingerprint !== current.rootFingerprint) return 'workspace identity changed';
+  if (expected.gitAvailable !== current.gitAvailable) return 'Git availability changed';
+  if (expected.gitAvailable && (expected.gitHead !== current.gitHead || expected.gitStatusFingerprint !== current.gitStatusFingerprint)) return 'Git HEAD or working tree changed';
+  return '';
+}
+function checkpointableOutcome(outcome) {
+  return ['timeout', 'worker_exit', 'step_limit', 'cursor_error'].includes(outcome);
+}
+async function createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode, stepLimitRounds, cursorError, parentCheckpointId = null }) {
+  if (!CHECKPOINT_ENABLED || !isInside(WORKSPACE_ROOT, cwd)) return null;
+  try {
+    const workspace = await checkpointWorkspaceSnapshot();
+    const relativeCwd = path.relative(WORKSPACE_ROOT, cwd).replaceAll('\\', '/') || '.';
+    const record = writeCheckpoint(CHECKPOINT_DIR, {
+      createdAt: new Date().toISOString(),
+      mode,
+      task,
+      cwd: relativeCwd,
+      maxSteps,
+      timeoutSeconds,
+      outcome,
+      exitCode,
+      stepLimitRounds: Number.isInteger(stepLimitRounds) ? stepLimitRounds : null,
+      cursorError: cursorError === true,
+      parentCheckpointId: isCheckpointId(parentCheckpointId) ? parentCheckpointId : null,
+      reasonixVersion: VERSION_CHECK.version || null,
+      configFingerprint: checkpointConfigFingerprint(),
+      workspace,
+    });
+    return record.id;
+  } catch (error) {
+    log(`checkpoint disabled for this failure: ${error?.message ?? error}`);
+    return null;
+  }
+}
+async function validateCheckpointForResume(checkpoint) {
+  if (checkpoint.configFingerprint !== checkpointConfigFingerprint()) return 'bridge configuration or selected profile changed';
+  const workspace = await checkpointWorkspaceSnapshot();
+  return checkpointWorkspaceDrift(checkpoint.workspace, workspace);
+}
+function resumeTask(checkpoint) {
+  const task = `Continue the previous task from the current workspace. The prior explicit run ended with ${checkpoint.outcome}. Inspect current state first, do not restart completed work, and do not reuse or edit any continuation cursor.\n\nOriginal task:\n${checkpoint.task}`;
+  if (task.length > TASK_CHAR_CAP) throw new Error(`resumed task exceeds ${TASK_CHAR_CAP} chars`);
+  return task;
 }
 function changedEntries(before, after) {
   const beforeMap = new Map(before.map((entry) => [entry.path, entry.status]));
@@ -442,7 +520,7 @@ function terminate(child) {
   child.kill('SIGKILL');
   return Promise.resolve();
 }
-function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true } = {}) {
+function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true, checkpoint = mode !== 'implement', parentCheckpointId = null } = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
@@ -465,12 +543,17 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
     const timer = setTimeout(async () => {
       if (settled) return;
       await terminate(child);
-      finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}` }, 'timeout');
+      if (settled) return;
+      const checkpointId = checkpoint
+        ? await createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome: 'timeout', exitCode: null, parentCheckpointId })
+        : null;
+      const suffix = checkpointId ? `\n\ncheckpoint_id=${checkpointId}; call reasonix_resume to continue explicitly.` : '';
+      finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}${suffix}` }, 'timeout', null, checkpointId ? { checkpointId } : {});
     }, timeoutSeconds * 1000);
     child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > outputCharCap * 2) { truncatedOutput = true; void terminate(child); } });
     child.stderr.on('data', (chunk) => { stderr += chunk; if (stderr.length > outputCharCap) { truncatedOutput = true; void terminate(child); } });
     child.on('error', (error) => finish({ isError: true, text: `cannot start reasonix CLI: ${error.message}` }, 'spawn_error'));
-    child.on('close', (code) => {
+    child.on('close', async (code) => {
       if (settled) return;
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(mode === 'plan' ? stdout : stdout.trim(), outputCharCap);
       if (code !== 0) {
@@ -482,9 +565,13 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
           : stepLimitRounds === null
             ? `worker exited with code ${code} (${elapsed}s)`
             : `worker reached Reasonix max_steps=${maxSteps} after ${stepLimitRounds} tool-call rounds (${elapsed}s); timeout_seconds=${timeoutSeconds} was not reached. Increase max_steps or pass tool_rounds.`;
-        const extra = { ...(stepLimitRounds === null ? {} : { stepLimitRounds }), ...(cursorError ? { cursorError: true } : {}) };
+        const checkpointId = checkpoint
+          ? await createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: code, stepLimitRounds, cursorError, parentCheckpointId })
+          : null;
+        const extra = { ...(stepLimitRounds === null ? {} : { stepLimitRounds }), ...(cursorError ? { cursorError: true } : {}), ...(checkpointId ? { checkpointId } : {}) };
         const stderrBody = cursorError ? '[cursor diagnostic redacted]' : truncate(stderr, 2000);
-        finish({ isError: true, text: `${prefix}${body ? `\n\n--- stdout ---\n${body}` : ''}${stderrBody ? `\n\n--- stderr ---\n${stderrBody}` : ''}` }, outcome, code, extra);
+        const suffix = checkpointId ? `\n\ncheckpoint_id=${checkpointId}; call reasonix_resume to continue explicitly.` : '';
+        finish({ isError: true, text: `${prefix}${body ? `\n\n--- stdout ---\n${body}` : ''}${stderrBody ? `\n\n--- stderr ---\n${stderrBody}` : ''}${suffix}` }, outcome, code, extra);
       }
       else finish({ isError: false, text: mode === 'plan' ? body : `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
@@ -523,18 +610,50 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
       : `worker failed: ${result.text}`;
     const rollbackText = rollback.ok ? 'rollback completed' : `rollback failed: ${rollback.error}`;
     const outcome = disallowed.length ? 'write_rejected' : (result.meta?.outcome ?? 'worker_exit');
+    const checkpointId = !disallowed.length && rollback.ok && checkpointableOutcome(outcome)
+      ? await createRunCheckpoint({ mode: 'implement', task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, stepLimitRounds: result.meta?.stepLimitRounds, cursorError: result.meta?.cursorError })
+      : null;
     recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, outcome } };
+    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, ...(checkpointId ? { checkpoint_id: checkpointId } : {}), outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, outcome, ...(checkpointId ? { checkpointId } : {}) } };
   }
   if (result.isError) {
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: result.meta?.outcome ?? 'worker_exit', exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
-    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome: result.meta?.outcome ?? 'worker_exit', error: 'worker failed; no changes were retained', changes: [] }), meta: result.meta };
+    const outcome = result.meta?.outcome ?? 'worker_exit';
+    const checkpointId = checkpointableOutcome(outcome)
+      ? await createRunCheckpoint({ mode: 'implement', task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, stepLimitRounds: result.meta?.stepLimitRounds, cursorError: result.meta?.cursorError })
+      : null;
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, ...(checkpointId ? { checkpoint_id: checkpointId } : {}), outcome, error: 'worker failed; no changes were retained', changes: [] }), meta: { ...result.meta, ...(checkpointId ? { checkpointId } : {}) } };
   }
   const changeSet = await buildChangeSet(WORKSPACE_ROOT, changed);
   const rollbackId = rememberRollback(WORKSPACE_ROOT, changeSet.changes);
   changeSet.rollback_id = rollbackId;
   recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
   return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, outcome: 'success', rollbackId } };
+}
+async function resumeCheckpoint(checkpointId, args = {}) {
+  if (!CHECKPOINT_ENABLED) return { isError: true, text: 'checkpoint resume is disabled because the checkpoint directory is inside the workspace.' };
+  const loaded = readCheckpoint(CHECKPOINT_DIR, checkpointId);
+  if (!loaded.ok) return { isError: true, text: `cannot resume checkpoint: ${loaded.error}` };
+  const checkpoint = loaded.value;
+  if (checkpoint.status !== 'ready') return { isError: true, text: 'cannot resume checkpoint: checkpoint has already been consumed' };
+  if (!['inspect', 'review', 'plan', 'implement'].includes(checkpoint.mode)) return { isError: true, text: 'cannot resume checkpoint: mode is invalid' };
+  let cwd;
+  try { cwd = resolveCwd(checkpoint.cwd); } catch (error) { return { isError: true, text: `cannot resume checkpoint: ${error.message}` }; }
+  const drift = await validateCheckpointForResume(checkpoint);
+  if (drift) return { isError: true, text: `cannot resume checkpoint: ${drift}` };
+  if (checkpoint.mode !== 'implement' && SUBAGENT_ROLE.role !== 'read') return { isError: true, text: `resume mode=${checkpoint.mode} requires a read-role subagent; selected role is ${SUBAGENT_ROLE.role}.` };
+  if (checkpoint.mode === 'implement' && SUBAGENT_ROLE.role !== 'write') return { isError: true, text: 'resume mode=implement requires an explicit write-role subagent.' };
+  let task;
+  try { task = resumeTask(checkpoint); } catch (error) { return { isError: true, text: `cannot resume checkpoint: ${error.message}` }; }
+  const maxToolRounds = Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND);
+  const maxSteps = args.tool_rounds === undefined
+    ? clampInteger(args.max_steps, checkpoint.maxSteps, LIMITS.maxStepsCap)
+    : clampInteger(args.tool_rounds, Math.ceil(checkpoint.maxSteps / REASONIX_STEPS_PER_TOOL_ROUND), maxToolRounds) * REASONIX_STEPS_PER_TOOL_ROUND;
+  const timeoutSeconds = clampInteger(args.timeout_seconds, checkpoint.timeoutSeconds, LIMITS.timeoutSecondsCap);
+  try { consumeCheckpoint(CHECKPOINT_DIR, checkpoint); } catch (error) { return { isError: true, text: `cannot resume checkpoint: could not mark it consumed (${error.message})` }; }
+  return checkpoint.mode === 'implement'
+    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task })
+    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode: checkpoint.mode }, { parentCheckpointId: checkpoint.id });
 }
 function estimateTaskTokens(task) {
   return Math.max(1, Math.ceil(Buffer.byteLength(task, 'utf8') / 4));
@@ -559,13 +678,17 @@ function enqueue(job, meta) {
   return run.finally(() => { queueDepth -= 1; });
 }
 async function callTool(name, args) {
+  if (name === 'reasonix_resume') {
+    const checkpointId = typeof args?.checkpoint_id === 'string' ? args.checkpoint_id.trim() : '';
+    return enqueue(() => resumeCheckpoint(checkpointId, args), { mode: 'resume', cwdRoot: 'workspace', maxSteps: null, timeoutSeconds: null });
+  }
   if (name === 'reasonix_rollback') {
     const rollbackId = typeof args?.rollback_id === 'string' ? args.rollback_id.trim() : '';
     const record = rollbackRecords.get(rollbackId);
     if (!record) return explicitRollback(rollbackId);
     return enqueue(() => explicitRollback(rollbackId), { mode: 'rollback', cwdRoot: cwdRootLabel(record.root), maxSteps: null, timeoutSeconds: null });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
