@@ -339,6 +339,32 @@ export function doctorRefs(doctor) {
   return { refs, defaultRef };
 }
 
+/**
+ * Detect only an explicit provider-native web_search declaration. An absent
+ * declaration is deliberately unavailable: the bridge must not infer search
+ * support from a model name or fabricate a backend.
+ */
+export function resolveProviderSearchCapability(doctor, modelRef = '') {
+  const selectedProvider = typeof modelRef === 'string' && modelRef.includes('/') ? modelRef.slice(0, modelRef.indexOf('/')).trim() : '';
+  const providers = Array.isArray(doctor?.providers) ? doctor.providers : [];
+  for (const provider of providers) {
+    if (!provider || typeof provider !== 'object') continue;
+    if (selectedProvider && provider.name !== selectedProvider) continue;
+    const declarations = [
+      provider.web_search,
+      provider.webSearch,
+      provider.capabilities?.web_search,
+      provider.capabilities?.webSearch,
+      provider.tools?.web_search,
+      provider.tools?.webSearch,
+    ];
+    const explicit = declarations.find((value) => typeof value === 'boolean');
+    if (explicit === true) return { owner: 'provider', tool: 'web_search', available: true, status: 'available', reason: null };
+    if (explicit === false) return { owner: 'provider', tool: 'web_search', available: false, status: 'unavailable', reason: 'provider_reported_unavailable' };
+  }
+  return { owner: 'provider', tool: 'web_search', available: false, status: 'unavailable', reason: 'provider_capability_not_advertised' };
+}
+
 export function readBridgeConfig(configPath = BRIDGE_CONFIG_PATH) {
   if (!isFile(configPath)) return { path: configPath, exists: false, data: {} };
   let text;

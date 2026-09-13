@@ -19,6 +19,7 @@ import {
   resolveCliPath,
   resolveExecPolicy,
   resolveModelRef,
+  resolveProviderSearchCapability,
   resolveSubagent,
   resolveSubagentRole,
   resolveTransport,
@@ -151,7 +152,11 @@ if (MODEL_REF_PROBLEM) {
 }
 const SUBAGENT_NAME = SUBAGENT_ROLE.name ?? SUBAGENT.name;
 const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
-const MODEL_CAPABILITIES = resolveModelCapabilities();
+const MODEL_DOCTOR = MODEL_RESOLUTION.doctor?.ok
+  ? MODEL_RESOLUTION.doctor
+  : readDoctor(CLI_PATH, 30_000, { writeCache: false });
+const PROVIDER_SEARCH = resolveProviderSearchCapability(MODEL_DOCTOR?.data, MODEL_REF);
+const MODEL_CAPABILITIES = resolveModelCapabilities(MODEL_DOCTOR);
 const WRITE_POLICY = resolveWritePolicy(bridgeConfig);
 const EXEC_POLICY = resolveExecPolicy(bridgeConfig);
 const TRANSPORT = resolveTransport(bridgeConfig);
@@ -159,10 +164,8 @@ if (TRANSPORT.error) log(`warning: ${TRANSPORT.error}; using per-call transport`
 const rollbackRecords = new Map();
 const MAX_ROLLBACK_RECORDS = 32;
 
-function resolveModelCapabilities() {
-  const doctor = MODEL_RESOLUTION.doctor?.ok
-    ? MODEL_RESOLUTION.doctor
-    : readDoctor(CLI_PATH, 30_000, { writeCache: false });
+function resolveModelCapabilities(doctorResult = MODEL_DOCTOR) {
+  const doctor = doctorResult;
   if (!doctor?.ok) return { available: false, provider: null, model: null, contextWindow: null, vision: null, base_url_host: null, error: doctor?.error || 'reasonix doctor unavailable' };
   const selected = doctorRefs(doctor.data).refs.find((item) => item.ref === MODEL_REF);
   if (!selected) return { available: false, provider: null, model: null, contextWindow: null, vision: null, base_url_host: null, error: 'selected model is not reported by reasonix doctor' };
@@ -1065,7 +1068,7 @@ async function callTool(name, args) {
     log(`exec command=${request.spec.name} cwd=${request.cwd} timeout=${request.timeoutSeconds}s`);
     return enqueue((cancelRef) => runExec(request, cancelRef), meta, { exclusive: true });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, errors: WRITE_POLICY.errors }, execPolicy: { configured: EXEC_POLICY.configured, enabled: EXEC_POLICY.enabled && EXEC_POLICY.errors.length === 0, allowedPaths: EXEC_POLICY.allowedPaths.map((entry) => entry || '.'), commands: EXEC_POLICY.commands.map((entry) => ({ name: entry.name, argsPrefix: entry.argsPrefix, maxArgs: entry.maxArgs })), requireCleanTree: EXEC_POLICY.requireCleanTree, timeoutSeconds: EXEC_POLICY.timeoutSeconds, outputCharCap: EXEC_POLICY.outputCharCap, errors: EXEC_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, providerSearch: PROVIDER_SEARCH, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, errors: WRITE_POLICY.errors }, execPolicy: { configured: EXEC_POLICY.configured, enabled: EXEC_POLICY.enabled && EXEC_POLICY.errors.length === 0, allowedPaths: EXEC_POLICY.allowedPaths.map((entry) => entry || '.'), commands: EXEC_POLICY.commands.map((entry) => ({ name: entry.name, argsPrefix: entry.argsPrefix, maxArgs: entry.maxArgs })), requireCleanTree: EXEC_POLICY.requireCleanTree, timeoutSeconds: EXEC_POLICY.timeoutSeconds, outputCharCap: EXEC_POLICY.outputCharCap, errors: EXEC_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);

@@ -177,6 +177,12 @@ the bridge estimates task tokens from UTF-8 bytes and rejects a task whose estim
 reported context window, with the concrete estimate and limit in the error. Capability discovery
 is read-only and does not write the doctor cache during bridge startup.
 
+`reasonix_status.providerSearch` is a fail-closed summary for provider-native `web_search`. When
+the selected provider does not explicitly advertise search, it returns `status=unavailable` with
+`reason=provider_capability_not_advertised`; the bridge does not build a search backend or treat
+model prose as search results. If a provider is later connected, `reasonix_run` continues to pass
+through only the Reasonix result, including any summary, sources, and truncation state.
+
 `reasonix_run` also accepts read-only `mode=plan`. In this mode the bridge returns worker stdout
 unchanged so callers can consume a machine-readable change list, for example:
 

@@ -119,6 +119,8 @@ worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必�
 
 状态里还会暴露 `reasonix doctor` 报告的选中 provider/model 能力：`contextWindow`、`vision` 与 provider 的脱敏 `base_url_host`。启动 worker 之前，桥接器按 UTF-8 字节估算任务 token 量，超过报告的上下文窗口即拒绝，并在错误里给出具体估算与上限。能力探测是只读的，桥接器启动时不会写 doctor 缓存。
 
+`reasonix_status.providerSearch` 是 provider 原生 `web_search` 的 fail-closed 能力摘要。当前 provider 未显式声明搜索能力时返回 `status=unavailable` 与 `reason=provider_capability_not_advertised`；bridge 不自建搜索后端，也不把模型文本推断当作搜索结果。若将来 provider 明确接通，`reasonix_run` 仍只原样透传 Reasonix 返回的摘要/来源/截断状态。
+
 `reasonix_run` 还接受只读的 `mode=plan`。该模式下桥接器**原样**返回 worker 的 stdout，便于调用方消费机器可读的改动清单，例如：
 
 ```json
