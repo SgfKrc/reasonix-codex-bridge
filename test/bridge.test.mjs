@@ -925,6 +925,42 @@ process.stdout.write('implemented');
     }
   });
 
+  test('rollback restores a staged rename without treating its destination as modified', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['source.txt', 'renamed.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'source.txt'), 'rename me', 'utf8');
+    writeFileSync(path.join(root, 'subagent'), `
+const { spawnSync } = require('node:child_process');
+const path = require('node:path');
+const root = process.env.WORKSPACE;
+const rename = spawnSync('git', ['-C', root, 'mv', 'source.txt', 'renamed.txt'], { encoding: 'utf8' });
+if (rename.status !== 0) { process.stderr.write(rename.stderr || 'git mv failed'); process.exit(rename.status || 1); }
+process.stdout.write('renamed');
+`, 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      cwd: root,
+      env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WORKSPACE: root }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const client = mcpClient(child);
+    try {
+      const writeResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'rename source.txt to renamed.txt', mode: 'implement' } });
+      const changeSet = JSON.parse(writeResponse.result.content[0].text);
+      assert.equal(writeResponse.result.isError, false);
+      assert.deepEqual(changeSet.changes.map((change) => [change.path, change.kind]), [['renamed.txt', 'added'], ['source.txt', 'deleted']]);
+      const rollbackResponse = await client.request(2, 'tools/call', { name: 'reasonix_rollback', arguments: { rollback_id: changeSet.rollback_id } });
+      assert.equal(rollbackResponse.result.isError, false, rollbackResponse.result.content[0].text);
+      assert.equal(readFileSync(path.join(root, 'source.txt'), 'utf8'), 'rename me');
+      assert.equal(existsSync(path.join(root, 'renamed.txt')), false);
+    } finally {
+      child.stdin.end();
+      await new Promise((resolve) => child.once('close', resolve));
+    }
+  });
+
   test('implement rolls back a change outside the whitelist', async () => {
     const root = tempRoot();
     writeCliFiles(root);

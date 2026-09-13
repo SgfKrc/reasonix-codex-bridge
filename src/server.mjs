@@ -213,6 +213,12 @@ async function rollbackEntries(root, entries) {
     });
   }
   for (const relativePath of untracked) {
+    // A worker may stage a rename/copy destination. Unstage it before removing
+    // the worktree path, otherwise the index keeps the rename alive.
+    if (runGitSync(root, ['ls-files', '--error-unmatch', '--', relativePath]).ok) {
+      const reset = runGitSync(root, ['reset', '--', relativePath]);
+      if (!reset.ok) errors.push(`unstage ${relativePath}: ${reset.error}`);
+    }
     try { rmSync(path.join(root, relativePath), { recursive: true, force: true }); } catch (error) { errors.push(`remove ${relativePath}: ${error.message}`); }
   }
   return { ok: errors.length === 0, error: errors.join('; ') };
@@ -284,7 +290,10 @@ function gitDiffStat(root, paths) {
 }
 function changeKind(entry) {
   if (entry.status.includes('D')) return 'deleted';
-  if (entry.status.includes('A') || entry.status.includes('?')) return 'added';
+  // For rename/copy status, Git reports the destination first and the source
+  // as a separate deleted entry. Treat the destination like an added path so
+  // rollback removes it instead of looking for a nonexistent HEAD blob.
+  if (entry.status.includes('A') || entry.status.includes('?') || entry.status.includes('R') || entry.status.includes('C')) return 'added';
   return 'modified';
 }
 async function buildChangeSet(root, entries, rollbackId = null) {
