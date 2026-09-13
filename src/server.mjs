@@ -50,7 +50,9 @@ const TASK_CHAR_CAP = 8000;
 const HARD_OUTPUT_CHAR_CAP = 24000;
 const HARD_QUEUE_CAP = 5;
 const HISTORY_HARD_CAP_BYTES = 128 * 1024 * 1024;
-const MODES = { inspect: { maxSteps: 24, timeoutSeconds: 180 }, review: { maxSteps: 32, timeoutSeconds: 240 }, plan: { maxSteps: 32, timeoutSeconds: 240 }, implement: { maxSteps: 32, timeoutSeconds: 240 } };
+// Per-mode defaults are raw Reasonix steps (2 per tool-call round); callers may raise them per call
+// via max_steps/tool_rounds up to the hard caps below.
+const MODES = { inspect: { maxSteps: 80, timeoutSeconds: 600 }, review: { maxSteps: 96, timeoutSeconds: 900 }, plan: { maxSteps: 96, timeoutSeconds: 900 }, implement: { maxSteps: 96, timeoutSeconds: 900 } };
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
