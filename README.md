@@ -148,10 +148,15 @@ worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必�
 
 桥接器有意保持**每次调用无状态**：把 `cwd` 限制在允许根内；写策略未启用时拒绝 `implement`；限制任务/预算/输出规模；超时或取消时终止进程树；写操作保持独占。超出 `OUTPUT_CHAR_CAP` 的输出在内存中有界，并作为**成功结果**返回且 `truncated=true`——输出超限本身不会杀死 worker。显式的只读并行任务各自独立启动并在完成后回收。这一切是为了避免把单一对话累积超过 Reasonix 的 128 MB 历史硬上限。
 
-`src/acp-client.mjs` 现已提供 ACP-01 的换行 JSON-RPC 客户端：在能力探测通过后执行 initialize/会话创建、load/resume、prompt 更新聚合、取消与进程干净关闭。它只负责传输，不持久化会话 id、也不决定写策略。server 仍默认按调用无状态执行，在后续的共存/切换票被接受之前不会 import 该客户端。
+`src/acp-client.mjs` 现已提供 ACP-01 的换行 JSON-RPC 客户端：在能力探测通过后执行 initialize/会话创建、load/resume、prompt 更新聚合、取消与进程干净关闭。它只负责传输，不持久化会话 id、也不决定写策略。server 默认仍按调用无状态执行；仅在显式 `transport: "acp"` 的只读会话调用中由 ACP-05 管理器加载。
 
-`src/acp-session.mjs` 提供 ACP-02 的可选会话预算协调器：使用有界确定性摘要器，把原型的 append/compact/rotate/per-call 决策接到替换会话，记录脱敏的决策遥测，并在替换失败时**保持旧会话原样**。持久 ACP 仍为 opt-in，server 仍保持无状态；生命周期与失败契约见 `ACP-TRANSPORT-DESIGN.md`。128 MiB 历史硬上限与 75% 触发比不可配置。
+`src/acp-session.mjs` 提供 ACP-02 的可选会话预算协调器：使用有界确定性摘要器，把原型的 append/compact/rotate/per-call 决策接到替换会话，记录脱敏的决策遥测，并在替换失败时**保持旧会话原样**。持久 ACP 仍为 opt-in；ACP-05 管理器复用它并在传输故障时回退 per-call。生命周期与失败契约见 `ACP-TRANSPORT-DESIGN.md`。128 MiB 历史硬上限与 75% 触发比不可配置。
 
-`src/acp-registry.mjs` 提供 ACP-03 的可选会话注册表：只持久化会话元数据，按会话串行化 prompt，把崩溃的传输标记为 orphaned，支持能力门控的 resume/load 与删除，并在显式关闭时关掉活跃客户端。在生命周期、安全与传输切换票被接受之前，server 不会 import 它。
+`src/acp-registry.mjs` 提供 ACP-03 的可选会话注册表：只持久化会话元数据，按会话串行化 prompt，把崩溃的传输标记为 orphaned，支持能力门控的 resume/load 与删除，并在显式关闭时关掉活跃客户端。它仍未由 server 生产接线；跨进程恢复留给 ACP-06。
 
-`src/acp-security.mjs` 提供 ACP-04 的可选安全门：把持久调用绑定到不透明的调用方/任务作用域，把会话 cwd 限制在配置的工作区根内，在 implement 预检复用 fail-closed 写白名单，并在内容进入续接历史前脱敏凭据类信息。server 仍保持无状态，在 ACP-05 传输共存被接受之前不会 import 该模块。
+`src/acp-security.mjs` 提供 ACP-04 的可选安全门：把持久调用绑定到不透明的调用方/任务作用域，把会话 cwd 限制在配置的工作区根内，在 implement 预检复用 fail-closed 写白名单，并在内容进入续接历史前脱敏凭据类信息。ACP-05 的 server 接线只在显式 `transport: "acp"` 时启用它；implement 仍走既有 per-call 写审计。
+
+`src/acp-transport.mjs` 提供 ACP-05 的可选切换：设置 `transport: "acp"` 并传入不透明的
+`session_id` 才会复用只读 ACP 会话；缺少会话 ID、所有 implement 调用和显式并行任务仍走
+现有 per-call 路径。ACP 启动、协议或超时失败会降级到该路径，状态只报告有界计数；默认传输
+仍为 `per-call`。

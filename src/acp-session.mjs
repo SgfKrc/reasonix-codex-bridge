@@ -1,9 +1,9 @@
 /**
  * ACP session budget coordinator.
  *
- * This module is deliberately not imported by server.mjs until the transport
- * coexistence and security tickets are complete. It owns adapter history and
- * turns the pure ACP budget prototype into an explicit, transactional flow.
+ * This module is used by the opt-in ACP transport manager. It owns adapter
+ * history and turns the pure ACP budget prototype into an explicit,
+ * transactional flow while retaining a stateless fallback.
  */
 import { AcpError } from './acp-client.mjs';
 import {
@@ -200,7 +200,11 @@ export class AcpSessionCoordinator {
       this.#record(decision, { ...context, error: new AcpError('ACP per-call fallback is unavailable', { code: 'fallback_unavailable' }), fallbackUsed: true });
       throw new AcpError('ACP per-call fallback is unavailable', { code: 'fallback_unavailable' });
     }
-    const result = await this.fallbackPrompt(nextMessage.content, { message: clone(nextMessage), reason: decision.reason ?? 'per_call' });
+    const result = await this.fallbackPrompt(nextMessage.content, {
+      message: clone(nextMessage),
+      reason: decision.reason ?? 'per_call',
+      ...(context.error ? { error: context.error } : {}),
+    });
     this.#record(decision, { ...context, resultBytes: historyBytes(this.history), fallbackUsed: true });
     return { ...result, transport: 'per_call', action: 'per_call', sessionId: this.sessionId };
   }

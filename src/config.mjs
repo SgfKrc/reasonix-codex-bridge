@@ -343,6 +343,15 @@ export function readBridgeConfig(configPath = BRIDGE_CONFIG_PATH) {
   }
 }
 
+/** Resolve the explicit transport switch; invalid values fail closed to per-call. */
+export function resolveTransport(bridgeConfig) {
+  const raw = bridgeConfig?.data?.transport;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return { mode: 'per-call', source: 'bridge default', error: '' };
+  const mode = String(raw).trim().toLowerCase();
+  if (mode === 'per-call' || mode === 'acp') return { mode, source: bridgeConfig.path || 'bridge.config.json', error: '' };
+  return { mode: 'per-call', source: 'bridge default', error: `transport must be "per-call" or "acp" (received ${String(raw)})` };
+}
+
 /** Resolves the subagent model ref, recording where it came from. */
 export function resolveModelRef({ cliPath, bridgeConfig, doctorOptions } = {}) {
   const fromEnv = (process.env.REASONIX_MODEL_REF ?? '').trim();
