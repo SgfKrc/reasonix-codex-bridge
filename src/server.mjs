@@ -388,8 +388,15 @@ function parseStepLimit(stderr) {
   const match = String(stderr ?? '').match(/paused after\s+(\d+)\s+tool-call rounds?\s+\(max_steps\)/iu);
   return match ? Number(match[1]) : null;
 }
-function stepLimitExtra(meta) {
-  return Number.isInteger(meta?.stepLimitRounds) ? { stepLimitRounds: meta.stepLimitRounds } : {};
+function parseCursorError(stderr) {
+  return /(?:continuation\s+)?cursor\s+(?:is\s+)?(?:not\s+valid|invalid|malformed)/iu.test(String(stderr ?? ''))
+    || /read_file[^\n]{0,160}(?:cursor|continuation)/iu.test(String(stderr ?? ''));
+}
+function workerFailureExtra(meta) {
+  const extra = {};
+  if (Number.isInteger(meta?.stepLimitRounds)) extra.stepLimitRounds = meta.stepLimitRounds;
+  if (meta?.cursorError === true) extra.cursorError = true;
+  return extra;
 }
 function cwdRootLabel(cwd) {
   const roots = allowedRoots();
@@ -407,6 +414,7 @@ function runSummary(entry) {
     timeoutSeconds: entry.timeoutSeconds,
     outcome: entry.outcome,
     stepLimitRounds: Number.isInteger(entry.stepLimitRounds) ? entry.stepLimitRounds : null,
+    cursorError: entry.cursorError === true,
     exitCode: entry.exitCode ?? null,
     elapsedMs: Number.isFinite(entry.elapsedMs) ? entry.elapsedMs : 0,
     outputBytes: Number.isFinite(entry.outputBytes) ? entry.outputBytes : 0,
@@ -466,11 +474,16 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(mode === 'plan' ? stdout : stdout.trim(), outputCharCap);
       if (code !== 0) {
         const stepLimitRounds = parseStepLimit(stderr);
-        const outcome = stepLimitRounds === null ? 'worker_exit' : 'step_limit';
-        const prefix = stepLimitRounds === null
-          ? `worker exited with code ${code} (${elapsed}s)`
-          : `worker reached Reasonix max_steps=${maxSteps} after ${stepLimitRounds} tool-call rounds (${elapsed}s); timeout_seconds=${timeoutSeconds} was not reached. Increase max_steps or pass tool_rounds.`;
-        finish({ isError: true, text: `${prefix}${body ? `\n\n--- stdout ---\n${body}` : ''}${stderr ? `\n\n--- stderr ---\n${truncate(stderr, 2000)}` : ''}` }, outcome, code, stepLimitRounds === null ? {} : { stepLimitRounds });
+        const cursorError = parseCursorError(stderr);
+        const outcome = cursorError ? 'cursor_error' : stepLimitRounds === null ? 'worker_exit' : 'step_limit';
+        const prefix = cursorError
+          ? `worker reported a malformed or invalid read_file continuation cursor (${elapsed}s); re-read the file without reusing or editing the cursor. The bridge did not retry the task.`
+          : stepLimitRounds === null
+            ? `worker exited with code ${code} (${elapsed}s)`
+            : `worker reached Reasonix max_steps=${maxSteps} after ${stepLimitRounds} tool-call rounds (${elapsed}s); timeout_seconds=${timeoutSeconds} was not reached. Increase max_steps or pass tool_rounds.`;
+        const extra = { ...(stepLimitRounds === null ? {} : { stepLimitRounds }), ...(cursorError ? { cursorError: true } : {}) };
+        const stderrBody = cursorError ? '[cursor diagnostic redacted]' : truncate(stderr, 2000);
+        finish({ isError: true, text: `${prefix}${body ? `\n\n--- stdout ---\n${body}` : ''}${stderrBody ? `\n\n--- stderr ---\n${stderrBody}` : ''}` }, outcome, code, extra);
       }
       else finish({ isError: false, text: mode === 'plan' ? body : `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
@@ -496,7 +509,7 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement' }, { record: false });
   const afterStatus = await gitStatus(WORKSPACE_ROOT);
   if (!afterStatus.ok) {
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, ...stepLimitExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: `mode=implement could not verify post-write Git state: ${afterStatus.error}`, meta: { ...result.meta, outcome: 'write_rejected' } };
   }
   const changed = changedEntries(beforeStatus.entries, afterStatus.entries);
@@ -509,11 +522,11 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
       : `worker failed: ${result.text}`;
     const rollbackText = rollback.ok ? 'rollback completed' : `rollback failed: ${rollback.error}`;
     const outcome = disallowed.length ? 'write_rejected' : (result.meta?.outcome ?? 'worker_exit');
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...stepLimitExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, outcome } };
   }
   if (result.isError) {
-    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: result.meta?.outcome ?? 'worker_exit', exitCode: result.meta?.exitCode ?? null, ...stepLimitExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: result.meta?.outcome ?? 'worker_exit', exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, outcome: result.meta?.outcome ?? 'worker_exit', error: 'worker failed; no changes were retained', changes: [] }), meta: result.meta };
   }
   const changeSet = await buildChangeSet(WORKSPACE_ROOT, changed);

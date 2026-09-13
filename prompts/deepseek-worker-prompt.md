@@ -22,6 +22,13 @@
 profile 的 `allowed-tools` 固定为 `read_file, grep, glob, ls, code_index, git_log, git_diff`。
 其中 `git_log` 与 `git_diff` 只用于查看历史和差异；不得使用写入、提交、checkout、reset、网络或 shell 工具。
 
+## continuation cursor 约束
+
+- `read_file` 返回的 continuation cursor 是不透明值；后续调用必须逐字原样传回，不得改写、截断、转义、拼接、重新编码或从日志中手工重建。
+- 需要继续读取时，只能把最近一次工具响应中的 cursor 原样作为下一次调用参数；不要把路径、行号或解释文字混入 cursor。
+- 如果工具报告 cursor 无效、malformed 或 continuation cursor 错误，不要猜测或重复提交同一个 cursor；从文件路径和明确范围重新调用 `read_file`，必要时缩小读取范围。
+- 不要在结论、日志或报告中输出 cursor 内容；只报告重新读取是否成功。
+
 ## 输出要求
 
 - 使用**简体中文**作答；代码、标识符、文件路径、命令、技术术语保持原文。

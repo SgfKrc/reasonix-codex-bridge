@@ -315,6 +315,16 @@ describe('configuration pure functions', () => {
     assert.deepEqual(WRITE_PROFILE_TOOLS, [...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
   });
 
+  test('worker prompts require opaque continuation cursors', () => {
+    const readPrompt = readFileSync(path.join(BRIDGE_ROOT, 'prompts', 'deepseek-worker-prompt.md'), 'utf8');
+    const writePrompt = readFileSync(path.join(BRIDGE_ROOT, 'prompts', 'deepseek-worker-write-prompt.md'), 'utf8');
+    assert.match(readPrompt, /continuation cursor.*不透明值/isu);
+    assert.match(readPrompt, /逐字原样传回/isu);
+    assert.match(readPrompt, /重新调用 `read_file`/u);
+    assert.match(writePrompt, /continuation cursor is opaque state/iu);
+    assert.match(writePrompt, /Pass the exact value returned by the tool/iu);
+  });
+
   test('upserts bridge blocks at append, first and last boundaries', () => {
     const block = '[mcp_servers.reasonix_local]\ncommand = "node"\nargs = ["server.mjs"]\nstartup_timeout_sec = 30\n\n[mcp_servers.reasonix_local.env]\nREASONIX_ROOT = "root"\nREASONIX_SUBAGENT = "worker"\nREASONIX_MODEL_REF = "fixture/provider"\n';
     assert.match(upsertReasonixBlock('title = "x"\n', block), /title = "x"[\s\S]*\[mcp_servers\.reasonix_local\]/);
@@ -1151,6 +1161,36 @@ process.exit(1);
   assert.equal(record.outcome, 'step_limit');
   assert.equal(record.stepLimitRounds, 5);
   assert.equal(record.timeoutSeconds, 120);
+});
+
+test('Reasonix continuation cursor failures are classified without automatic replay', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  writeFileSync(path.join(root, 'subagent'), `
+  process.stderr.write('sub-agent: read_file did not complete safely: read continuation cursor is not valid; cursor=opaque-token-secret; re-read the file');
+process.exit(1);
+`, 'utf8');
+  const logPath = path.join(root, 'cursor-error.jsonl');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { BRIDGE_LOG: logPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const responses = await readMcpSession(child, [
+    { id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'cursor-error', cwd: '.', mode: 'inspect', timeout_seconds: 120 } } },
+  ]);
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
+  assert.equal(responses[0].result.isError, true);
+  assert.match(responses[0].result.content[0].text, /malformed or invalid read_file continuation cursor/);
+  assert.match(responses[0].result.content[0].text, /bridge did not retry the task/);
+  assert.match(responses[0].result.content[0].text, /cursor diagnostic redacted/);
+  assert.doesNotMatch(responses[0].result.content[0].text, /opaque-token-secret/);
+  const record = JSON.parse(readFileSync(logPath, 'utf8').trim());
+  assert.equal(record.outcome, 'cursor_error');
+  assert.equal(record.cursorError, true);
+  assert.equal(record.stepLimitRounds, null);
 });
 
 test('bridge limit overrides affect worker calls and status', async () => {
