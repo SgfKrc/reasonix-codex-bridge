@@ -17,6 +17,7 @@ All notable changes to this project are documented here.
 ### Changed
 
 - Widened the finite runtime budget envelope to 256 raw Reasonix steps (128 tool-call rounds) and 1800 seconds; callers still opt in per call via `tool_rounds`/`timeout_seconds` and the hard caps remain enforced.
+- Made output-cap handling deterministic across platforms: output overflow is bounded and reported as `truncated=true` without terminating the worker; timeout and explicit cancellation still terminate it.
 
 ## [0.1.0] - 2026-09-12
 
