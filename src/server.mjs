@@ -34,8 +34,9 @@ function refuse(reason, hint) {
 // public tool-round control separate so callers do not have to guess that CLI
 // implementation detail.
 const REASONIX_STEPS_PER_TOOL_ROUND = 2;
-const HARD_MAX_STEPS_CAP = 80;
-const HARD_TIMEOUT_SECONDS_CAP = 600;
+// Keep long runs bounded while leaving enough room for explicit multi-stage work.
+const HARD_MAX_STEPS_CAP = 256;
+const HARD_TIMEOUT_SECONDS_CAP = 1800;
 const TASK_CHAR_CAP = 8000;
 const HARD_OUTPUT_CHAR_CAP = 24000;
 const HARD_QUEUE_CAP = 5;

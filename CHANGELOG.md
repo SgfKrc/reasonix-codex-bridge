@@ -12,6 +12,10 @@ All notable changes to this project are documented here.
 - Run-mode authorization now rejects write profiles in inspect/review/plan and requires a write profile for implement.
 - Unsafe `requireCleanTree=false` write policies are rejected; controlled writes always require a clean Git tree.
 
+### Changed
+
+- Widened the finite runtime budget envelope to 256 raw Reasonix steps (128 tool-call rounds) and 1800 seconds; callers still opt in per call via `tool_rounds`/`timeout_seconds` and the hard caps remain enforced.
+
 ## [0.1.0] - 2026-09-12
 
 ### Added
