@@ -35,6 +35,7 @@ import {
   prepareSessionContinuation,
 } from '../src/acp-prototype.mjs';
 import { AcpClient, collectAcpText } from '../src/acp-client.mjs';
+import { AcpSessionCoordinator, summarizeAcpMessages } from '../src/acp-session.mjs';
 
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
@@ -168,7 +169,7 @@ function acpFixtureSpawn() {
       send({ jsonrpc: '2.0', id: 77, method: 'session/request_permission', params: { sessionId: message.params.sessionId, toolCall: { title: 'fixture' } } });
       send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answer' } } } });
       setTimeout(() => respond(message, { stopReason: 'end_turn' }), 5);
-    } else if (message.method === 'session/cancel' || message.method === 'session/close') {
+    } else if (message.method === 'session/cancel' || message.method === 'session/close' || message.method === 'session/delete') {
       respond(message, {});
     }
   };
@@ -1130,6 +1131,8 @@ describe('ACP client transport', () => {
     const permissionResponse = fixture.received.find((message) => message.id === 77);
     assert.deepEqual(permissionResponse.result, { outcome: { outcome: 'cancelled' } });
     assert.deepEqual(fixture.received.find((message) => message.method === 'session/new').params, { cwd: 'C:/fixture', mcpServers: [] });
+    await client.deleteSession(created.sessionId);
+    assert.ok(fixture.received.some((message) => message.method === 'session/delete' && message.params.sessionId === created.sessionId));
     await client.close({ sessionId: created.sessionId });
     assert.equal(client.child, null);
   });
@@ -1143,6 +1146,141 @@ describe('ACP client transport', () => {
     assert.ok(fixture.received.some((message) => message.method === 'session/cancel'));
     await client.close({ sessionId: session.sessionId });
     assert.equal(client.child, null);
+  });
+});
+
+function coordinatorFixture({ failReplacementPrompt = false } = {}) {
+  const events = [];
+  let nextSession = 1;
+  const client = {
+    started: false,
+    async start() { this.started = true; events.push(['start']); },
+    async newSession() {
+      const sessionId = `coordinator-session-${nextSession++}`;
+      events.push(['new', sessionId]);
+      return { sessionId };
+    },
+    async prompt(sessionId, text) {
+      events.push(['prompt', sessionId, text]);
+      if (failReplacementPrompt && sessionId !== 'coordinator-session-1') throw Object.assign(new Error('replacement failed'), { code: 'replacement_failed' });
+      return { stopReason: 'end_turn', text: `reply:${text.slice(0, 24)}` };
+    },
+    async closeSession(sessionId) { events.push(['close', sessionId]); return {}; },
+    async deleteSession(sessionId) { events.push(['delete', sessionId]); return {}; },
+    supportsSession(name) { return name === 'delete'; },
+  };
+  return { client, events };
+}
+
+describe('ACP session budget coordinator', () => {
+  test('uses deterministic bounded summaries and records append decisions without bodies', async () => {
+    const { client } = coordinatorFixture();
+    const decisions = [];
+    const coordinator = new AcpSessionCoordinator({ client, onDecision: (entry) => decisions.push(entry), now: (() => { let tick = 100; return () => tick += 7; })() });
+    await coordinator.start();
+    const result = await coordinator.prompt('first request');
+    assert.equal(result.transport, 'acp');
+    assert.equal(result.action, 'append');
+    assert.equal(coordinator.currentHistory.length, 2);
+    assert.equal(decisions.length, 1);
+    assert.equal(decisions[0].action, 'append');
+    assert.equal(Object.hasOwn(decisions[0], 'text'), false);
+    assert.equal(Object.hasOwn(decisions[0], 'content'), false);
+    assert.equal(summarizeAcpMessages([{ role: 'user', content: '  alpha\n beta  ' }]), '1. user: alpha beta');
+    assert.ok(summarizeAcpMessages([{ role: 'user', content: 'x'.repeat(100) }], { perMessageCap: 10, maxChars: 10 }).length <= 10);
+  });
+
+  test('compacts through a replacement session and deletes the old session only after success', async () => {
+    const { client, events } = coordinatorFixture();
+    const coordinator = new AcpSessionCoordinator({
+      client,
+      hardCapBytes: 400,
+      compactTriggerRatio: 0.25,
+      preserveRecent: 1,
+      summarize: (messages) => messages.map((message) => message.content).join(' | '),
+    });
+    await coordinator.start();
+    coordinator.history = [
+      { role: 'user', content: 'old question '.repeat(3) },
+      { role: 'assistant', content: 'old answer '.repeat(3) },
+      { role: 'user', content: 'recent question' },
+    ];
+    const result = await coordinator.prompt('next request');
+    assert.equal(result.action, 'compact');
+    assert.equal(result.sessionId, 'coordinator-session-2');
+    assert.deepEqual(events.map((event) => event[0]), ['start', 'new', 'new', 'prompt', 'close', 'delete']);
+    assert.equal(events[4][1], 'coordinator-session-1');
+    assert.equal(events[5][1], 'coordinator-session-1');
+    assert.ok(coordinator.currentHistory.some((message) => message.acpCompacted));
+    assert.equal(coordinator.decisions[0].action, 'compact');
+    assert.ok(coordinator.decisions[0].resultBytes < coordinator.hardCapBytes);
+  });
+
+  test('rotates when a valid compacted history still exceeds the hard cap', async () => {
+    const { client, events } = coordinatorFixture();
+    const next = { role: 'user', content: 'next' };
+    const coordinator = new AcpSessionCoordinator({
+      client,
+      hardCapBytes: historyBytes([next, { role: 'assistant', content: 'reply:next' }]) + 1,
+      compactTriggerRatio: 0.25,
+      preserveRecent: 1,
+      summarize: () => 'oversized summary '.repeat(40),
+    });
+    await coordinator.start();
+    coordinator.history = [{ role: 'user', content: 'old question' }, { role: 'assistant', content: 'old answer' }];
+    const result = await coordinator.prompt(next.content);
+    assert.equal(result.action, 'rotate');
+    assert.equal(result.sessionId, 'coordinator-session-2');
+    assert.equal(events.filter((event) => event[0] === 'new').length, 2);
+    assert.equal(coordinator.currentHistory.at(0).content, next.content);
+    assert.ok(coordinator.decisions[0].resultBytes < coordinator.hardCapBytes);
+  });
+
+  test('falls back per-call when summarization fails and leaves persistent history unchanged', async () => {
+    const { client, events } = coordinatorFixture();
+    let fallbackCalls = 0;
+    const coordinator = new AcpSessionCoordinator({
+      client,
+      hardCapBytes: 100,
+      compactTriggerRatio: 0.25,
+      summarize: () => { throw new Error('summary unavailable'); },
+      fallbackPrompt: async (text, context) => { fallbackCalls += 1; assert.equal(text, 'next'); assert.equal(Object.hasOwn(context, 'history'), false); return { text: 'fallback-answer' }; },
+    });
+    await coordinator.start();
+    coordinator.history = [{ role: 'user', content: 'old question' }, { role: 'assistant', content: 'old answer' }];
+    const before = JSON.stringify(coordinator.currentHistory);
+    const result = await coordinator.prompt('next');
+    assert.equal(result.transport, 'per_call');
+    assert.equal(result.action, 'per_call');
+    assert.equal(fallbackCalls, 1);
+    assert.equal(events.filter((event) => event[0] === 'prompt').length, 0);
+    assert.equal(JSON.stringify(coordinator.currentHistory), before);
+    assert.equal(coordinator.decisions[0].reason, 'compact_failed');
+    assert.equal(coordinator.decisions[0].fallbackUsed, true);
+  });
+
+  test('falls back when replacement prompt fails and keeps the old session active', async () => {
+    const { client, events } = coordinatorFixture({ failReplacementPrompt: true });
+    let fallbackCalls = 0;
+    const coordinator = new AcpSessionCoordinator({
+      client,
+      hardCapBytes: 220,
+      compactTriggerRatio: 0.25,
+      preserveRecent: 1,
+      summarize: () => 'small summary',
+      fallbackPrompt: async () => { fallbackCalls += 1; return { text: 'fallback-answer' }; },
+    });
+    await coordinator.start();
+    coordinator.history = [{ role: 'user', content: 'old question '.repeat(3) }, { role: 'assistant', content: 'old answer '.repeat(3) }, { role: 'user', content: 'recent' }];
+    const before = JSON.stringify(coordinator.currentHistory);
+    const result = await coordinator.prompt('next request');
+    assert.equal(result.transport, 'per_call');
+    assert.equal(fallbackCalls, 1);
+    assert.equal(coordinator.sessionId, 'coordinator-session-1');
+    assert.equal(JSON.stringify(coordinator.currentHistory), before);
+    assert.ok(events.some((event) => event[0] === 'close' && event[1] === 'coordinator-session-2'));
+    assert.equal(coordinator.decisions[0].action, 'per_call');
+    assert.equal(coordinator.decisions[0].reason, 'compact_failed');
   });
 });
 

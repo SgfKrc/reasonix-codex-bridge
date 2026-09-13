@@ -1,8 +1,8 @@
 # ACP Transport Design (E2)
 
-Status: ACP-01 client layer landed; production transport remains design-only. `src/server.mjs`
-remains stateless per call; the client and `src/acp-prototype.mjs` are not imported by the server
-until the later coexistence/switching ticket.
+Status: ACP-01 client layer and ACP-02 session budget coordinator landed; production transport
+remains design-only. `src/server.mjs` remains stateless per call; the client, coordinator, and
+`src/acp-prototype.mjs` are not imported by the server until the later coexistence/switching ticket.
 
 The bridge now has a separate task-level checkpoint/`reasonix_resume` path. It is not ACP session
 resume: it starts a new Reasonix process with an explicit continuation instruction after validating
@@ -50,11 +50,30 @@ change `mode=implement` or turn a plan into a write.
 
 `src/acp-client.mjs` owns one ACP child process and exposes newline-delimited JSON-RPC requests for
 `initialize`, `session/new`, `session/load`, `session/resume`, `session/prompt`, `session/cancel`,
-and `session/close`. It rejects load/resume when the agent does not advertise the corresponding
+`session/close`, and capability-gated `session/delete`. It rejects load/resume when the agent does not advertise the corresponding
 capability, aggregates `session/update` notifications for a prompt, rejects permission requests by
 default, and sends `session/cancel` before surfacing a prompt timeout. It bounds captured stderr and
 terminates the child tree during shutdown. The module deliberately does not persist sessions,
 compact history, authorize writes, or alter the MCP server's default per-call path.
+
+## ACP-02 session budget coordinator
+
+`src/acp-session.mjs` now connects the pure budget decision to an `AcpClient` without changing the
+server entry point. `summarizeAcpMessages` is deterministic and bounded (512 characters per source
+message and 12,000 characters total by default); callers may inject a later LLM summarizer. Each
+prompt records only action, reason, bounded byte counts, summarized message count, elapsed time, and
+whether a fallback was used.
+
+The `append` branch prompts the active session and commits adapter history only after success. The
+`compact` and `rotate` branches create a replacement session, send a bounded context envelope, and
+close/delete the old session only after the replacement prompt succeeds. A replacement failure
+closes the new session and invokes the explicit stateless fallback, leaving the old session and
+history unchanged. Summarizer failure or an invalid summary follows the same per-call fallback; the
+fallback receives only the next message and reason, never persistent history.
+
+This is an adapter-level implementation, not a claim that ACP history replacement is a native
+Reasonix operation. The coordinator remains opt-in and must be wired by the later ACP-03/04/05
+tickets after lifecycle, write-policy, and transport-switching tests are complete.
 
 ## Failure and observability contract
 

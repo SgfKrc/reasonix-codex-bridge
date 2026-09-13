@@ -234,7 +234,9 @@ shutdown. It is transport-only and does not persist session ids or decide write 
 still defaults to stateless per-call execution and does not import the client until the later
 coexistence/switching ticket is accepted.
 
-Persistent ACP history remains design-only; see `ACP-TRANSPORT-DESIGN.md` for the lifecycle and
-failure contract. The offline prototype in `src/acp-prototype.mjs` triggers transactional compaction
-at 75% of the fixed 128 MiB Reasonix history cap, rotates when a compacted session still cannot fit,
-and falls back to per-call without mutating persistent history when compaction fails.
+`src/acp-session.mjs` provides the ACP-02 opt-in session budget coordinator. It uses a bounded
+deterministic summarizer, connects the prototype's append/compact/rotate/per-call decisions to
+replacement sessions, records redacted decision telemetry, and leaves the old session untouched
+when replacement fails. Persistent ACP remains opt-in and the server remains stateless; see
+`ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The fixed 128 MiB Reasonix
+history cap and 75% trigger are not configurable.
