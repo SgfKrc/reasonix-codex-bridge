@@ -1449,6 +1449,21 @@ describe('ACP session registry', () => {
     assert.deepEqual(result.closed.sort(), ['crashed-session', 'live-session']);
     assert.equal(registry.list().every((entry) => entry.state === 'closed'), true);
   });
+
+  test('process lifecycle hooks trigger idempotent registry shutdown', async () => {
+    const root = tempRoot();
+    const { client, events } = registryClient();
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json') });
+    await registry.create({ client, cwd: root, profile: 'read', model: 'fixture/provider' });
+    const processLike = new EventEmitter();
+    const uninstall = registry.installProcessHandlers(processLike);
+    processLike.emit('SIGTERM');
+    processLike.emit('SIGTERM');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(registry.list()[0].state, 'closed');
+    assert.equal(events.filter((event) => event[0] === 'close-client').length, 1);
+    uninstall();
+  });
 });
 
 describe('ACP transport design prototype', () => {
