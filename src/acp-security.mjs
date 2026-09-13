@@ -13,6 +13,8 @@ import { resolveWorkspaceRoot, resolveWritePolicy } from './config.mjs';
 const MAX_SCOPE_ID_LENGTH = 256;
 const SENSITIVE_KEY = '(?:api[_-]?key|access[_-]?key|token|secret|password|passwd|private[_-]?key|authorization|auth|cookie)';
 const SENSITIVE_ASSIGNMENT = new RegExp(`(\\b${SENSITIVE_KEY}\\b\\s*[:=]\\s*)[^\\r\\n,;]+`, 'giu');
+const ENV_ASSIGNMENT = /(^|\r?\n)(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*)[^\r\n]*/gmu;
+const SENSITIVE_JSON = new RegExp(`([\"']${SENSITIVE_KEY}[\"']\\s*:\\s*)(\"[^\"]*\"|'[^']*'|[^,}\\r\\n]+)`, 'giu');
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu;
 const PEM_PRIVATE_KEY = /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/giu;
 const SENSITIVE_FILE = /(?:^|[/\\\\])(?:\.env(?:\.[^/\\\\]+)?|credentials(?:\.[^/\\\\]+)?|secrets(?:\.[^/\\\\]+)?)$/iu;
@@ -58,7 +60,9 @@ export function scrubAcpContent(content, { sourcePath = '' } = {}) {
   return value
     .replace(PEM_PRIVATE_KEY, '[REDACTED private key]')
     .replace(BEARER_TOKEN, 'Bearer [REDACTED]')
-    .replace(SENSITIVE_ASSIGNMENT, '$1[REDACTED]');
+    .replace(SENSITIVE_ASSIGNMENT, '$1[REDACTED]')
+    .replace(SENSITIVE_JSON, '$1"[REDACTED]"')
+    .replace(ENV_ASSIGNMENT, '$1$2[REDACTED]');
 }
 
 export function scrubAcpMessage(message) {
