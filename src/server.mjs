@@ -54,8 +54,9 @@ const MODES = { inspect: { maxSteps: 24, timeoutSeconds: 180 }, review: { maxSte
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
-  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. max_steps is the raw Reasonix budget; tool_rounds is the preferred tool-call-round budget.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
+  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. max_steps is the raw Reasonix budget; tool_rounds is the preferred tool-call-round budget. Set parallel=true explicitly for concurrent read-only jobs.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' }, parallel: { type: 'boolean' } }, required: ['task'] } },
   { name: 'reasonix_resume', description: 'Explicitly resume one durable checkpoint after workspace/configuration drift checks. A checkpoint is one-shot and is never replayed implicitly.', inputSchema: { type: 'object', properties: { checkpoint_id: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, timeout_seconds: { type: 'integer' } }, required: ['checkpoint_id'] } },
+  { name: 'reasonix_cancel', description: 'Request cancellation of one queued or running job. Running workers are terminated and the terminal cancellation remains visible in reasonix_status.', inputSchema: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
@@ -520,7 +521,7 @@ function terminate(child) {
   child.kill('SIGKILL');
   return Promise.resolve();
 }
-function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true, checkpoint = mode !== 'implement', parentCheckpointId = null } = {}) {
+function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true, checkpoint = mode !== 'implement', parentCheckpointId = null, cancelRef = null } = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
@@ -532,29 +533,49 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
     }
     const child = spawn(invocation.file, invocation.args, invocation.options);
     let stdout = ''; let stderr = ''; let settled = false; let truncatedOutput = false;
+    let cancelRequested = false;
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     const finish = (result, outcome, exitCode = null, extra = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
-      resolve({ ...result, meta: { outcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
+      if (cancelRef) cancelRef.cancel = null;
+      const finalOutcome = cancelRequested ? 'cancelled' : outcome;
+      const finalResult = cancelRequested ? { isError: true, text: `worker cancelled after ${((Date.now() - startedAt) / 1000).toFixed(1)}s` } : result;
+      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
+      resolve({ ...finalResult, meta: { outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
     };
     const timer = setTimeout(async () => {
       if (settled) return;
       await terminate(child);
       if (settled) return;
+      if (cancelRequested) {
+        finish({ isError: true, text: '' }, 'cancelled', null);
+        return;
+      }
       const checkpointId = checkpoint
         ? await createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome: 'timeout', exitCode: null, parentCheckpointId })
         : null;
       const suffix = checkpointId ? `\n\ncheckpoint_id=${checkpointId}; call reasonix_resume to continue explicitly.` : '';
       finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}${suffix}` }, 'timeout', null, checkpointId ? { checkpointId } : {});
     }, timeoutSeconds * 1000);
+    if (cancelRef && typeof cancelRef === 'object') {
+      cancelRef.cancel = () => {
+        if (settled || cancelRequested) return;
+        cancelRequested = true;
+        void terminate(child);
+      };
+      if (cancelRef.requested) cancelRef.cancel();
+    }
     child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > outputCharCap * 2) { truncatedOutput = true; void terminate(child); } });
     child.stderr.on('data', (chunk) => { stderr += chunk; if (stderr.length > outputCharCap) { truncatedOutput = true; void terminate(child); } });
     child.on('error', (error) => finish({ isError: true, text: `cannot start reasonix CLI: ${error.message}` }, 'spawn_error'));
     child.on('close', async (code) => {
       if (settled) return;
+      if (cancelRequested) {
+        finish({ isError: true, text: '' }, 'cancelled', code);
+        return;
+      }
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(mode === 'plan' ? stdout : stdout.trim(), outputCharCap);
       if (code !== 0) {
         const stepLimitRounds = parseStepLimit(stderr);
@@ -577,7 +598,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
     });
   });
 }
-async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task }) {
+async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task }, cancelRef = null) {
   const reject = (text, startedAt = Date.now()) => {
     recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
     return { isError: true, text, meta: { outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
@@ -594,7 +615,7 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   if (!WRITE_POLICY.requireCleanTree && beforeStatus.entries.some((entry) => pathMatchesAllowed(entry.path))) {
     return reject('mode=implement refuses to write an allowed path that is already dirty; restore or commit it first.', startedAt);
   }
-  const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement' }, { record: false });
+  const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement' }, { record: false, cancelRef });
   const afterStatus = await gitStatus(WORKSPACE_ROOT);
   if (!afterStatus.ok) {
     recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
@@ -630,7 +651,7 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
   return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, outcome: 'success', rollbackId } };
 }
-async function resumeCheckpoint(checkpointId, args = {}) {
+async function resumeCheckpoint(checkpointId, args = {}, cancelRef = null) {
   if (!CHECKPOINT_ENABLED) return { isError: true, text: 'checkpoint resume is disabled because the checkpoint directory is inside the workspace.' };
   const loaded = readCheckpoint(CHECKPOINT_DIR, checkpointId);
   if (!loaded.ok) return { isError: true, text: `cannot resume checkpoint: ${loaded.error}` };
@@ -652,35 +673,187 @@ async function resumeCheckpoint(checkpointId, args = {}) {
   const timeoutSeconds = clampInteger(args.timeout_seconds, checkpoint.timeoutSeconds, LIMITS.timeoutSecondsCap);
   try { consumeCheckpoint(CHECKPOINT_DIR, checkpoint); } catch (error) { return { isError: true, text: `cannot resume checkpoint: could not mark it consumed (${error.message})` }; }
   return checkpoint.mode === 'implement'
-    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task })
-    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode: checkpoint.mode }, { parentCheckpointId: checkpoint.id });
+    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task }, cancelRef)
+    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode: checkpoint.mode }, { parentCheckpointId: checkpoint.id, cancelRef });
 }
 function estimateTaskTokens(task) {
   return Math.max(1, Math.ceil(Buffer.byteLength(task, 'utf8') / 4));
 }
-let queue = Promise.resolve(); let queueDepth = 0; let inFlight = 0;
+const MAX_JOB_RECORDS = 64;
+const jobQueue = [];
+const jobRecords = new Map();
+let queueDepth = 0;
+let inFlight = 0;
+let parallelActive = 0;
+let exclusiveActive = 0;
 function retryHint() {
   const seconds = lastRun?.elapsedMs > 0 ? Math.max(1, Math.ceil(lastRun.elapsedMs / 1000)) : 1;
   return `retry after about ${seconds}s`;
 }
-function enqueue(job, meta) {
+function jobSummary(record) {
+  return {
+    jobId: record.id,
+    mode: record.mode,
+    cwdRoot: record.cwdRoot,
+    parallel: record.parallel,
+    exclusive: record.exclusive,
+    state: record.state,
+    outcome: record.outcome,
+    maxSteps: record.maxSteps,
+    timeoutSeconds: record.timeoutSeconds,
+    createdAt: record.createdAt,
+    startedAt: record.startedAt,
+    endedAt: record.endedAt,
+    reclaimedAt: record.reclaimedAt,
+    cancelRequested: record.cancelRequested,
+    exitCode: record.exitCode,
+    stepLimitRounds: record.stepLimitRounds,
+    cursorError: record.cursorError,
+    checkpointId: record.checkpointId,
+  };
+}
+function pruneJobRecords() {
+  while (jobRecords.size > MAX_JOB_RECORDS) {
+    const candidate = [...jobRecords.values()].find((record) => ['completed', 'failed', 'cancelled'].includes(record.state));
+    if (!candidate) return;
+    jobRecords.delete(candidate.id);
+  }
+}
+function settleJobRecord(record, result) {
+  const meta = result?.meta ?? {};
+  const outcome = meta.outcome ?? (result?.isError ? 'worker_exit' : 'success');
+  record.outcome = outcome;
+  record.state = outcome === 'success' ? 'completed' : outcome === 'cancelled' ? 'cancelled' : 'failed';
+  record.exitCode = meta.exitCode ?? null;
+  record.stepLimitRounds = Number.isInteger(meta.stepLimitRounds) ? meta.stepLimitRounds : null;
+  record.cursorError = meta.cursorError === true;
+  record.checkpointId = meta.checkpointId ?? null;
+  record.endedAt = new Date().toISOString();
+  record.reclaimedAt = record.endedAt;
+  record.reclaimed = true;
+  record.cancel = null;
+}
+function attachJobMeta(result, record) {
+  return { ...result, meta: { ...(result?.meta ?? {}), jobId: record.id } };
+}
+function startJob(item) {
+  const { record } = item;
+  record.state = 'running';
+  record.startedAt = new Date().toISOString();
+  inFlight += 1;
+  if (record.exclusive) exclusiveActive += 1;
+  else parallelActive += 1;
+  const cancelRef = { requested: false, cancel: null };
+  record.cancel = () => {
+    record.cancelRequested = true;
+    cancelRef.requested = true;
+    if (typeof cancelRef.cancel === 'function') cancelRef.cancel();
+  };
+  Promise.resolve()
+    .then(() => item.job(cancelRef))
+    .then((result) => {
+      settleJobRecord(record, result);
+      item.resolve(attachJobMeta(result, record));
+    }, (error) => {
+      const result = { isError: true, text: `job failed: ${error?.message ?? error}`, meta: { outcome: 'worker_exit', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } };
+      settleJobRecord(record, result);
+      item.resolve(attachJobMeta(result, record));
+    })
+    .finally(() => {
+      inFlight -= 1;
+      if (record.exclusive) exclusiveActive -= 1;
+      else parallelActive -= 1;
+      queueDepth -= 1;
+      pruneJobRecords();
+      pumpJobs();
+    });
+}
+function pumpJobs() {
+  if (exclusiveActive > 0) return;
+  if (jobQueue[0]?.record.exclusive) {
+    if (parallelActive === 0) startJob(jobQueue.shift());
+    return;
+  }
+  while (jobQueue.length && !jobQueue[0].record.exclusive && parallelActive < LIMITS.queueCap) startJob(jobQueue.shift());
+}
+function enqueue(job, meta, { parallel = false, exclusive = true } = {}) {
   if (queueDepth >= LIMITS.queueCap) {
     recordRun({ ...meta, outcome: 'queue_rejected', elapsedMs: 0, outputBytes: 0, truncated: false });
     return Promise.resolve({ isError: true, text: `too many queued requests (depth=${queueDepth}, cap=${LIMITS.queueCap}); ${retryHint()}`, meta: { outcome: 'queue_rejected', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } });
   }
-  queueDepth += 1;
-  const execute = async () => {
-    inFlight += 1;
-    try { return await job(); } finally { inFlight -= 1; }
+  const record = {
+    id: randomUUID(),
+    mode: meta.mode,
+    cwdRoot: meta.cwdRoot,
+    maxSteps: meta.maxSteps,
+    timeoutSeconds: meta.timeoutSeconds,
+    parallel,
+    exclusive,
+    state: 'queued',
+    outcome: null,
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    endedAt: null,
+    reclaimedAt: null,
+    reclaimed: false,
+    cancelRequested: false,
+    cancel: null,
+    exitCode: null,
+    stepLimitRounds: null,
+    cursorError: false,
+    checkpointId: null,
   };
-  const run = queue.then(execute, execute);
-  queue = run.then(() => undefined, () => undefined);
-  return run.finally(() => { queueDepth -= 1; });
+  let resolveResult;
+  const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
+  const item = { job, record, resolve: resolveResult };
+  record.item = item;
+  jobRecords.set(record.id, record);
+  queueDepth += 1;
+  jobQueue.push(item);
+  pumpJobs();
+  return resultPromise;
+}
+function cancelJob(jobId) {
+  const value = typeof jobId === 'string' ? jobId.trim() : '';
+  if (!value) return { isError: true, text: 'job_id is required' };
+  const record = jobRecords.get(value);
+  if (!record) return { isError: true, text: 'job_id is unknown or has expired' };
+  if (record.state !== 'queued' && record.state !== 'running') {
+    return { isError: false, text: `job_id=${value} is already ${record.state}`, meta: { jobId: value, outcome: record.outcome } };
+  }
+  record.cancelRequested = true;
+  if (record.state === 'queued') {
+    const index = jobQueue.findIndex((item) => item.record.id === value);
+    if (index < 0) return { isError: true, text: 'job_id is no longer queued; inspect reasonix_status' };
+    const [item] = jobQueue.splice(index, 1);
+    const result = { isError: true, text: `job cancelled before start (job_id=${value})`, meta: { outcome: 'cancelled', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } };
+    record.outcome = 'cancelled';
+    record.state = 'cancelled';
+    record.endedAt = new Date().toISOString();
+    record.reclaimedAt = record.endedAt;
+    record.reclaimed = true;
+    queueDepth -= 1;
+    recordRun({ mode: record.mode, cwdRoot: record.cwdRoot, maxSteps: record.maxSteps, timeoutSeconds: record.timeoutSeconds, outcome: 'cancelled', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false });
+    item.resolve(attachJobMeta(result, record));
+    pumpJobs();
+    return { isError: false, text: result.text, meta: { jobId: value, outcome: 'cancelled' } };
+  }
+  if (typeof record.cancel === 'function') {
+    record.cancel();
+    return { isError: false, text: `cancellation requested (job_id=${value})`, meta: { jobId: value, outcome: 'cancellation_requested' } };
+  }
+  return { isError: true, text: `job_id=${value} is running but cannot be cancelled safely` };
+}
+function jobStatus() {
+  return [...jobRecords.values()].map(jobSummary);
 }
 async function callTool(name, args) {
   if (name === 'reasonix_resume') {
     const checkpointId = typeof args?.checkpoint_id === 'string' ? args.checkpoint_id.trim() : '';
-    return enqueue(() => resumeCheckpoint(checkpointId, args), { mode: 'resume', cwdRoot: 'workspace', maxSteps: null, timeoutSeconds: null });
+    return enqueue((cancelRef) => resumeCheckpoint(checkpointId, args, cancelRef), { mode: 'resume', cwdRoot: 'workspace', maxSteps: null, timeoutSeconds: null });
+  }
+  if (name === 'reasonix_cancel') {
+    return cancelJob(args?.job_id);
   }
   if (name === 'reasonix_rollback') {
     const rollbackId = typeof args?.rollback_id === 'string' ? args.rollback_id.trim() : '';
@@ -688,7 +861,7 @@ async function callTool(name, args) {
     if (!record) return explicitRollback(rollbackId);
     return enqueue(() => explicitRollback(rollbackId), { mode: 'rollback', cwdRoot: cwdRootLabel(record.root), maxSteps: null, timeoutSeconds: null });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
@@ -721,10 +894,15 @@ async function callTool(name, args) {
     ? clampInteger(args?.max_steps, preset.maxSteps, LIMITS.maxStepsCap)
     : clampInteger(args.tool_rounds, Math.ceil(preset.maxSteps / REASONIX_STEPS_PER_TOOL_ROUND), maxToolRounds) * REASONIX_STEPS_PER_TOOL_ROUND;
   const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, LIMITS.timeoutSecondsCap);
+  const parallel = args?.parallel === true;
+  if (parallel && mode === 'implement') {
+    logRejected('parallel_implement_disallowed');
+    return { isError: true, text: 'parallel=true is only available for read-only inspect, review, or plan jobs; implement remains workspace-exclusive.' };
+  }
   const meta = { mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
-  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => mode === 'implement'
-    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task })
-    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }), meta);
+  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s parallel=${parallel}`); return enqueue((cancelRef) => mode === 'implement'
+    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task }, cancelRef)
+    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }, { cancelRef }), { ...meta, parallel }, { parallel, exclusive: !parallel });
 }
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 const handlers = { initialize: () => ({ capabilities: { tools: {} }, protocolVersion: '2024-11-05', serverInfo: { name: SERVER_NAME, version: '1.0.0' } }), ping: () => ({}), 'tools/list': () => ({ tools: TOOLS }), 'tools/call': async (params) => { const result = await callTool(params?.name, params?.arguments ?? {}); return { content: [{ type: 'text', text: result.text }], isError: result.isError }; } };
