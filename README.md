@@ -152,7 +152,7 @@ worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必�
 
 `src/acp-session.mjs` 提供 ACP-02 的可选会话预算协调器：使用有界确定性摘要器，把原型的 append/compact/rotate/per-call 决策接到替换会话，记录脱敏的决策遥测，并在替换失败时**保持旧会话原样**。持久 ACP 仍为 opt-in；ACP-05 管理器复用它并在传输故障时回退 per-call。生命周期与失败契约见 `ACP-TRANSPORT-DESIGN.md`。128 MiB 历史硬上限与 75% 触发比不可配置。
 
-`src/acp-registry.mjs` 提供 ACP-03 的可选会话注册表：只持久化会话元数据，按会话串行化 prompt，把崩溃的传输标记为 orphaned，支持能力门控的 resume/load 与删除，并在显式关闭时关掉活跃客户端。它仍未由 server 生产接线；跨进程恢复留给 ACP-06。
+`src/acp-registry.mjs` 提供 ACP-03 的可选会话注册表：只持久化会话元数据，按会话串行化 prompt，把崩溃的传输标记为 orphaned，支持能力门控的 resume/load 与删除，并在显式关闭时关掉活跃客户端。它仍未由 server 生产接线；离线跨进程恢复由 ACP-06 验收通过，真实 provider 恢复仍受持久化语义门控。
 
 `src/acp-security.mjs` 提供 ACP-04 的可选安全门：把持久调用绑定到不透明的调用方/任务作用域，把会话 cwd 限制在配置的工作区根内，在 implement 预检复用 fail-closed 写白名单，并在内容进入续接历史前脱敏凭据类信息。ACP-05 的 server 接线只在显式 `transport: "acp"` 时启用它；implement 仍走既有 per-call 写审计。
 
@@ -160,3 +160,10 @@ worker 提示词同样把 `read_file` 的续读 cursor 当作不透明值：必�
 `session_id` 才会复用只读 ACP 会话；缺少会话 ID、所有 implement 调用和显式并行任务仍走
 现有 per-call 路径。ACP 启动、协议或超时失败会降级到该路径，状态只报告有界计数；默认传输
 仍为 `per-call`。
+
+`scripts/acp-acceptance.mjs` 提供 ACP-06 的无模型离线验收：`npm run acceptance:acp` 在项目树内
+的 `build/bridge-test/` 中实际启动并强杀 registry 子进程，验证 orphan/resume、metadata-only
+持久化、compact/rotate、并发串行、取消、子进程清理和工件删除；当前 bridge 回归为 `92 passed /
+0 failed`。`npm run acceptance:acp:real` 仅探测真实 Reasonix 控制面，不发送模型 prompt；若
+provider 未持久化空会话，会输出结构化 `status: "blocked"` 并以退出码 2 返回，不能把该结果当作
+跨进程恢复通过。
