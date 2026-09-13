@@ -21,6 +21,7 @@ import {
   checkCliVersion,
   cliSpawnCommand,
   cliSpawnOptions,
+  doctorUnknownToolReferences,
   doctorRefs,
   isFile,
   profileDrift,
@@ -495,6 +496,7 @@ function verifyCommand(args = []) {
   const context = loadContext({ refresh: args.includes('--refresh') });
   const target = roleProfile(context, role);
   const results = [];
+  let doctorDiagnostics = null;
   if (context.cliPath) {
     const version = checkCliVersion(context.cliPath);
     if (version.status === 'fail') {
@@ -516,6 +518,7 @@ function verifyCommand(args = []) {
     results.push(['fail', `model ref: ${validateModelRef(context.resolution.ref)}`]);
   } else {
     const doctor = doctorFor(context);
+    doctorDiagnostics = doctor;
     if (!doctor.ok) {
       results.push(['warn', `model ref: ${context.resolution.ref} (could not verify against this machine: ${doctor.error})`]);
     } else {
@@ -538,6 +541,12 @@ function verifyCommand(args = []) {
     const present = listed.status === 0 && text.split('\n').some((line) => line.trim().split(/\s+/)[0] === name);
     const profile = readSubagentProfile(name);
     const issues = context.resolution.ref ? profileDrift(profile, context.resolution.ref, target.tools, role) : [];
+    const unknownToolWarnings = doctorDiagnostics?.ok ? doctorUnknownToolReferences(doctorDiagnostics.data, name) : [];
+    if (unknownToolWarnings.length) {
+      results.push(['fail', `Reasonix capability diagnostics: ${unknownToolWarnings.join('; ')}`]);
+    } else if (doctorDiagnostics?.ok) {
+      results.push(['ok', `Reasonix capability diagnostics: no unknown allowed-tools identities for ${name}`]);
+    }
     results.push(!present ? ['fail', `subagent profile: ${name} missing - create it with: node src/configure.mjs profile --role ${role} --create --write`]
       : !profile.exists ? ['fail', `subagent profile: ${name} is listed but SKILL.md is missing at ${profile.path || REASONIX_SKILLS_PATH}`]
         : issues.length ? ['fail', `subagent profile drift: ${issues.join('; ')} (${profile.path})`]

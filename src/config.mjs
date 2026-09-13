@@ -15,7 +15,10 @@ import { fileURLToPath } from 'node:url';
 export const SERVER_NAME = 'reasonix-local-bridge';
 export const DEFAULT_SUBAGENT = 'deepseek-worker';
 export const DEFAULT_MIN_REASONIX_VERSION = '1.38.6';
-export const READ_ONLY_PROFILE_TOOLS = Object.freeze(['read_file', 'grep', 'glob', 'ls', 'code_index', 'git_log', 'git_diff']);
+// Keep this list aligned with Reasonix's actual tool identities. Git history/diff
+// inspection belongs to the host's MCP/exec surface until the CLI exposes names
+// that it recognizes in subagent profiles.
+export const READ_ONLY_PROFILE_TOOLS = Object.freeze(['read_file', 'grep', 'glob', 'ls', 'code_index']);
 export const WRITE_PROFILE_TOOLS = Object.freeze([...READ_ONLY_PROFILE_TOOLS, 'edit_file', 'write_file']);
 export const DEFAULT_WRITE_SUBAGENT_SUFFIX = '-write';
 export const EXEC_HARD_TIMEOUT_SECONDS_CAP = 1800;
@@ -230,13 +233,16 @@ function cacheableDoctorData(data) {
     version: typeof data?.version === 'string' ? data.version : null,
     config: { default_model: typeof data?.config?.default_model === 'string' ? data.config.default_model.trim() : '' },
     providers,
+    warnings: Array.isArray(data?.warnings)
+      ? data.warnings.filter((warning) => typeof warning === 'string' && warning.trim()).map((warning) => warning.trim()).slice(0, 128)
+      : [],
   };
 }
 
 function isCacheableDoctorData(data) {
   if (!data || typeof data !== 'object' || (data.version !== null && typeof data.version !== 'string')
     || !data.config || typeof data.config !== 'object' || typeof data.config.default_model !== 'string'
-    || !Array.isArray(data.providers)) return false;
+    || !Array.isArray(data.providers) || !Array.isArray(data.warnings)) return false;
   return data.providers.every((provider) => {
     if (!provider || typeof provider !== 'object' || typeof provider.name !== 'string') return false;
     if (provider.models !== undefined && (!Array.isArray(provider.models) || provider.models.some((model) => typeof model !== 'string'))) return false;
@@ -343,6 +349,21 @@ export function readBridgeConfig(configPath = BRIDGE_CONFIG_PATH) {
   } catch (error) {
     throw new ConfigError(`invalid bridge config ${configPath}: ${error.message}`);
   }
+}
+
+export function doctorWarnings(doctor) {
+  return Array.isArray(doctor?.warnings)
+    ? doctor.warnings.filter((warning) => typeof warning === 'string' && warning.trim()).map((warning) => warning.trim())
+    : [];
+}
+
+/** Return only profile tool identity warnings for the selected profile. */
+export function doctorUnknownToolReferences(doctor, profileName = '') {
+  const name = typeof profileName === 'string' ? profileName.trim() : '';
+  return doctorWarnings(doctor).filter((warning) => {
+    if (!/allowed-tools reference .* is not a known tool identity/u.test(warning)) return false;
+    return !name || new RegExp(`^skill "${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}" `, 'u').test(warning);
+  });
 }
 
 /** Resolve the explicit transport switch; invalid values fail closed to per-call. */
