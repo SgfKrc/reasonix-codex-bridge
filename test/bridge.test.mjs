@@ -1311,6 +1311,7 @@ process.stdout.write('z'.repeat(64));
   const responses = await readMcpSession(child, [
     { id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
     { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'limit-check', cwd: '.', max_steps: 99, timeout_seconds: 999 } } },
+    { id: 3, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
   ]);
   const exit = await new Promise((resolve) => child.once('close', resolve));
   assert.equal(exit, 0);
@@ -1318,6 +1319,9 @@ process.stdout.write('z'.repeat(64));
   assert.deepEqual(status.limits, { maxStepsCap: 3, toolRoundsCap: 1, taskCharCap: 8000, timeoutSecondsCap: 4, outputCharCap: 20, queueCap: 1 });
   assert.equal(responses[1].result.isError, false);
   assert.match(responses[1].result.content[0].text, /\[output truncated; original 64 chars\]/);
+  const afterStatus = JSON.parse(responses[2].result.content[0].text);
+  assert.equal(afterStatus.lastRun.outcome, 'success');
+  assert.equal(afterStatus.lastRun.truncated, true);
   const args = JSON.parse(readFileSync(capturePath, 'utf8'));
   assert.equal(args[args.indexOf('--max-steps') + 1], '3');
 });

@@ -463,7 +463,10 @@ function clampInteger(value, fallback, cap) {
   if (!Number.isFinite(parsed)) return safeFallback;
   return Math.min(cap, Math.max(1, Math.trunc(parsed)));
 }
-function truncate(value, cap) { return value.length <= cap ? value : `${value.slice(0, cap)}\n\n[output truncated; original ${value.length} chars]`; }
+function truncate(value, cap, originalLength = value.length, trim = false) {
+  const body = trim ? value.trim() : value;
+  return originalLength <= cap ? body : `${body.slice(0, cap)}\n\n[output truncated; original ${originalLength} chars]`;
+}
 function parseStepLimit(stderr) {
   const match = String(stderr ?? '').match(/paused after\s+(\d+)\s+tool-call rounds?\s+\(max_steps\)/iu);
   return match ? Number(match[1]) : null;
@@ -532,7 +535,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
       return;
     }
     const child = spawn(invocation.file, invocation.args, invocation.options);
-    let stdout = ''; let stderr = ''; let settled = false; let truncatedOutput = false;
+    let stdout = ''; let stderr = ''; let stdoutChars = 0; let stderrChars = 0; let settled = false; let truncatedOutput = false;
     let cancelRequested = false;
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     const finish = (result, outcome, exitCode = null, extra = {}) => {
@@ -542,8 +545,8 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
       if (cancelRef) cancelRef.cancel = null;
       const finalOutcome = cancelRequested ? 'cancelled' : outcome;
       const finalResult = cancelRequested ? { isError: true, text: `worker cancelled after ${((Date.now() - startedAt) / 1000).toFixed(1)}s` } : result;
-      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
-      resolve({ ...finalResult, meta: { outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
+      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap });
+      resolve({ ...finalResult, meta: { outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap } });
     };
     const timer = setTimeout(async () => {
       if (settled) return;
@@ -557,7 +560,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
         ? await createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome: 'timeout', exitCode: null, parentCheckpointId })
         : null;
       const suffix = checkpointId ? `\n\ncheckpoint_id=${checkpointId}; call reasonix_resume to continue explicitly.` : '';
-      finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000)}${suffix}` }, 'timeout', null, checkpointId ? { checkpointId } : {});
+      finish({ isError: true, text: `worker timeout (${timeoutSeconds}s)\n${truncate(stderr, 2000, stderrChars)}${suffix}` }, 'timeout', null, checkpointId ? { checkpointId } : {});
     }, timeoutSeconds * 1000);
     if (cancelRef && typeof cancelRef === 'object') {
       cancelRef.cancel = () => {
@@ -567,8 +570,18 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
       };
       if (cancelRef.requested) cancelRef.cancel();
     }
-    child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > outputCharCap * 2) { truncatedOutput = true; void terminate(child); } });
-    child.stderr.on('data', (chunk) => { stderr += chunk; if (stderr.length > outputCharCap) { truncatedOutput = true; void terminate(child); } });
+    child.stdout.on('data', (chunk) => {
+      stdoutChars += chunk.length;
+      const remaining = Math.max(0, outputCharCap * 2 - stdout.length);
+      if (remaining > 0) stdout += chunk.slice(0, remaining);
+      if (stdoutChars > outputCharCap) truncatedOutput = true;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrChars += chunk.length;
+      const remaining = Math.max(0, outputCharCap * 2 - stderr.length);
+      if (remaining > 0) stderr += chunk.slice(0, remaining);
+      if (stderrChars > outputCharCap) truncatedOutput = true;
+    });
     child.on('error', (error) => finish({ isError: true, text: `cannot start reasonix CLI: ${error.message}` }, 'spawn_error'));
     child.on('close', async (code) => {
       if (settled) return;
@@ -576,7 +589,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
         finish({ isError: true, text: '' }, 'cancelled', code);
         return;
       }
-      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(mode === 'plan' ? stdout : stdout.trim(), outputCharCap);
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(stdout, outputCharCap, stdoutChars, mode !== 'plan');
       if (code !== 0) {
         const stepLimitRounds = parseStepLimit(stderr);
         const cursorError = parseCursorError(stderr);
@@ -590,7 +603,7 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
           ? await createRunCheckpoint({ mode, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: code, stepLimitRounds, cursorError, parentCheckpointId })
           : null;
         const extra = { ...(stepLimitRounds === null ? {} : { stepLimitRounds }), ...(cursorError ? { cursorError: true } : {}), ...(checkpointId ? { checkpointId } : {}) };
-        const stderrBody = cursorError ? '[cursor diagnostic redacted]' : truncate(stderr, 2000);
+        const stderrBody = cursorError ? '[cursor diagnostic redacted]' : truncate(stderr, 2000, stderrChars);
         const suffix = checkpointId ? `\n\ncheckpoint_id=${checkpointId}; call reasonix_resume to continue explicitly.` : '';
         finish({ isError: true, text: `${prefix}${body ? `\n\n--- stdout ---\n${body}` : ''}${stderrBody ? `\n\n--- stderr ---\n${stderrBody}` : ''}${suffix}` }, outcome, code, extra);
       }

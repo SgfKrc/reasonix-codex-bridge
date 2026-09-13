@@ -222,7 +222,9 @@ paths are never written. With `BRIDGE_LOG` unset, the bridge performs no log wri
 
 The bridge is deliberately stateless per call. It confines `cwd` to allowed roots, rejects
 `implement` unless the write policy is enabled, limits task/budget/output sizes, terminates the
-process tree on timeout/cancel, and keeps write operations exclusive. Explicit read-only parallel
+process tree on timeout/cancel, and keeps write operations exclusive. Output beyond
+`OUTPUT_CHAR_CAP` is bounded in memory and returned as a successful result with
+`truncated=true`; output overflow alone does not kill the worker. Explicit read-only parallel
 jobs are independently spawned and reclaimed when they finish. This avoids accumulating one
 conversation beyond Reasonix's hard 128 MB history limit.
 
