@@ -12,10 +12,6 @@ import { AcpSessionCoordinator } from './acp-session.mjs';
 
 const SECURITY_ERROR_PREFIXES = ['session_scope_', 'write_', 'read_mode_', 'mode_'];
 
-function clone(value) {
-  return structuredClone(value);
-}
-
 function validSessionKey(value) {
   if (value === undefined || value === null || value === '') return null;
   if (typeof value !== 'string' || !value.trim() || value.length > 256 || /[\r\n]/u.test(value)) {
@@ -57,6 +53,8 @@ export class AcpTransportManager {
     this.owner = owner.trim();
     this.onEvent = onEvent;
     this.sessions = new Map();
+    this.creating = new Map();
+    this.closing = false;
     this.degraded = false;
     this.fallbackCount = 0;
     this.lastFallback = null;
@@ -73,43 +71,26 @@ export class AcpTransportManager {
     const request = { sessionId: key, taskId: scopedTaskId, owner, task, mode, cwd, profile, model, maxSteps, timeoutSeconds, timeoutMs, outputCharCap, cancelRef, requestedPaths };
     request.startedAt = startedAt;
     if (mode === 'implement') return this.#fallback(request, 'write_mode_per_call');
-    if (this.degraded) return this.#fallback(request, 'acp_degraded');
+    if (this.degraded || this.closing) return this.#fallback(request, 'acp_degraded');
     let entry = null;
-    let client = null;
-    let coordinator = null;
     let ephemeral = false;
     try {
       entry = key ? this.sessions.get(key) : null;
-      if (entry) {
-        this.#authorize(entry, request);
-      } else {
-        const metadata = { sessionId: key ?? `ephemeral-${randomUUID()}`, cwd, profile, model, owner, taskId: scopedTaskId };
-        this.#authorize(metadata, request);
-        client = await this.clientFactory({ cwd, profile, model, owner, taskId: scopedTaskId, sessionId: key, timeoutMs });
-        coordinator = new AcpSessionCoordinator({
-          client,
-          fallbackPrompt: (text, context) => {
-            const reason = context.error?.code ? `acp_${context.error.code}` : `acp_${context.reason ?? 'per_call'}`;
-            return this.#fallback({ ...request, task: text }, reason, context.error);
-          },
-          sanitizePrompt: this.securityPolicy?.sanitizeText ? this.securityPolicy.sanitizeText.bind(this.securityPolicy) : undefined,
-        });
-        await coordinator.start({ cwd });
-        entry = { key, metadata, client, coordinator, internalSessionId: coordinator.sessionId };
-        if (key) this.sessions.set(key, entry);
-        else ephemeral = true;
+      if (!entry && key) {
+        let creation = this.creating.get(key);
+        if (!creation) {
+          creation = this.#createEntry(key, request);
+          this.creating.set(key, creation);
+        }
+        try { entry = await creation; } finally {
+          if (this.creating.get(key) === creation) this.creating.delete(key);
+        }
+      } else if (!entry) {
+        entry = await this.#createEntry(null, request);
+        ephemeral = true;
       }
       this.#authorize(entry, request);
-      if (cancelRef && typeof cancelRef === 'object') {
-        let cancelSent = false;
-        cancelRef.cancel = () => {
-          if (cancelSent) return;
-          cancelSent = true;
-          void entry.client.cancel?.(entry.internalSessionId).catch?.(() => {});
-        };
-        if (cancelRef.requested) cancelRef.cancel();
-      }
-      const result = await entry.coordinator.prompt(task, { timeoutMs });
+      const result = await this.#enqueuePrompt(entry, request, task, timeoutMs);
       if (cancelRef?.requested) return this.#cancelled(request, entry);
       if (result?.transport === 'per_call' || result?.meta?.transport === 'per-call') {
         const reason = result.meta?.transportFallback ?? '';
@@ -135,20 +116,19 @@ export class AcpTransportManager {
       this.onEvent?.({ action: 'acp_fallback', sessionId: key, reason: this.lastFallback.reason, code: this.lastFallback.code });
       if (entry) {
         await this.#closeEntry(entry, key);
-      } else {
-        try { await coordinator?.close?.(); } catch { /* best effort */ }
-        try { await client?.close?.(); } catch { /* best effort */ }
       }
       return this.#fallback(request, this.lastFallback.reason, error);
     } finally {
       if (ephemeral) await this.#closeEntry(entry, null);
-      if (cancelRef && typeof cancelRef === 'object') cancelRef.cancel = null;
     }
   }
 
   async close() {
-    const entries = [...this.sessions.values()];
+    this.closing = true;
+    await Promise.allSettled([...this.creating.values()]);
+    const entries = [...new Set(this.sessions.values())];
     this.sessions.clear();
+    this.creating.clear();
     await Promise.all(entries.map((entry) => this.#closeEntry(entry, null)));
   }
 
@@ -165,15 +145,82 @@ export class AcpTransportManager {
     });
   }
 
+  async #createEntry(key, request) {
+    const metadata = { sessionId: key ?? `ephemeral-${randomUUID()}`, cwd: request.cwd, profile: request.profile, model: request.model, owner: request.owner, taskId: request.taskId };
+    this.#authorize(metadata, request);
+    let client = null;
+    let coordinator = null;
+    let entry = null;
+    try {
+      client = await this.clientFactory({ cwd: request.cwd, profile: request.profile, model: request.model, owner: request.owner, taskId: request.taskId, sessionId: key, timeoutMs: request.timeoutMs });
+      coordinator = new AcpSessionCoordinator({
+        client,
+        fallbackPrompt: (text, context) => {
+          const activeRequest = entry?.activeRequest ?? request;
+          const reason = context.error?.code ? `acp_${context.error.code}` : `acp_${context.reason ?? 'per_call'}`;
+          return this.#fallback({ ...activeRequest, task: text }, reason, context.error);
+        },
+        sanitizePrompt: this.securityPolicy?.sanitizeText ? this.securityPolicy.sanitizeText.bind(this.securityPolicy) : undefined,
+      });
+      await coordinator.start({ cwd: request.cwd });
+      entry = { key, metadata, client, coordinator, internalSessionId: coordinator.sessionId, activeRequest: null, tail: Promise.resolve(), closed: false };
+      if (this.closing) throw new AcpError('ACP transport manager is closing', { code: 'closed' });
+      if (key) this.sessions.set(key, entry);
+      return entry;
+    } catch (error) {
+      try { await coordinator?.close?.(); } catch { /* best effort */ }
+      try { await client?.close?.(); } catch { /* best effort */ }
+      throw error;
+    }
+  }
+
   async #closeEntry(entry, key) {
     if (!entry) return;
+    entry.closed = true;
     if (key) this.sessions.delete(key);
+    try { await entry.tail; } catch { /* prompt failure is handled by its caller */ }
     try { await entry.coordinator?.close?.(); } catch { /* best effort */ }
     try { await entry.client?.close?.(); } catch { /* best effort */ }
   }
 
   #cancelled(request, entry) {
-    return { isError: true, text: `worker cancelled (transport=acp session=${request.sessionId ?? 'ephemeral'})`, meta: { outcome: 'cancelled', transport: 'acp', sessionId: request.sessionId, internalSessionId: entry?.internalSessionId ?? null, exitCode: null, elapsedMs: Date.now() - request.startedAt, outputBytes: 0, truncated: false } };
+    return { isError: true, text: `worker cancelled (transport=acp session=${request.sessionId ?? 'ephemeral'})`, meta: { outcome: 'cancelled', transport: 'acp', sessionId: request.sessionId, internalSessionId: entry?.coordinator?.sessionId ?? entry?.internalSessionId ?? null, exitCode: null, elapsedMs: Date.now() - request.startedAt, outputBytes: 0, truncated: false } };
+  }
+
+  #enqueuePrompt(entry, request, task, timeoutMs) {
+    const cancelRef = request.cancelRef;
+    let started = false;
+    let settled = false;
+    let cancelled = false;
+    const cancel = () => {
+      if (settled) return;
+      cancelled = true;
+      if (started) void entry.client.cancel?.(entry.coordinator?.sessionId ?? entry.internalSessionId).catch?.(() => {});
+    };
+    if (cancelRef && typeof cancelRef === 'object') {
+      cancelRef.cancel = cancel;
+      if (cancelRef.requested) cancel();
+    }
+    const operation = async () => {
+      if (cancelled || cancelRef?.requested) return this.#cancelled(request, entry);
+      if (this.degraded || entry.closed || !entry.coordinator?.started) return this.#fallback(request, 'acp_degraded');
+      started = true;
+      if (cancelled || cancelRef?.requested) return this.#cancelled(request, entry);
+      entry.activeRequest = request;
+      try {
+        const result = await entry.coordinator.prompt(task, { timeoutMs });
+        entry.internalSessionId = entry.coordinator.sessionId;
+        return result;
+      } finally {
+        entry.activeRequest = null;
+      }
+    };
+    const current = entry.tail.then(operation, operation);
+    entry.tail = current.catch(() => {});
+    return current.finally(() => {
+      settled = true;
+      if (cancelRef && typeof cancelRef === 'object' && cancelRef.cancel === cancel) cancelRef.cancel = null;
+    });
   }
 
   async #fallback(request, reason, error = null) {

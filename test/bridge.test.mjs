@@ -45,6 +45,7 @@ const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
 const CONFIGURE_PATH = path.join(BRIDGE_ROOT, 'src', 'configure.mjs');
 const CHECK_LINKS_PATH = path.join(BRIDGE_ROOT, 'scripts', 'check-readme-links.mjs');
+const ACP_ACCEPTANCE_PATH = path.join(BRIDGE_ROOT, 'scripts', 'acp-acceptance.mjs');
 const PACKAGE_PATH = path.join(BRIDGE_ROOT, 'package.json');
 const CHANGELOG_PATH = path.join(BRIDGE_ROOT, 'CHANGELOG.md');
 const PROJECT_TEST_ROOT = path.resolve(BRIDGE_ROOT, '..', '..', 'build', 'bridge-test');
@@ -781,6 +782,21 @@ describe('offline command contracts', () => {
     assert.equal(status.lastRun.transportFallback, 'acp_process_exit');
   });
 
+  test('ACP-06 offline acceptance drill covers crash resume, bounded history, and cleanup', () => {
+    const result = spawnSync(process.execPath, [ACP_ACCEPTANCE_PATH], { cwd: BRIDGE_ROOT, encoding: 'utf8', windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const report = JSON.parse(result.stdout.trim().split(/\r?\n/u).at(-1));
+    assert.equal(report.schema, 'qlh.reasonix.acp.acceptance.v1');
+    assert.equal(report.status, 'passed');
+    assert.equal(report.resume.orphanDetected, true);
+    assert.equal(report.resume.resumed, true);
+    assert.equal(report.compact.action, 'compact');
+    assert.equal(report.compact.rotate, 'rotate');
+    assert.equal(report.transport.serialized, true);
+    assert.equal(report.transport.cancelled, true);
+    assert.equal(report.realClient.childClosed, true);
+  });
+
   test('rejects a task over the reported context window before spawning the worker', async () => {
     const root = tempRoot();
     writeCliFiles(root, { contextWindow: 4 });
@@ -1401,13 +1417,13 @@ describe('ACP session budget coordinator', () => {
   });
 });
 
-function registryClient({ sessionId = 'registry-session-1', canResume = true, canLoad = true, delayMs = 0, failClose = false } = {}) {
+function registryClient({ sessionId = 'registry-session-1', canResume = true, canLoad = true, delayMs = 0, failClose = false, failNew = false } = {}) {
   const events = [];
   const client = {
     started: false,
     closed: false,
     async start() { this.started = true; this.closed = false; events.push(['start']); },
-    async newSession() { events.push(['new', sessionId]); return { sessionId }; },
+    async newSession() { events.push(['new', sessionId]); if (failNew) throw Object.assign(new Error('new failed'), { code: 'new_failed' }); return { sessionId }; },
     supportsSession(name) { return name === 'resume' ? canResume : name === 'load' ? canLoad : name === 'delete'; },
     async resumeSession(id) { events.push(['resume', id]); return { sessionId: id }; },
     async loadSession(id) { events.push(['load', id]); return { sessionId: id }; },
@@ -1425,6 +1441,16 @@ function registryClient({ sessionId = 'registry-session-1', canResume = true, ca
 }
 
 describe('ACP session registry', () => {
+  test('closes a started client when session creation fails before registration', async () => {
+    const root = tempRoot();
+    const { client, events } = registryClient({ failNew: true });
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json') });
+    await assert.rejects(() => registry.create({ client, cwd: root, profile: 'read', model: 'fixture/provider' }), (error) => error.code === 'new_failed');
+    assert.equal(client.closed, true);
+    assert.deepEqual(events.map((event) => event[0]), ['start', 'new', 'close-client']);
+    assert.equal(registry.size, 0);
+  });
+
   test('uses the project build test root and persists metadata without task bodies', async () => {
     const root = tempRoot();
     assert.equal(path.dirname(root), PROJECT_TEST_ROOT);
@@ -1611,10 +1637,12 @@ describe('ACP session security policy', () => {
 });
 
 describe('ACP transport coexistence switch', () => {
-  function transportClient({ failStart = false, failNewSessionCode = null, failPromptCode = null } = {}) {
+  function transportClient({ failStart = false, failNewSessionCode = null, failPromptCode = null, delayMs = 0 } = {}) {
     const events = [];
     let nextSession = 1;
     let promptCount = 0;
+    let activePrompts = 0;
+    let maxActivePrompts = 0;
     const client = {
       started: false,
       closed: false,
@@ -1629,12 +1657,20 @@ describe('ACP transport coexistence switch', () => {
       async prompt(sessionId, text) {
         events.push(['prompt', sessionId, text]);
         if (failPromptCode && promptCount++ === 0) throw Object.assign(new Error(`ACP ${failPromptCode}`), { code: failPromptCode });
-        return { text: `answer:${text}` };
+        activePrompts += 1;
+        maxActivePrompts = Math.max(maxActivePrompts, activePrompts);
+        try {
+          if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+          return { text: `answer:${text}` };
+        } finally {
+          activePrompts -= 1;
+        }
       },
+      async cancel(sessionId) { events.push(['cancel', sessionId]); },
       async closeSession(sessionId) { events.push(['close-session', sessionId]); return {}; },
       async close() { events.push(['close']); this.closed = true; this.started = false; },
     };
-    return { client, events };
+    return { client, events, get maxActivePrompts() { return maxActivePrompts; } };
   }
 
   test('defaults and invalid transport values fail closed to per-call', () => {
@@ -1705,6 +1741,27 @@ describe('ACP transport coexistence switch', () => {
     assert.deepEqual(fallbacks, ['acp_protocol_error']);
     assert.equal(fixture.client.closed, true);
     assert.ok(fixture.events.some((event) => event[0] === 'close'));
+  });
+
+  test('serializes concurrent prompts for one ACP session and cancels only the active request', async () => {
+    const fixture = transportClient({ delayMs: 12 });
+    const manager = new AcpTransportManager({ clientFactory: async () => fixture.client, fallback: async () => ({ isError: true, text: 'fallback' }) });
+    const first = manager.run({ sessionId: 'session-a', task: 'one', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider' });
+    const second = manager.run({ sessionId: 'session-a', task: 'two', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider' });
+    const results = await Promise.all([first, second]);
+    assert.deepEqual(results.map((result) => result.meta.transport), ['acp', 'acp']);
+    assert.deepEqual(fixture.events.filter((event) => event[0] === 'prompt').map((event) => event[2]), ['one', 'two']);
+    assert.equal(fixture.events.filter((event) => event[0] === 'new').length, 1);
+    assert.equal(fixture.maxActivePrompts, 1);
+    const cancelRef = { requested: false, cancel: null };
+    const cancelled = manager.run({ sessionId: 'session-a', task: 'three', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider', cancelRef });
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    cancelRef.requested = true;
+    cancelRef.cancel?.();
+    const cancelledResult = await cancelled;
+    assert.equal(cancelledResult.meta.outcome, 'cancelled');
+    assert.ok(fixture.events.some((event) => event[0] === 'cancel'));
+    await manager.close();
   });
 
   test('accepts a configured additional allowed root without allowing session cwd drift', () => {

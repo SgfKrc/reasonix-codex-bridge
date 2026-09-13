@@ -1,12 +1,14 @@
 # ACP Transport Design (E2)
 
-Status: ACP-01 through ACP-05 have landed. Production default transport remains stateless
-per-call; `transport: "acp"` is an explicit, read-only, process-local opt-in with automatic
-per-call fallback. Durable registry recovery and strong-kill acceptance remain ACP-06 work.
+Status: ACP-01 through ACP-05 have landed. The ACP-06 offline acceptance drill passes. Production
+default transport remains stateless per-call; `transport: "acp"` is an explicit, read-only,
+process-local opt-in with automatic per-call fallback. Real Reasonix cross-process resume is
+blocked until a session that has produced a prompt is persisted by the provider.
 
 The bridge now has a separate task-level checkpoint/`reasonix_resume` path. It is not ACP session
 resume: it starts a new Reasonix process with an explicit continuation instruction after validating
-the saved configuration and workspace fingerprints. Persistent ACP history remains design-only.
+the saved configuration and workspace fingerprints. Durable ACP history remains opt-in and
+provider-gated.
 
 ## Goals and boundaries
 
@@ -73,7 +75,7 @@ fallback receives only the next message and reason, never persistent history.
 
 This is an adapter-level implementation, not a claim that ACP history replacement is a native
 Reasonix operation. The coordinator remains opt-in and is wired by the ACP-05 transport manager;
-durable cross-process recovery is intentionally deferred to ACP-06.
+durable cross-process recovery is accepted only after the ACP-06 provider persistence gate passes.
 
 ## ACP-03 session registry and lifecycle
 
@@ -89,7 +91,8 @@ client factory and successfully completes capability-gated `session/resume` (or 
 fallback). A crashed transport is detected before prompt dispatch and cannot be used until resumed.
 `shutdown` closes every live entry and reports failures, while `installProcessHandlers` exposes the
 embedding layer's signal/exit cleanup hook. The registry is not imported by `server.mjs`; process
-ownership and durable recovery remain ACP-06 work. An embedding layer
+ownership and durable recovery remain gated by the real-provider persistence
+acceptance described in ACP-06. An embedding layer
 may attach the ACP-04 `AcpSecurityPolicy` to the registry; each queued prompt is then checked again
 before dispatch so a caller cannot bypass the session scope through queue timing.
 
@@ -108,7 +111,8 @@ Bearer tokens, and private-key blocks. `AcpSessionCoordinator` accepts an opt-in
 function and always scrubs assistant responses before retaining local continuation history. The
 registry persists only the opaque scope metadata, never prompts or responses. ACP-04 remains opt-in:
 `server.mjs` loads the security gate through the ACP-05 transport manager only when
-`transport: "acp"` is selected; the registry remains unwired until ACP-06.
+`transport: "acp"` is selected; the registry remains unwired in the production
+server path pending the real-provider persistence gate from ACP-06.
 
 ## ACP-05 coexistence and switching
 
@@ -123,8 +127,40 @@ through the normal per-call worker, and marks ACP degraded after a startup, prot
 process failure. Degraded and unsupported ACP calls automatically use the same per-call worker with
 the original limits and checkpoint behavior. `reasonix_status` reports the configured transport and
 bounded ACP session/fallback counters; no prompt or response body is placed in status or logs.
-The switch is explicit and process-local in ACP-05. Durable registry recovery and strong-kill
-acceptance remain ACP-06 work.
+The switch is explicit and process-local in ACP-05. ACP-06 now supplies the offline lifecycle
+gate, while provider-backed cross-process recovery remains blocked until the persistence
+semantics are demonstrated with a non-empty session.
+
+## ACP-06 acceptance drill
+
+`scripts/acp-acceptance.mjs` is a deterministic, model-free acceptance entry point. It writes
+only under the ignored project-local `build/bridge-test/` root (with no task or response bodies),
+starts a separate registry child, strongly terminates it, reloads the metadata registry as an
+orphan, resumes and prompts through a fixture, and verifies compact/rotate, serialized
+concurrency, cancellation, child cleanup, and artifact removal. Run:
+
+```text
+npm run check
+npm run acceptance:acp
+```
+
+The offline command returns a bounded JSON report with
+`process.childExited=true`, `resume.resumed=true`, `compact.replacementCleanup=true`,
+`transport.serialized=true`, `transport.cancelled=true`, `realClient.childClosed=true`, and
+`artifacts.retainedBodies=false`. The current bridge regression is `92 passed / 0 failed`.
+
+The opt-in real-provider control-plane probe is:
+
+```text
+npm run acceptance:acp:real
+```
+
+On 2026-09-13 with Reasonix CLI v1.38.7 it created a session, strongly killed the ACP child, and
+then received `unknown session` when resuming the empty session. The command intentionally emits
+`qlh.reasonix.acp.acceptance.real.v1` with `status: "blocked"`,
+`reason: "empty_session_not_persisted"`, and exit code 2. This is an external provider
+persistence boundary, not an offline bridge failure. No model prompt is sent by this probe; rerun
+after a provider-backed persistence fixture or an explicitly approved real prompt test.
 
 ## Failure and observability contract
 
@@ -132,4 +168,5 @@ The adapter may record only enum outcomes (`append`, `compact`, `rotate`, `per_c
 counts/byte sizes, elapsed time, and a redacted session state. It must not record message bodies.
 Compaction failure is recoverable: the request still gets a stateless attempt, while the failed
 persistent session remains unchanged for inspection or explicit closure. Persistent ACP remains
-opt-in until a real transport, crash recovery, and provider-specific context contract are reviewed.
+opt-in until a real transport, crash recovery, and provider-specific context/persistence contract
+are reviewed. A real provider result of `blocked` is surfaced as such and never treated as a pass.

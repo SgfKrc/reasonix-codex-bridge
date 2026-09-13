@@ -1,7 +1,7 @@
 /**
  * Opt-in ACP session registry and lifecycle coordinator.
  *
- * The production MCP server remains stateless until ACP-05. This module keeps
+ * The production MCP server remains per-call by default. This module keeps
  * session metadata durable without persisting prompts, responses, or secrets,
  * serializes work per session, and makes resume/cleanup explicit to its caller.
  */
@@ -98,10 +98,15 @@ export class AcpSessionRegistry {
   async create({ client, cwd, profile, model, owner, taskId, scope, sessionOptions = {} } = {}) {
     if (!client || typeof client.newSession !== 'function') throw new TypeError('client with newSession is required');
     const normalizedScope = normalizeSessionScope({ owner, taskId, scope }, { required: this.scopeRequired });
-    await client.start?.();
-    const result = await client.newSession(sessionOptions);
-    const metadata = validateMetadata({ sessionId: result?.sessionId, cwd, profile, model, ...normalizedScope }, { scopeRequired: this.scopeRequired });
-    return this.register({ ...metadata, client });
+    try {
+      await client.start?.();
+      const result = await client.newSession(sessionOptions);
+      const metadata = validateMetadata({ sessionId: result?.sessionId, cwd, profile, model, ...normalizedScope }, { scopeRequired: this.scopeRequired });
+      return this.register({ ...metadata, client });
+    } catch (error) {
+      try { await client.close?.(); } catch { /* best effort teardown */ }
+      throw error;
+    }
   }
 
   register({ client, sessionId, cwd, profile, model, owner, taskId, scope, createdAt = this.now(), lastUsedAt = createdAt } = {}) {

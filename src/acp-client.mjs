@@ -244,6 +244,19 @@ export class AcpClient {
     this.sessions.clear();
   }
 
+  /** Terminate the ACP process tree without sending session close requests. */
+  async abort() {
+    const child = this.child;
+    this.closed = true;
+    this.started = false;
+    this.#failPending(new AcpError('ACP client aborted', { code: 'closed' }));
+    this.reader?.close();
+    try { child?.stdin?.destroy?.(); } catch { /* already closed */ }
+    await terminateProcess(child);
+    this.child = null;
+    this.sessions.clear();
+  }
+
   #resumeLike(method, sessionId, { cwd, additionalDirectories, mcpServers }) {
     if (typeof sessionId !== 'string' || !sessionId.trim()) throw new TypeError('sessionId is required');
     const params = { sessionId: sessionId.trim(), cwd, mcpServers };
