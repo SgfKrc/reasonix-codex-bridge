@@ -1,8 +1,8 @@
 /**
  * Opt-in security gates for persistent ACP sessions.
  *
- * The MCP server intentionally remains stateless until ACP-05. Consumers that
- * enable ACP persistence can use this module to bind a session to one caller,
+ * The MCP server remains per-call by default. Consumers that explicitly enable
+ * ACP persistence can use this module to bind a session to one caller,
  * keep its cwd inside the workspace, enforce the existing write policy, and
  * remove credentials from local continuation history.
  */
@@ -127,7 +127,7 @@ export class AcpSecurityPolicy {
     }
     const cwd = normalizedAbsolute(request.cwd ?? session.cwd, 'cwd');
     const sessionCwd = normalizedAbsolute(session.cwd, 'session.cwd');
-    if (cwd !== sessionCwd || !inside(this.workspaceRoot, cwd) || !this.allowedRoots.some((root) => inside(root, cwd))) {
+    if (cwd !== sessionCwd || !this.allowedRoots.some((root) => inside(root, cwd))) {
       throw new AcpError('ACP session cwd is outside the allowed workspace roots', { code: 'session_scope_mismatch' });
     }
     for (const field of ['profile', 'model']) {

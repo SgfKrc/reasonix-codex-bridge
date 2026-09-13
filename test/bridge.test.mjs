@@ -23,6 +23,7 @@ import {
   readDoctor,
   resolveModelRef,
   resolveSubagentRole,
+  resolveTransport,
   upsertReasonixBlock,
   validateCodexBlock,
   validateModelRef,
@@ -38,6 +39,7 @@ import { AcpClient, collectAcpText } from '../src/acp-client.mjs';
 import { AcpSessionCoordinator, summarizeAcpMessages } from '../src/acp-session.mjs';
 import { ACP_REGISTRY_SCHEMA, AcpSessionRegistry } from '../src/acp-registry.mjs';
 import { AcpSecurityPolicy, normalizeSessionScope, scrubAcpContent, scrubAcpMessages } from '../src/acp-security.mjs';
+import { AcpTransportManager } from '../src/acp-transport.mjs';
 
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
@@ -159,6 +161,26 @@ exit 0
   // chmod is intentionally avoided in the Windows test path; POSIX runners use a shell script.
   spawnSync('chmod', ['+x', file]);
   return file;
+}
+
+function writeAcpCli(root, { failStart = false } = {}) {
+  writeFileSync(path.join(root, 'acp'), `
+const readline = require('node:readline');
+if (${JSON.stringify(failStart)} && process.argv[1].endsWith('acp')) process.exit(17);
+let nextSession = 1;
+const input = readline.createInterface({ input: process.stdin, terminal: false });
+function send(message) { process.stdout.write(JSON.stringify(message) + '\\n'); }
+input.on('line', (line) => {
+  if (!line.trim()) return;
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {}, delete: {} } } } });
+  else if (message.method === 'session/new') send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'server-fixture-' + nextSession++ } });
+  else if (message.method === 'session/prompt') {
+    send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'acp-server-answer' } } } });
+    send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
+  } else if (message.method === 'session/close' || message.method === 'session/delete' || message.method === 'session/cancel') send({ jsonrpc: '2.0', id: message.id, result: {} });
+});
+`, 'utf8');
 }
 
 function acpFixtureSpawn() {
@@ -713,6 +735,50 @@ describe('offline command contracts', () => {
       error: null,
     });
     assert.equal(readdirSync(root).some((name) => name.endsWith('.jsonl')), false);
+  });
+
+  test('explicit ACP transport reuses a session and reports bounded transport status', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeAcpCli(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', transport: 'acp' }), 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [
+      { id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'first', mode: 'inspect', session_id: 'demo-session' } } },
+      { id: 2, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'second', mode: 'review', session_id: 'demo-session' } } },
+      { id: 3, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
+    ]);
+    child.stdin.end();
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, false);
+    assert.match(responses[0].result.content[0].text, /transport=acp/);
+    assert.equal(responses[1].result.isError, false);
+    const status = JSON.parse(responses[2].result.content[0].text);
+    assert.equal(status.transport.configured, 'acp');
+    assert.equal(status.transport.acp.persistentSessions, 1);
+    assert.equal(status.transport.acp.fallbackCount, 0);
+  });
+
+  test('ACP startup failure degrades to the existing per-call worker', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeAcpCli(root, { failStart: true });
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', transport: 'acp' }), 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const responses = await readMcpSession(child, [
+      { id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'fallback', mode: 'inspect', session_id: 'broken-session' } } },
+      { id: 2, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } },
+    ]);
+    child.stdin.end();
+    const exit = await new Promise((resolve) => child.once('close', resolve));
+    assert.equal(exit, 0);
+    assert.equal(responses[0].result.isError, false);
+    const status = JSON.parse(responses[1].result.content[0].text);
+    assert.equal(status.transport.acp.degraded, true);
+    assert.equal(status.transport.acp.fallbackCount, 1);
+    assert.equal(status.lastRun.transport, 'per-call');
+    assert.equal(status.lastRun.transportFallback, 'acp_process_exit');
   });
 
   test('rejects a task over the reported context window before spawning the worker', async () => {
@@ -1541,6 +1607,113 @@ describe('ACP session security policy', () => {
     assert.deepEqual(normalizeSessionScope({ owner: 'a', taskId: 'b' }, { required: true }), { owner: 'a', taskId: 'b' });
     assert.throws(() => normalizeSessionScope({ owner: 'a' }, { required: true }), (error) => error.code === 'session_scope_required');
     assert.throws(() => normalizeSessionScope({ owner: 'a', taskId: 'b\nc' }), (error) => error.code === 'session_scope_invalid');
+  });
+});
+
+describe('ACP transport coexistence switch', () => {
+  function transportClient({ failStart = false, failNewSessionCode = null, failPromptCode = null } = {}) {
+    const events = [];
+    let nextSession = 1;
+    let promptCount = 0;
+    const client = {
+      started: false,
+      closed: false,
+      async start() { events.push(['start']); if (failStart) throw Object.assign(new Error('ACP unavailable'), { code: 'spawn_error' }); this.started = true; },
+      async newSession() {
+        events.push(['new']);
+        if (failNewSessionCode) throw Object.assign(new Error(`ACP ${failNewSessionCode}`), { code: failNewSessionCode });
+        const sessionId = `transport-session-${nextSession++}`;
+        events.at(-1).push(sessionId);
+        return { sessionId };
+      },
+      async prompt(sessionId, text) {
+        events.push(['prompt', sessionId, text]);
+        if (failPromptCode && promptCount++ === 0) throw Object.assign(new Error(`ACP ${failPromptCode}`), { code: failPromptCode });
+        return { text: `answer:${text}` };
+      },
+      async closeSession(sessionId) { events.push(['close-session', sessionId]); return {}; },
+      async close() { events.push(['close']); this.closed = true; this.started = false; },
+    };
+    return { client, events };
+  }
+
+  test('defaults and invalid transport values fail closed to per-call', () => {
+    assert.equal(resolveTransport({ path: 'fixture.json', data: {} }).mode, 'per-call');
+    assert.equal(resolveTransport({ path: 'fixture.json', data: { transport: 'acp' } }).mode, 'acp');
+    const invalid = resolveTransport({ path: 'fixture.json', data: { transport: 'ACP-ish' } });
+    assert.equal(invalid.mode, 'per-call');
+    assert.match(invalid.error, /per-call/);
+  });
+
+  test('reuses only an explicit ACP session and keeps implement on per-call fallback', async () => {
+    const fixture = transportClient();
+    const fallbacks = [];
+    const manager = new AcpTransportManager({
+      clientFactory: async () => fixture.client,
+      fallback: async (request, context) => { fallbacks.push([request.task, context.reason]); return { isError: false, text: `fallback:${request.task}`, meta: { outcome: 'success' } }; },
+    });
+    const first = await manager.run({ sessionId: 'session-a', task: 'one', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider', maxSteps: 80, timeoutSeconds: 5 });
+    const second = await manager.run({ sessionId: 'session-a', task: 'two', cwd: 'C:/fixture', mode: 'review', profile: 'read', model: 'fixture/provider', maxSteps: 96, timeoutSeconds: 5 });
+    const write = await manager.run({ sessionId: 'session-a', task: 'write', cwd: 'C:/fixture', mode: 'implement', profile: 'write', model: 'fixture/provider', maxSteps: 96, timeoutSeconds: 5 });
+    assert.equal(first.meta.transport, 'acp');
+    assert.equal(second.meta.transport, 'acp');
+    assert.equal(fixture.events.filter((event) => event[0] === 'new').length, 1);
+    assert.deepEqual(fallbacks, [['write', 'write_mode_per_call']]);
+    assert.equal(write.meta.transport, 'per-call');
+    await manager.close();
+    assert.ok(fixture.events.some((event) => event[0] === 'close'));
+  });
+
+  test('falls back once on ACP startup failure and marks later requests degraded', async () => {
+    const fixture = transportClient({ failStart: true });
+    const fallbacks = [];
+    const manager = new AcpTransportManager({
+      clientFactory: async () => fixture.client,
+      fallback: async (request, context) => { fallbacks.push(context.reason); return { isError: false, text: 'per-call', meta: { outcome: 'success' } }; },
+    });
+    const first = await manager.run({ sessionId: 'session-a', task: 'first', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider' });
+    const second = await manager.run({ sessionId: 'session-b', task: 'second', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider' });
+    assert.equal(first.meta.transport, 'per-call');
+    assert.equal(second.meta.transport, 'per-call');
+    assert.equal(manager.status.degraded, true);
+    assert.deepEqual(fallbacks, ['acp_spawn_error', 'acp_degraded']);
+  });
+
+  test('preserves an internal ACP transport error code through coordinator fallback', async () => {
+    const fixture = transportClient({ failPromptCode: 'timeout' });
+    const fallbacks = [];
+    const manager = new AcpTransportManager({
+      clientFactory: async () => fixture.client,
+      fallback: async (request, context) => { fallbacks.push(context.reason); return { isError: false, text: 'per-call', meta: { outcome: 'success' } }; },
+    });
+    const result = await manager.run({ sessionId: 'session-a', task: 'timeout', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider' });
+    assert.equal(result.meta.transport, 'per-call');
+    assert.equal(result.meta.transportFallback, 'acp_timeout');
+    assert.deepEqual(fallbacks, ['acp_timeout']);
+    assert.equal(manager.status.degraded, true);
+    assert.equal(manager.status.persistentSessions, 0);
+  });
+
+  test('closes an ACP client when session creation fails before registration', async () => {
+    const fixture = transportClient({ failNewSessionCode: 'protocol_error' });
+    const fallbacks = [];
+    const manager = new AcpTransportManager({
+      clientFactory: async () => fixture.client,
+      fallback: async (_request, context) => { fallbacks.push(context.reason); return { isError: false, text: 'per-call', meta: { outcome: 'success' } }; },
+    });
+    await manager.run({ sessionId: 'session-a', task: 'new-session-failure', cwd: 'C:/fixture', mode: 'inspect', profile: 'read', model: 'fixture/provider' });
+    assert.deepEqual(fallbacks, ['acp_protocol_error']);
+    assert.equal(fixture.client.closed, true);
+    assert.ok(fixture.events.some((event) => event[0] === 'close'));
+  });
+
+  test('accepts a configured additional allowed root without allowing session cwd drift', () => {
+    const root = tempRoot();
+    const extra = tempRoot();
+    const policy = new AcpSecurityPolicy({ workspaceRoot: root, allowedRoots: [root, extra], requireScope: true });
+    const session = { sessionId: 'extra-root', cwd: extra, profile: 'read', model: 'fixture/provider', owner: 'caller-a', taskId: 'task-1' };
+    assert.equal(policy.authorizeSession(session, { owner: 'caller-a', taskId: 'task-1', cwd: extra }).cwd, extra);
+    assert.throws(() => policy.authorizeSession(session, { owner: 'caller-a', taskId: 'task-1', cwd: root }), (error) => error.code === 'session_scope_mismatch');
   });
 });
 

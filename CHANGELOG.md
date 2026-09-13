@@ -6,11 +6,12 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- ACP-01 newline-delimited JSON-RPC client with capability-gated session lifecycle, prompt update aggregation, cancellation, and process cleanup; it is not enabled by the stateless server yet.
-- ACP-02 opt-in `AcpSessionCoordinator` with bounded deterministic summaries, transactional replacement sessions for compact/rotate, redacted decision telemetry, and explicit stateless fallback; it is not enabled by the stateless server yet.
+- ACP-01 newline-delimited JSON-RPC client with capability-gated session lifecycle, prompt update aggregation, cancellation, and process cleanup.
+- ACP-02 opt-in `AcpSessionCoordinator` with bounded deterministic summaries, transactional replacement sessions for compact/rotate, redacted decision telemetry, and explicit stateless fallback.
 - ACP client `session/delete` support with capability gating and local session-set cleanup.
-- ACP-03 opt-in `AcpSessionRegistry` with metadata-only persistence, orphan detection, capability-gated resume/load/delete, per-session prompt serialization, and explicit shutdown cleanup; it is not enabled by the stateless server yet.
-- ACP-04 opt-in `AcpSecurityPolicy` for owner/task isolation, workspace and profile/model pinning, fail-closed write-path preflight, and bounded credential/history scrubbing; it is not enabled by the stateless server yet.
+- ACP-03 opt-in `AcpSessionRegistry` with metadata-only persistence, orphan detection, capability-gated resume/load/delete, per-session prompt serialization, and explicit shutdown cleanup; production registry wiring remains deferred to ACP-06.
+- ACP-04 opt-in `AcpSecurityPolicy` for owner/task isolation, workspace and profile/model pinning, fail-closed write-path preflight, and bounded credential/history scrubbing; ACP-05 loads it only for explicit read-only ACP transport.
+- ACP-05 explicit `transport: "acp"` coexistence manager for read-only session ids, with per-call fallback on startup/protocol/timeout failures; default transport and implement/parallel lanes remain per-call.
 - Separate `read` and `write` profile contracts via `configure profile --role read|write`.
 - The write profile uses only `edit_file` and `write_file` beyond the canonical read tools, omits `read-only`, and has a dedicated implementation prompt.
 - Role-aware verification and status reporting for the explicit write profile workflow.

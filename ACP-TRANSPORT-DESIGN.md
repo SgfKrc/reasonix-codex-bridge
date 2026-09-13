@@ -1,8 +1,8 @@
 # ACP Transport Design (E2)
 
-Status: ACP-01 client layer and ACP-02 session budget coordinator landed; production transport
-remains design-only. `src/server.mjs` remains stateless per call; the client, coordinator, and
-`src/acp-prototype.mjs` are not imported by the server until the later coexistence/switching ticket.
+Status: ACP-01 through ACP-05 have landed. Production default transport remains stateless
+per-call; `transport: "acp"` is an explicit, read-only, process-local opt-in with automatic
+per-call fallback. Durable registry recovery and strong-kill acceptance remain ACP-06 work.
 
 The bridge now has a separate task-level checkpoint/`reasonix_resume` path. It is not ACP session
 resume: it starts a new Reasonix process with an explicit continuation instruction after validating
@@ -72,8 +72,8 @@ history unchanged. Summarizer failure or an invalid summary follows the same per
 fallback receives only the next message and reason, never persistent history.
 
 This is an adapter-level implementation, not a claim that ACP history replacement is a native
-Reasonix operation. The coordinator remains opt-in and must be wired by the later ACP-05
-tickets after lifecycle, security, and transport-switching tests are complete.
+Reasonix operation. The coordinator remains opt-in and is wired by the ACP-05 transport manager;
+durable cross-process recovery is intentionally deferred to ACP-06.
 
 ## ACP-03 session registry and lifecycle
 
@@ -89,7 +89,7 @@ client factory and successfully completes capability-gated `session/resume` (or 
 fallback). A crashed transport is detected before prompt dispatch and cannot be used until resumed.
 `shutdown` closes every live entry and reports failures, while `installProcessHandlers` exposes the
 embedding layer's signal/exit cleanup hook. The registry is not imported by `server.mjs`; process
-ownership, write-policy rechecks, and transport switching remain ACP-05 work. An embedding layer
+ownership and durable recovery remain ACP-06 work. An embedding layer
 may attach the ACP-04 `AcpSecurityPolicy` to the registry; each queued prompt is then checked again
 before dispatch so a caller cannot bypass the session scope through queue timing.
 
@@ -107,8 +107,24 @@ audit remains authoritative for actual writes, so this preflight does not weaken
 Bearer tokens, and private-key blocks. `AcpSessionCoordinator` accepts an opt-in `sanitizePrompt`
 function and always scrubs assistant responses before retaining local continuation history. The
 registry persists only the opaque scope metadata, never prompts or responses. ACP-04 remains opt-in:
-`server.mjs` is still stateless and does not import the registry, coordinator, or security gate until
-the ACP-05 coexistence switch is accepted.
+`server.mjs` loads the security gate through the ACP-05 transport manager only when
+`transport: "acp"` is selected; the registry remains unwired until ACP-06.
+
+## ACP-05 coexistence and switching
+
+`resolveTransport` accepts only `per-call` (the default) or explicit `acp`; malformed values fail
+closed to `per-call`. When `transport: "acp"` is configured, read-only `reasonix_run` calls use an
+in-process `AcpTransportManager` only when the caller supplies an opaque `session_id`. Calls without
+that id remain one-shot ACP sessions, while `implement` and explicit `parallel=true` calls always
+stay on the existing per-call path so Git write auditing and the read-only parallel lane are unchanged.
+
+The manager creates one `AcpClient`/coordinator per session key, routes compact/fallback results back
+through the normal per-call worker, and marks ACP degraded after a startup, protocol, timeout, or
+process failure. Degraded and unsupported ACP calls automatically use the same per-call worker with
+the original limits and checkpoint behavior. `reasonix_status` reports the configured transport and
+bounded ACP session/fallback counters; no prompt or response body is placed in status or logs.
+The switch is explicit and process-local in ACP-05. Durable registry recovery and strong-kill
+acceptance remain ACP-06 work.
 
 ## Failure and observability contract
 

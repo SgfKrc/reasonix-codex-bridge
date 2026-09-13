@@ -18,6 +18,7 @@ import {
   resolveModelRef,
   resolveSubagent,
   resolveSubagentRole,
+  resolveTransport,
   resolveWritePolicy,
   resolveWorkspaceRoot,
   validateModelRef,
@@ -31,6 +32,9 @@ import {
   resolveCheckpointDir,
   writeCheckpoint,
 } from './checkpoint.mjs';
+import { AcpClient } from './acp-client.mjs';
+import { AcpSecurityPolicy } from './acp-security.mjs';
+import { AcpTransportManager } from './acp-transport.mjs';
 
 function log(message) { process.stderr.write(`[${SERVER_NAME}] ${message}\n`); }
 function refuse(reason, hint) {
@@ -56,7 +60,7 @@ const MODES = { inspect: { maxSteps: 80, timeoutSeconds: 600 }, review: { maxSte
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
-  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. max_steps is the raw Reasonix budget; tool_rounds is the preferred tool-call-round budget. Set parallel=true explicitly for concurrent read-only jobs.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' }, parallel: { type: 'boolean' } }, required: ['task'] } },
+  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. max_steps is the raw Reasonix budget; tool_rounds is the preferred tool-call-round budget. Set parallel=true explicitly for concurrent read-only jobs. When transport=acp is enabled, pass session_id to opt into a persistent ACP session.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' }, parallel: { type: 'boolean' }, session_id: { type: 'string' } }, required: ['task'] } },
   { name: 'reasonix_resume', description: 'Explicitly resume one durable checkpoint after workspace/configuration drift checks. A checkpoint is one-shot and is never replayed implicitly.', inputSchema: { type: 'object', properties: { checkpoint_id: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, timeout_seconds: { type: 'integer' } }, required: ['checkpoint_id'] } },
   { name: 'reasonix_cancel', description: 'Request cancellation of one queued or running job. Running workers are terminated and the terminal cancellation remains visible in reasonix_status.', inputSchema: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
@@ -145,6 +149,8 @@ const SUBAGENT_NAME = SUBAGENT_ROLE.name ?? SUBAGENT.name;
 const MODEL_REF_SOURCE = MODEL_RESOLUTION.source;
 const MODEL_CAPABILITIES = resolveModelCapabilities();
 const WRITE_POLICY = resolveWritePolicy(bridgeConfig);
+const TRANSPORT = resolveTransport(bridgeConfig);
+if (TRANSPORT.error) log(`warning: ${TRANSPORT.error}; using per-call transport`);
 const rollbackRecords = new Map();
 const MAX_ROLLBACK_RECORDS = 32;
 
@@ -218,6 +224,7 @@ function checkpointConfigFingerprint() {
     subagent: SUBAGENT_NAME,
     role: SUBAGENT_ROLE.role,
     reasonixVersion: VERSION_CHECK.version || 'unknown',
+    transport: TRANSPORT.mode,
     limits: LIMITS,
   });
 }
@@ -494,6 +501,8 @@ function runSummary(entry) {
   return {
     timestamp: new Date().toISOString(),
     mode: entry.mode,
+    transport: entry.transport ?? 'per-call',
+    transportFallback: entry.transportFallback ?? null,
     cwdRoot: entry.cwdRoot,
     maxSteps: entry.maxSteps,
     timeoutSeconds: entry.timeoutSeconds,
@@ -526,14 +535,14 @@ function terminate(child) {
   child.kill('SIGKILL');
   return Promise.resolve();
 }
-function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true, checkpoint = mode !== 'implement', parentCheckpointId = null, cancelRef = null } = {}) {
+function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode }, { record = true, checkpoint = mode !== 'implement', parentCheckpointId = null, cancelRef = null, transport = 'per-call', transportFallback = null } = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
     const invocation = cliSpawnCommand(CLI_PATH, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     if (invocation.error) {
-      recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-      resolve({ isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } });
+      recordRun({ mode, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+      resolve({ isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', transport, transportFallback, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } });
       return;
     }
     const child = spawn(invocation.file, invocation.args, invocation.options);
@@ -547,8 +556,8 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
       if (cancelRef) cancelRef.cancel = null;
       const finalOutcome = cancelRequested ? 'cancelled' : outcome;
       const finalResult = cancelRequested ? { isError: true, text: `worker cancelled after ${((Date.now() - startedAt) / 1000).toFixed(1)}s` } : result;
-      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap });
-      resolve({ ...finalResult, meta: { outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap } });
+      if (record) recordRun({ mode, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap });
+      resolve({ ...finalResult, meta: { outcome: finalOutcome, transport, transportFallback, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap } });
     };
     const timer = setTimeout(async () => {
       if (settled) return;
@@ -666,6 +675,41 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   recordRun({ mode: 'implement', cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
   return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, outcome: 'success', rollbackId } };
 }
+
+const ACP_SECURITY = new AcpSecurityPolicy({
+  workspaceRoot: WORKSPACE_ROOT,
+  allowedRoots: allowedRoots(),
+  writePolicy: WRITE_POLICY,
+  requireScope: true,
+});
+const ACP_TRANSPORT = new AcpTransportManager({
+  clientFactory: ({ cwd, timeoutMs }) => new AcpClient({
+    cliPath: CLI_PATH,
+    modelRef: MODEL_REF,
+    cwd,
+    workspaceOnly: true,
+    timeoutMs: timeoutMs ?? 30_000,
+  }),
+  fallback: (request, context) => runWorker(
+    { cwd: request.cwd, maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outputCharCap: request.outputCharCap, task: request.task, mode: request.mode },
+    { cancelRef: context.cancelRef, transport: 'per-call', transportFallback: context.reason },
+  ),
+  securityPolicy: ACP_SECURITY,
+  outputCharCap: LIMITS.outputCharCap,
+});
+async function runAcp(request, cancelRef) {
+  try {
+    const result = await ACP_TRANSPORT.run({ ...request, cancelRef, timeoutMs: request.timeoutSeconds * 1000 });
+    if (result.meta?.transport === 'acp') {
+      recordRun({ mode: request.mode, transport: result.meta.transport, transportFallback: result.meta.transportFallback ?? null, cwdRoot: cwdRootLabel(request.cwd), maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outcome: result.meta.outcome ?? (result.isError ? 'worker_exit' : 'success'), exitCode: result.meta.exitCode ?? null, elapsedMs: result.meta.elapsedMs ?? 0, outputBytes: result.meta.outputBytes ?? 0, truncated: result.meta.truncated === true });
+    }
+    return result;
+  } catch (error) {
+    const outcome = error?.code?.startsWith?.('session_scope_') || error?.code?.startsWith?.('write_') || error?.code?.startsWith?.('read_mode_') ? 'rejected' : 'acp_error';
+    recordRun({ mode: request.mode, transport: 'acp', cwdRoot: cwdRootLabel(request.cwd), maxSteps: request.maxSteps, timeoutSeconds: request.timeoutSeconds, outcome, exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false });
+    return { isError: true, text: error instanceof Error ? error.message : String(error), meta: { outcome, transport: 'acp', exitCode: null, elapsedMs: 0, outputBytes: 0, truncated: false } };
+  }
+}
 async function resumeCheckpoint(checkpointId, args = {}, cancelRef = null) {
   if (!CHECKPOINT_ENABLED) return { isError: true, text: 'checkpoint resume is disabled because the checkpoint directory is inside the workspace.' };
   const loaded = readCheckpoint(CHECKPOINT_DIR, checkpointId);
@@ -709,6 +753,8 @@ function jobSummary(record) {
   return {
     jobId: record.id,
     mode: record.mode,
+    transport: record.transport ?? 'per-call',
+    transportFallback: record.transportFallback ?? null,
     cwdRoot: record.cwdRoot,
     parallel: record.parallel,
     exclusive: record.exclusive,
@@ -799,6 +845,8 @@ function enqueue(job, meta, { parallel = false, exclusive = true } = {}) {
   const record = {
     id: randomUUID(),
     mode: meta.mode,
+    transport: meta.transport ?? 'per-call',
+    transportFallback: meta.transportFallback ?? null,
     cwdRoot: meta.cwdRoot,
     maxSteps: meta.maxSteps,
     timeoutSeconds: meta.timeoutSeconds,
@@ -876,7 +924,7 @@ async function callTool(name, args) {
     if (!record) return explicitRollback(rollbackId);
     return enqueue(() => explicitRollback(rollbackId), { mode: 'rollback', cwdRoot: cwdRootLabel(record.root), maxSteps: null, timeoutSeconds: null });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
@@ -914,10 +962,14 @@ async function callTool(name, args) {
     logRejected('parallel_implement_disallowed');
     return { isError: true, text: 'parallel=true is only available for read-only inspect, review, or plan jobs; implement remains workspace-exclusive.' };
   }
-  const meta = { mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
-  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s parallel=${parallel}`); return enqueue((cancelRef) => mode === 'implement'
-    ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task }, cancelRef)
-    : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }, { cancelRef }), { ...meta, parallel }, { parallel, exclusive: !parallel });
+  const useAcp = TRANSPORT.mode === 'acp' && !parallel && mode !== 'implement';
+  const transport = useAcp ? 'acp' : 'per-call';
+  const meta = { mode, transport, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
+  log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s parallel=${parallel} transport=${transport}`); return enqueue((cancelRef) => useAcp
+    ? runAcp({ sessionId: args?.session_id, taskId: args?.session_id, owner: 'mcp-stdio', cwd, profile: SUBAGENT_NAME, model: MODEL_REF, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }, cancelRef)
+    : mode === 'implement'
+      ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task }, cancelRef)
+      : runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task, mode }, { cancelRef }), { ...meta, parallel }, { parallel, exclusive: !parallel });
 }
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 const handlers = { initialize: () => ({ capabilities: { tools: {} }, protocolVersion: '2024-11-05', serverInfo: { name: SERVER_NAME, version: '1.0.0' } }), ping: () => ({}), 'tools/list': () => ({ tools: TOOLS }), 'tools/call': async (params) => { const result = await callTool(params?.name, params?.arguments ?? {}); return { content: [{ type: 'text', text: result.text }], isError: result.isError }; } };
@@ -930,4 +982,4 @@ async function handleMessage(message) {
 log(`ready: cli=${CLI_PATH} root=${WORKSPACE_ROOT} subagent=${SUBAGENT_NAME} role=${SUBAGENT_ROLE.role} model=${MODEL_REF} source=${MODEL_REF_SOURCE}`);
 const reader = createInterface({ input: process.stdin, terminal: false }); const pendingMessages = new Set();
 reader.on('line', (line) => { if (!line.trim()) return; let message; try { message = JSON.parse(line); } catch { log(`ignored invalid JSON input: ${line.slice(0, 200)}`); return; } const task = handleMessage(message).catch((error) => log(`message failed: ${error?.message ?? error}`)); pendingMessages.add(task); void task.finally(() => pendingMessages.delete(task)); });
-reader.on('close', () => { void Promise.allSettled([...pendingMessages]).then(() => process.exit(0)); });
+reader.on('close', () => { void Promise.allSettled([...pendingMessages]).then(async () => { await ACP_TRANSPORT.close(); process.exit(0); }); });
