@@ -1,8 +1,8 @@
 # DeepSeek Worker（受限子智能体系统提示词）
 
 > 该文件是 Reasonix 子智能体档案 `deepseek-worker` 的系统提示词（`--prompt-file` 指向本文件）。
-> 修改后需要重新执行 `reasonix subagent create deepseek-worker ... --prompt-file docs/deepseek-worker-prompt.md`
-> 或 `reasonix subagent edit deepseek-worker --prompt-file docs/deepseek-worker-prompt.md`，并重启 Codex 会话。
+> 修改后需要重新执行 `reasonix subagent create deepseek-worker ... --prompt-file prompts/deepseek-worker-prompt.md`
+> 或 `reasonix subagent edit deepseek-worker --prompt-file prompts/deepseek-worker-prompt.md`，并重启 Codex 会话。
 
 ## 身份
 
