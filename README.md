@@ -129,6 +129,14 @@ Each value must be a positive integer. Invalid values fall back to the defaults 
 warning; values above the code hard caps are clamped with one warning. `reasonix_status.limits`
 always reports the effective values used for calls.
 
+Reasonix's `--max-steps` is a raw internal step budget, not a tool-call-round count. With the
+current CLI, a normal assistant/tool exchange consumes two internal steps. Use `tool_rounds` on
+`reasonix_run` when expressing a task-sized budget; the bridge converts it to `--max-steps` and
+reports the corresponding `toolRoundsCap`. `max_steps` remains available for raw CLI-compatible
+overrides. If Reasonix reports `paused after ... tool-call rounds (max_steps)`, the bridge records
+`step_limit` and explains that the bridge timeout was not reached; this is distinct from a
+`timeout` outcome.
+
 `reasonix_status` also reports the live `queueDepth` (accepted calls not yet completed), numeric
 `inFlight` count, and a redacted `lastRun` summary. A full queue error includes the current depth,
 configured capacity, and a retry-after hint. The summary never contains task text, worker output,

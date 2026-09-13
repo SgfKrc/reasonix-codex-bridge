@@ -30,17 +30,21 @@ function refuse(reason, hint) {
   process.exit(2);
 }
 
-const HARD_MAX_STEPS_CAP = 40;
+// Reasonix counts an assistant/tool exchange as two internal steps. Keep the
+// public tool-round control separate so callers do not have to guess that CLI
+// implementation detail.
+const REASONIX_STEPS_PER_TOOL_ROUND = 2;
+const HARD_MAX_STEPS_CAP = 80;
 const HARD_TIMEOUT_SECONDS_CAP = 600;
 const TASK_CHAR_CAP = 8000;
 const HARD_OUTPUT_CHAR_CAP = 24000;
 const HARD_QUEUE_CAP = 5;
 const HISTORY_HARD_CAP_BYTES = 128 * 1024 * 1024;
-const MODES = { inspect: { maxSteps: 12, timeoutSeconds: 180 }, review: { maxSteps: 16, timeoutSeconds: 240 }, plan: { maxSteps: 16, timeoutSeconds: 240 }, implement: { maxSteps: 16, timeoutSeconds: 240 } };
+const MODES = { inspect: { maxSteps: 24, timeoutSeconds: 180 }, review: { maxSteps: 32, timeoutSeconds: 240 }, plan: { maxSteps: 32, timeoutSeconds: 240 }, implement: { maxSteps: 32, timeoutSeconds: 240 } };
 const BRIDGE_LOG_PATH = (process.env.BRIDGE_LOG ?? '').trim() ? path.resolve(process.env.BRIDGE_LOG.trim()) : '';
 
 const TOOLS = [
-  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
+  { name: 'reasonix_run', description: 'Run the configured Reasonix worker in inspect, review, plan, or explicitly authorized implement mode. max_steps is the raw Reasonix budget; tool_rounds is the preferred tool-call-round budget.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, cwd: { type: 'string' }, max_steps: { type: 'integer' }, tool_rounds: { type: 'integer', minimum: 1 }, mode: { type: 'string', enum: ['inspect', 'implement', 'review', 'plan'] }, timeout_seconds: { type: 'integer' } }, required: ['task'] } },
   { name: 'reasonix_rollback', description: 'Explicitly roll back one successful implement call by its returned rollback_id, only when its files are unchanged since that call.', inputSchema: { type: 'object', properties: { rollback_id: { type: 'string' } }, required: ['rollback_id'] } },
   { name: 'reasonix_status', description: 'Show bridge configuration and limits without calling a model.', inputSchema: { type: 'object', properties: {} } },
 ];
@@ -380,6 +384,10 @@ function clampInteger(value, fallback, cap) {
   return Math.min(cap, Math.max(1, Math.trunc(parsed)));
 }
 function truncate(value, cap) { return value.length <= cap ? value : `${value.slice(0, cap)}\n\n[output truncated; original ${value.length} chars]`; }
+function parseStepLimit(stderr) {
+  const match = String(stderr ?? '').match(/paused after\s+(\d+)\s+tool-call rounds?\s+\(max_steps\)/iu);
+  return match ? Number(match[1]) : null;
+}
 function cwdRootLabel(cwd) {
   const roots = allowedRoots();
   const index = roots.findIndex((root) => isInside(root, cwd));
@@ -395,6 +403,7 @@ function runSummary(entry) {
     maxSteps: entry.maxSteps,
     timeoutSeconds: entry.timeoutSeconds,
     outcome: entry.outcome,
+    stepLimitRounds: Number.isInteger(entry.stepLimitRounds) ? entry.stepLimitRounds : null,
     exitCode: entry.exitCode ?? null,
     elapsedMs: Number.isFinite(entry.elapsedMs) ? entry.elapsedMs : 0,
     outputBytes: Number.isFinite(entry.outputBytes) ? entry.outputBytes : 0,
@@ -434,12 +443,12 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
     const child = spawn(invocation.file, invocation.args, invocation.options);
     let stdout = ''; let stderr = ''; let settled = false; let truncatedOutput = false;
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    const finish = (result, outcome, exitCode = null) => {
+    const finish = (result, outcome, exitCode = null, extra = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
-      resolve({ ...result, meta: { outcome, exitCode, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
+      if (record) recordRun({ mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap });
+      resolve({ ...result, meta: { outcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdout.length > outputCharCap } });
     };
     const timer = setTimeout(async () => {
       if (settled) return;
@@ -452,7 +461,14 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode },
     child.on('close', (code) => {
       if (settled) return;
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1); const body = truncate(mode === 'plan' ? stdout : stdout.trim(), outputCharCap);
-      if (code !== 0) finish({ isError: true, text: `worker exited with code ${code} (${elapsed}s)${body ? `\n\n--- stdout ---\n${body}` : ''}${stderr ? `\n\n--- stderr ---\n${truncate(stderr, 2000)}` : ''}` }, 'worker_exit', code);
+      if (code !== 0) {
+        const stepLimitRounds = parseStepLimit(stderr);
+        const outcome = stepLimitRounds === null ? 'worker_exit' : 'step_limit';
+        const prefix = stepLimitRounds === null
+          ? `worker exited with code ${code} (${elapsed}s)`
+          : `worker reached Reasonix max_steps=${maxSteps} after ${stepLimitRounds} tool-call rounds (${elapsed}s); timeout_seconds=${timeoutSeconds} was not reached. Increase max_steps or pass tool_rounds.`;
+        finish({ isError: true, text: `${prefix}${body ? `\n\n--- stdout ---\n${body}` : ''}${stderr ? `\n\n--- stderr ---\n${truncate(stderr, 2000)}` : ''}` }, outcome, code, stepLimitRounds === null ? {} : { stepLimitRounds });
+      }
       else finish({ isError: false, text: mode === 'plan' ? body : `[mode cwd=${cwd} model=${MODEL_REF} steps<=${maxSteps} elapsed=${elapsed}s]\n\n${body || '[worker returned no content]'}` }, 'success', 0);
     });
   });
@@ -532,7 +548,7 @@ async function callTool(name, args) {
     if (!record) return explicitRollback(rollbackId);
     return enqueue(() => explicitRollback(rollbackId), { mode: 'rollback', cwdRoot: cwdRootLabel(record.root), maxSteps: null, timeoutSeconds: null });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, modes: Object.keys(MODES), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, requireCleanTree: WRITE_POLICY.requireCleanTree, errors: WRITE_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);
@@ -560,7 +576,11 @@ async function callTool(name, args) {
   }
   let cwd;
   try { cwd = resolveCwd(args?.cwd); } catch (error) { logRejected('cwd_invalid'); throw error; }
-  const maxSteps = clampInteger(args?.max_steps, preset.maxSteps, LIMITS.maxStepsCap); const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, LIMITS.timeoutSecondsCap);
+  const maxToolRounds = Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND);
+  const maxSteps = args?.tool_rounds === undefined
+    ? clampInteger(args?.max_steps, preset.maxSteps, LIMITS.maxStepsCap)
+    : clampInteger(args.tool_rounds, Math.ceil(preset.maxSteps / REASONIX_STEPS_PER_TOOL_ROUND), maxToolRounds) * REASONIX_STEPS_PER_TOOL_ROUND;
+  const timeoutSeconds = clampInteger(args?.timeout_seconds, preset.timeoutSeconds, LIMITS.timeoutSecondsCap);
   const meta = { mode, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds };
   log(`run mode=${mode} cwd=${cwd} steps<=${maxSteps} timeout=${timeoutSeconds}s`); return enqueue(() => mode === 'implement'
     ? runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap: LIMITS.outputCharCap, task })
