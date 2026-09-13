@@ -321,6 +321,7 @@ describe('configuration pure functions', () => {
     assert.match(readPrompt, /continuation cursor.*不透明值/isu);
     assert.match(readPrompt, /逐字原样传回/isu);
     assert.match(readPrompt, /重新调用 `read_file`/u);
+    assert.match(readPrompt, /--prompt-file prompts\/deepseek-worker-prompt\.md/u);
     assert.match(writePrompt, /continuation cursor is opaque state/iu);
     assert.match(writePrompt, /Pass the exact value returned by the tool/iu);
   });
