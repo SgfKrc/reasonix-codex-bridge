@@ -245,3 +245,9 @@ history cap and 75% trigger are not configurable.
 serializes prompts per session, marks crashed transports orphaned, supports capability-gated resume/
 load and delete, and closes live clients during explicit shutdown. It is not imported by the server
 until the lifecycle, security, and transport-switching tickets are accepted.
+
+`src/acp-security.mjs` provides the ACP-04 opt-in security gate. It binds persistent calls to an
+opaque caller/task scope, keeps the session cwd inside the configured workspace roots, reuses the
+fail-closed write whitelist for implement preflight, and redacts credential-like content before it
+is retained in continuation history. The server remains stateless and does not import this module
+until ACP-05 transport coexistence is accepted.

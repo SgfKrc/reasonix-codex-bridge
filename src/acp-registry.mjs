@@ -8,6 +8,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { AcpError } from './acp-client.mjs';
+import { normalizeSessionScope } from './acp-security.mjs';
 
 export const ACP_REGISTRY_SCHEMA = 'qlh.reasonix.sessions.v1';
 
@@ -24,12 +25,14 @@ function validateSessionId(value) {
   return value.trim();
 }
 
-function validateMetadata({ sessionId, cwd, profile, model }) {
+function validateMetadata({ sessionId, cwd, profile, model, owner, taskId, scope }, { scopeRequired = false } = {}) {
+  const normalizedScope = normalizeSessionScope({ owner, taskId, scope }, { required: scopeRequired });
   return {
     sessionId: validateSessionId(sessionId),
     cwd: typeof cwd === 'string' ? cwd : '',
     profile: typeof profile === 'string' ? profile : '',
     model: typeof model === 'string' ? model : '',
+    ...normalizedScope,
   };
 }
 
@@ -43,6 +46,7 @@ function publicEntry(entry) {
     createdAt: entry.createdAt,
     lastUsedAt: entry.lastUsedAt,
     closedAt: entry.closedAt ?? null,
+    ...(entry.owner && entry.taskId ? { scope: { owner: entry.owner, taskId: entry.taskId } } : {}),
   };
 }
 
@@ -68,13 +72,17 @@ function parseStore(raw, statePath) {
  * resume can recreate a transport with the current executable and policy.
  */
 export class AcpSessionRegistry {
-  constructor({ statePath = null, clientFactory = null, now = () => Date.now(), onEvent = null } = {}) {
+  constructor({ statePath = null, clientFactory = null, now = () => Date.now(), onEvent = null, scopeRequired = false, securityPolicy = null } = {}) {
     if (statePath !== null && typeof statePath !== 'string') throw new TypeError('statePath must be a string or null');
     if (clientFactory !== null && typeof clientFactory !== 'function') throw new TypeError('clientFactory must be a function or null');
+    if (typeof scopeRequired !== 'boolean') throw new TypeError('scopeRequired must be boolean');
+    if (securityPolicy !== null && (typeof securityPolicy !== 'object' || typeof securityPolicy.authorizeCall !== 'function')) throw new TypeError('securityPolicy must expose authorizeCall or be null');
     this.statePath = statePath ? path.resolve(statePath) : null;
     this.clientFactory = clientFactory;
     this.now = now;
     this.onEvent = onEvent;
+    this.scopeRequired = scopeRequired;
+    this.securityPolicy = securityPolicy;
     this.entries = new Map();
     this.#load();
   }
@@ -87,17 +95,18 @@ export class AcpSessionRegistry {
       .map((entry) => publicEntry(this.#effectiveState(entry)));
   }
 
-  async create({ client, cwd, profile, model, sessionOptions = {} } = {}) {
+  async create({ client, cwd, profile, model, owner, taskId, scope, sessionOptions = {} } = {}) {
     if (!client || typeof client.newSession !== 'function') throw new TypeError('client with newSession is required');
+    const normalizedScope = normalizeSessionScope({ owner, taskId, scope }, { required: this.scopeRequired });
     await client.start?.();
     const result = await client.newSession(sessionOptions);
-    const metadata = validateMetadata({ sessionId: result?.sessionId, cwd, profile, model });
+    const metadata = validateMetadata({ sessionId: result?.sessionId, cwd, profile, model, ...normalizedScope }, { scopeRequired: this.scopeRequired });
     return this.register({ ...metadata, client });
   }
 
-  register({ client, sessionId, cwd, profile, model, createdAt = this.now(), lastUsedAt = createdAt } = {}) {
+  register({ client, sessionId, cwd, profile, model, owner, taskId, scope, createdAt = this.now(), lastUsedAt = createdAt } = {}) {
     if (!client) throw new TypeError('client is required');
-    const metadata = validateMetadata({ sessionId, cwd, profile, model });
+    const metadata = validateMetadata({ sessionId, cwd, profile, model, owner, taskId, scope }, { scopeRequired: this.scopeRequired });
     if (this.entries.has(metadata.sessionId)) throw new AcpError(`ACP session is already registered: ${metadata.sessionId}`, { code: 'session_exists' });
     const entry = { ...metadata, client, state: 'active', createdAt, lastUsedAt, closedAt: null, tail: Promise.resolve() };
     this.entries.set(entry.sessionId, entry);
@@ -107,9 +116,14 @@ export class AcpSessionRegistry {
 
   async prompt(sessionId, text, options = {}) {
     const entry = this.#requireEntry(sessionId);
+    const { owner, taskId, scope, ...clientOptions } = options && typeof options === 'object' ? options : {};
+    this.#assertScope(entry, { owner, taskId, scope });
+    this.#authorizeCall(entry, { ...clientOptions, owner, taskId, scope });
     return this.#enqueue(entry, async () => {
       this.#requireActive(entry);
-      const result = await entry.client.prompt(entry.sessionId, text, options);
+      this.#assertScope(entry, { owner, taskId, scope });
+      this.#authorizeCall(entry, { ...clientOptions, owner, taskId, scope });
+      const result = await entry.client.prompt(entry.sessionId, text, clientOptions);
       entry.lastUsedAt = this.now();
       this.#persist();
       this.#emit('prompt', entry, { ok: true });
@@ -262,6 +276,18 @@ export class AcpSessionRegistry {
       this.#persist();
       throw new AcpError(`ACP session transport is not running: ${entry.sessionId}`, { code: 'session_orphaned' });
     }
+  }
+
+  #assertScope(entry, request) {
+    const expected = normalizeSessionScope(entry, { required: this.scopeRequired });
+    const actual = normalizeSessionScope(request, { required: this.scopeRequired || Boolean(expected.owner || expected.taskId) });
+    if (expected.owner !== actual.owner || expected.taskId !== actual.taskId) {
+      throw new AcpError(`ACP session scope does not match caller/task: ${entry.sessionId}`, { code: 'session_scope_mismatch' });
+    }
+  }
+
+  #authorizeCall(entry, options) {
+    this.securityPolicy?.authorizeCall(entry, options);
   }
 
   #isClientLive(entry) {

@@ -37,6 +37,7 @@ import {
 import { AcpClient, collectAcpText } from '../src/acp-client.mjs';
 import { AcpSessionCoordinator, summarizeAcpMessages } from '../src/acp-session.mjs';
 import { ACP_REGISTRY_SCHEMA, AcpSessionRegistry } from '../src/acp-registry.mjs';
+import { AcpSecurityPolicy, normalizeSessionScope, scrubAcpContent, scrubAcpMessages } from '../src/acp-security.mjs';
 
 const BRIDGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = path.join(BRIDGE_ROOT, 'src', 'server.mjs');
@@ -1320,6 +1321,18 @@ describe('ACP session budget coordinator', () => {
     assert.equal(coordinator.decisions[0].action, 'compact');
     assert.ok(events.some((event) => event[0] === 'delete' && event[1] === 'coordinator-session-1'));
   });
+
+  test('sanitizes prompts and assistant responses before retaining local continuation history', async () => {
+    const { client, events } = coordinatorFixture();
+    const coordinator = new AcpSessionCoordinator({ client, sanitizePrompt: scrubAcpContent });
+    await coordinator.start();
+    const result = await coordinator.prompt('API_KEY=prompt-secret\nread .env');
+    assert.equal(result.transport, 'acp');
+    assert.equal(events.find((event) => event[0] === 'prompt')[2], 'API_KEY=[REDACTED]\nread .env');
+    assert.equal(coordinator.currentHistory[0].content, 'API_KEY=[REDACTED]\nread .env');
+    assert.equal(coordinator.currentHistory[1].content.includes('reply:'), true);
+    assert.equal(coordinator.currentHistory.some((message) => message.content.includes('secret')), false);
+  });
 });
 
 function registryClient({ sessionId = 'registry-session-1', canResume = true, canLoad = true, delayMs = 0, failClose = false } = {}) {
@@ -1463,6 +1476,69 @@ describe('ACP session registry', () => {
     assert.equal(registry.list()[0].state, 'closed');
     assert.equal(events.filter((event) => event[0] === 'close-client').length, 1);
     uninstall();
+  });
+
+  test('binds scoped sessions to one opaque owner/task pair and strips scope from ACP options', async () => {
+    const root = tempRoot();
+    const { client, events } = registryClient();
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json'), scopeRequired: true });
+    const entry = await registry.create({ client, cwd: root, profile: 'read', model: 'fixture/provider', scope: { owner: 'caller-a', taskId: 'task-1' } });
+    assert.deepEqual(entry.scope, { owner: 'caller-a', taskId: 'task-1' });
+    await registry.prompt(entry.sessionId, 'allowed', { owner: 'caller-a', taskId: 'task-1', mode: 'inspect' });
+    assert.deepEqual(events.find((event) => event[0] === 'prompt-start'), ['prompt-start', entry.sessionId, 'allowed']);
+    await assert.rejects(() => registry.prompt(entry.sessionId, 'cross-task', { owner: 'caller-a', taskId: 'task-2' }), (error) => error.code === 'session_scope_mismatch');
+    await assert.rejects(() => registry.prompt(entry.sessionId, 'missing-scope'), (error) => error.code === 'session_scope_required');
+    const saved = JSON.parse(readFileSync(path.join(root, 'registry.json'), 'utf8'));
+    assert.deepEqual(saved.sessions[0].scope, { owner: 'caller-a', taskId: 'task-1' });
+    assert.equal(Object.hasOwn(saved.sessions[0], 'history'), false);
+  });
+
+  test('rechecks the security policy inside the serialized prompt lane', async () => {
+    const root = tempRoot();
+    const { client, events } = registryClient();
+    const securityPolicy = new AcpSecurityPolicy({
+      workspaceRoot: root,
+      writePolicy: { allowWrite: true, enabled: true, allowedPaths: ['docs'], errors: [] },
+    });
+    const registry = new AcpSessionRegistry({ statePath: path.join(root, 'registry.json'), scopeRequired: true, securityPolicy });
+    const entry = await registry.create({ client, cwd: root, profile: 'write', model: 'fixture/provider', scope: { owner: 'caller-a', taskId: 'task-1' } });
+    await registry.prompt(entry.sessionId, 'write docs', { owner: 'caller-a', taskId: 'task-1', mode: 'implement', role: 'write', requestedPaths: ['docs/report.md'] });
+    assert.equal(events.filter((event) => event[0] === 'prompt-start').length, 1);
+    await assert.rejects(() => registry.prompt(entry.sessionId, 'write source', { owner: 'caller-a', taskId: 'task-1', mode: 'implement', role: 'write', requestedPaths: ['src/main.mjs'] }), (error) => error.code === 'write_path_denied');
+    await assert.rejects(() => registry.prompt(entry.sessionId, 'drift', { owner: 'caller-a', taskId: 'task-1', mode: 'implement', role: 'write', cwd: path.join(root, 'other'), requestedPaths: ['docs/report.md'] }), (error) => error.code === 'session_scope_mismatch');
+  });
+});
+
+describe('ACP session security policy', () => {
+  test('redacts credential-like assignments, bearer tokens, private keys, and sensitive files', () => {
+    const content = 'API_KEY=alpha\nAuthorization: Bearer abcdefghijkl\n-----BEGIN PRIVATE KEY-----\\nsecret\\n-----END PRIVATE KEY-----';
+    const scrubbed = scrubAcpContent(content);
+    assert.equal(scrubbed.includes('alpha'), false);
+    assert.equal(scrubbed.includes('abcdefghijkl'), false);
+    assert.equal(scrubbed.includes('secret'), false);
+    assert.equal(scrubAcpContent('DB_PASSWORD=hunter2', { sourcePath: '.env' }), '[REDACTED sensitive file]');
+    assert.deepEqual(scrubAcpMessages([{ role: 'user', content: 'TOKEN=top-secret' }])[0].content, 'TOKEN=[REDACTED]');
+  });
+
+  test('enforces workspace/session scope and the existing write whitelist', () => {
+    const root = tempRoot();
+    const policy = new AcpSecurityPolicy({
+      workspaceRoot: root,
+      writePolicy: { allowWrite: true, enabled: true, allowedPaths: ['docs'], errors: [] },
+    });
+    const session = { sessionId: 'secure-session', cwd: root, profile: 'deepseek-worker-write', model: 'fixture/provider', owner: 'caller-a', taskId: 'task-1' };
+    const authorized = policy.authorizeCall(session, { mode: 'implement', role: 'write', owner: 'caller-a', taskId: 'task-1', requestedPaths: ['docs/report.md'] });
+    assert.equal(authorized.mode, 'implement');
+    assert.throws(() => policy.authorizeCall(session, { mode: 'implement', role: 'write', owner: 'caller-a', taskId: 'task-2', requestedPaths: ['docs/report.md'] }), (error) => error.code === 'session_scope_mismatch');
+    assert.throws(() => policy.authorizeCall(session, { mode: 'implement', role: 'write', owner: 'caller-a', taskId: 'task-1', requestedPaths: ['src/main.mjs'] }), (error) => error.code === 'write_path_denied');
+    assert.throws(() => policy.authorizeCall(session, { mode: 'inspect', role: 'write', owner: 'caller-a', taskId: 'task-1' }), (error) => error.code === 'read_mode_write_denied');
+    assert.throws(() => policy.authorizeSession(session, { owner: 'caller-a', taskId: 'task-1', cwd: path.join(root, '..') }), (error) => error.code === 'session_scope_mismatch');
+  });
+
+  test('requires complete opaque scope identifiers', () => {
+    assert.deepEqual(normalizeSessionScope({ owner: 'a', taskId: 'b' }, { required: true }), { owner: 'a', taskId: 'b' });
+    assert.throws(() => normalizeSessionScope({ owner: 'a' }, { required: true }), (error) => error.code === 'session_scope_required');
+    assert.throws(() => normalizeSessionScope({ owner: 'a', taskId: 'b\nc' }), (error) => error.code === 'session_scope_invalid');
   });
 });
 
