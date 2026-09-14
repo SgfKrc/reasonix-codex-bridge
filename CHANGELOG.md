@@ -29,6 +29,7 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- CLI usage extraction now scans all structured output records and keeps the most complete usage record, so an early partial progress event cannot mask the final cache metrics.
 - Widened the finite runtime budget envelope to 256 raw Reasonix steps (128 tool-call rounds) and 1800 seconds; callers still opt in per call via `tool_rounds`/`timeout_seconds` and the hard caps remain enforced.
 - Made output-cap handling deterministic across platforms: output overflow is bounded and reported as `truncated=true` without terminating the worker; timeout and explicit cancellation still terminate it.
 - Test fixtures now prefer project-local `build/bridge-test/` (covered by `.gitignore`) and fall back to the system temp directory only when the project path cannot be created.

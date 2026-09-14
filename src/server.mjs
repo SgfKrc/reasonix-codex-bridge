@@ -606,17 +606,34 @@ function normalizeCliUsage(value) {
   if (hasHit && hasMiss) return { status: 'available', source: 'cli', ...usage };
   return { status: 'unavailable', source: 'cli', reason: 'cache_usage_not_forwarded', ...usage };
 }
+function cliUsageCompleteness(usage) {
+  const fields = [
+    'prompt_tokens',
+    'completion_tokens',
+    'prompt_cache_hit_tokens',
+    'prompt_cache_miss_tokens',
+  ];
+  const fieldCount = fields.reduce((count, field) => count + (usage[field] !== null ? 1 : 0), 0);
+  return [fieldCount, usage.status === 'available' ? 1 : 0];
+}
 function extractCliUsage(stdout, stderr, truncated) {
   if (truncated) return cliUsageUnavailable('cli_output_truncated');
+  let best = null;
+  let bestScore = [-1, -1];
   for (const text of [stdout, stderr]) {
     for (const record of parseJsonRecords(text)) {
       for (const candidate of [record, ...collectUsageObjects(record)]) {
         const usage = normalizeCliUsage(candidate);
-        if (usage) return usage;
+        if (!usage) continue;
+        const score = cliUsageCompleteness(usage);
+        if (score[0] > bestScore[0] || (score[0] === bestScore[0] && score[1] > bestScore[1])) {
+          best = usage;
+          bestScore = score;
+        }
       }
     }
   }
-  return cliUsageUnavailable();
+  return best ?? cliUsageUnavailable();
 }
 function workerFailureExtra(meta) {
   const extra = {};
