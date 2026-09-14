@@ -546,6 +546,78 @@ function parseCursorError(stderr) {
   return /(?:continuation\s+)?cursor\s+(?:is\s+)?(?:not\s+valid|invalid|malformed)/iu.test(String(stderr ?? ''))
     || /read_file[^\n]{0,160}(?:cursor|continuation)/iu.test(String(stderr ?? ''));
 }
+function cliUsageUnavailable(reason = 'cli_usage_not_forwarded', source = 'cli') {
+  return {
+    status: 'unavailable',
+    source,
+    reason,
+    prompt_tokens: null,
+    completion_tokens: null,
+    prompt_cache_hit_tokens: null,
+    prompt_cache_miss_tokens: null,
+  };
+}
+function parseJsonRecords(text) {
+  const records = [];
+  const value = String(text ?? '').trim();
+  if (!value) return records;
+  try { records.push(JSON.parse(value)); } catch { /* CLI output may be plain text or JSONL. */ }
+  for (const line of value.split(/\r?\n/u)) {
+    const candidate = line.trim().replace(/^data:\s*/iu, '');
+    if (!candidate || candidate === value) continue;
+    try { records.push(JSON.parse(candidate)); } catch { /* Ignore non-JSON worker lines. */ }
+  }
+  return records;
+}
+function collectUsageObjects(value, output = [], depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 3) return output;
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 16)) collectUsageObjects(item, output, depth + 1);
+    return output;
+  }
+  if (Object.hasOwn(value, 'usage') && value.usage && typeof value.usage === 'object') output.push(value.usage);
+  if (Object.hasOwn(value, 'metrics') && value.metrics && typeof value.metrics === 'object') output.push(value.metrics);
+  for (const key of ['result', 'response', 'data']) {
+    if (value[key] && typeof value[key] === 'object') collectUsageObjects(value[key], output, depth + 1);
+  }
+  return output;
+}
+function usageInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function readUsageField(value, keys) {
+  for (const key of keys) {
+    const parsed = usageInteger(value?.[key]);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+function normalizeCliUsage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const usage = {
+    prompt_tokens: readUsageField(value, ['prompt_tokens', 'promptTokens', 'total_prompt_tokens']),
+    completion_tokens: readUsageField(value, ['completion_tokens', 'completionTokens', 'generated_tokens', 'total_generated_tokens']),
+    prompt_cache_hit_tokens: readUsageField(value, ['prompt_cache_hit_tokens', 'promptCacheHitTokens', 'cache_hit_tokens']),
+    prompt_cache_miss_tokens: readUsageField(value, ['prompt_cache_miss_tokens', 'promptCacheMissTokens', 'cache_miss_tokens']),
+  };
+  if (Object.values(usage).every((item) => item === null)) return null;
+  const hasHit = usage.prompt_cache_hit_tokens !== null;
+  const hasMiss = usage.prompt_cache_miss_tokens !== null;
+  if (hasHit && hasMiss) return { status: 'available', source: 'cli', ...usage };
+  return { status: 'unavailable', source: 'cli', reason: 'cache_usage_not_forwarded', ...usage };
+}
+function extractCliUsage(stdout, stderr, truncated) {
+  if (truncated) return cliUsageUnavailable('cli_output_truncated');
+  for (const text of [stdout, stderr]) {
+    for (const record of parseJsonRecords(text)) {
+      for (const candidate of [record, ...collectUsageObjects(record)]) {
+        const usage = normalizeCliUsage(candidate);
+        if (usage) return usage;
+      }
+    }
+  }
+  return cliUsageUnavailable();
+}
 function workerFailureExtra(meta) {
   const extra = {};
   if (Number.isInteger(meta?.stepLimitRounds)) extra.stepLimitRounds = meta.stepLimitRounds;
@@ -560,7 +632,7 @@ function cwdRootLabel(cwd) {
 let logFailureReported = false;
 let lastRun = null;
 function runSummary(entry) {
-  return {
+  const summary = {
     timestamp: new Date().toISOString(),
     mode: entry.mode,
     stage: entry.stage ?? stageForMode(entry.mode),
@@ -578,6 +650,11 @@ function runSummary(entry) {
     outputBytes: Number.isFinite(entry.outputBytes) ? entry.outputBytes : 0,
     truncated: entry.truncated === true,
   };
+  if (entry.usage !== undefined) summary.usage = entry.usage;
+  else if (['inspect', 'review', 'plan', 'implement'].includes(entry.mode)) {
+    summary.usage = cliUsageUnavailable(entry.transport === 'acp' ? 'acp_usage_not_forwarded' : undefined, entry.transport === 'acp' ? 'acp' : 'cli');
+  }
+  return summary;
 }
 function writeCallLog(record) {
   if (!BRIDGE_LOG_PATH) return;
@@ -605,8 +682,9 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode, s
     const args = ['subagent', 'run', SUBAGENT_NAME, '--model', MODEL_REF, '--max-steps', String(maxSteps), '--dir', cwd, '--', task];
     const invocation = cliSpawnCommand(CLI_PATH, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     if (invocation.error) {
-      recordRun({ mode, stage, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-      resolve({ isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', stage, transport, transportFallback, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } });
+      const usage = cliUsageUnavailable();
+      recordRun({ mode, stage, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'spawn_rejected', exitCode: null, usage, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+      resolve({ isError: true, text: invocation.error, meta: { outcome: 'spawn_rejected', stage, transport, transportFallback, usage, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } });
       return;
     }
     const child = spawn(invocation.file, invocation.args, invocation.options);
@@ -620,8 +698,10 @@ function runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode, s
       if (cancelRef) cancelRef.cancel = null;
       const finalOutcome = cancelRequested ? 'cancelled' : outcome;
       const finalResult = cancelRequested ? { isError: true, text: `worker cancelled after ${((Date.now() - startedAt) / 1000).toFixed(1)}s` } : result;
-      if (record) recordRun({ mode, stage, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap });
-      resolve({ ...finalResult, meta: { outcome: finalOutcome, stage, transport, transportFallback, exitCode, ...extra, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: truncatedOutput || stdoutChars > outputCharCap } });
+      const outputTruncated = truncatedOutput || stdoutChars > outputCharCap || stderrChars > outputCharCap;
+      const usage = extractCliUsage(stdout, stderr, outputTruncated);
+      if (record) recordRun({ mode, stage, transport, transportFallback, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: finalOutcome, exitCode, ...extra, usage, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: outputTruncated });
+      resolve({ ...finalResult, meta: { outcome: finalOutcome, stage, transport, transportFallback, exitCode, ...extra, usage, elapsedMs: Date.now() - startedAt, outputBytes: Buffer.byteLength(stdout, 'utf8'), truncated: outputTruncated } });
     };
     const timer = setTimeout(async () => {
       if (settled) return;
@@ -743,8 +823,9 @@ async function runExec({ cwd, spec, args, timeoutSeconds, outputCharCap, stage =
 }
 async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, stage = 'implement' }, cancelRef = null) {
   const reject = (text, startedAt = Date.now()) => {
-    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
-    return { isError: true, text, meta: { outcome: 'write_rejected', stage, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
+    const usage = cliUsageUnavailable();
+    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', usage, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false });
+    return { isError: true, text, meta: { outcome: 'write_rejected', stage, usage, exitCode: null, elapsedMs: Date.now() - startedAt, outputBytes: 0, truncated: false } };
   };
   const startedAt = Date.now();
   if (!WRITE_POLICY.allowWrite) return reject('mode=implement is disabled; set allowWrite=true in bridge.config.json and pass mode=implement explicitly.', startedAt);
@@ -761,7 +842,7 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement', stage }, { record: false, cancelRef });
   const afterStatus = await gitStatus(WORKSPACE_ROOT);
   if (!afterStatus.ok) {
-    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'write_rejected', usage: result.meta?.usage, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: `mode=implement could not verify post-write Git state: ${afterStatus.error}`, meta: { ...result.meta, stage, outcome: 'write_rejected' } };
   }
   const changed = changedEntries(beforeStatus.entries, afterStatus.entries);
@@ -777,7 +858,7 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
     const checkpointId = !disallowed.length && rollback.ok && checkpointableOutcome(outcome)
       ? await createRunCheckpoint({ mode: 'implement', stage, task, cwd, maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, stepLimitRounds: result.meta?.stepLimitRounds, cursorError: result.meta?.cursorError })
       : null;
-    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+    recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome, usage: result.meta?.usage, exitCode: result.meta?.exitCode ?? null, ...workerFailureExtra(result.meta), elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
     return { isError: true, text: JSON.stringify({ schema: 'qlh.reasonix.changes.v1', rollback_id: null, ...(checkpointId ? { checkpoint_id: checkpointId } : {}), outcome, error: `${reason}; ${rollbackText}`, changes: [] }), meta: { ...result.meta, stage, outcome, ...(checkpointId ? { checkpointId } : {}) } };
   }
   if (result.isError) {
@@ -791,7 +872,7 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   const changeSet = await buildChangeSet(WORKSPACE_ROOT, changed);
   const rollbackId = rememberRollback(WORKSPACE_ROOT, changeSet.changes);
   changeSet.rollback_id = rollbackId;
-  recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
+  recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', usage: result.meta?.usage, exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
   return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, stage, outcome: 'success', rollbackId } };
 }
 
