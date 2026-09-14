@@ -2215,6 +2215,41 @@ process.stdout.write(JSON.stringify({ content: 'completion-secret', usage: {
   assert.doesNotMatch(readFileSync(logPath, 'utf8'), /completion-secret/);
 });
 
+test('BRIDGE_LOG selects the most complete usage record when progress arrives first', async () => {
+  const root = tempRoot();
+  writeCliFiles(root);
+  writeFileSync(path.join(root, 'subagent'), `
+process.stdout.write([
+  JSON.stringify({ event: 'progress', usage: { prompt_cache_hit_tokens: 96 } }),
+  JSON.stringify({ event: 'completed', usage: {
+    prompt_tokens: 120, completion_tokens: 8, prompt_cache_hit_tokens: 96, prompt_cache_miss_tokens: 24
+  } })
+].join('\\n'));
+`, 'utf8');
+  const logPath = path.join(root, 'multi-record-usage.jsonl');
+  const child = spawn(process.execPath, [SERVER_PATH], {
+    cwd: root,
+    env: envFor(root, { BRIDGE_LOG: logPath }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const responses = await readMcpSession(child, [
+    { id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'multi-record-usage', cwd: '.', mode: 'inspect', max_steps: 2, timeout_seconds: 2 } } },
+  ]);
+  const exit = await new Promise((resolve) => child.once('close', resolve));
+  assert.equal(exit, 0);
+  assert.equal(responses[0].result.isError, false);
+  const record = JSON.parse(readFileSync(logPath, 'utf8').trim());
+  assert.deepEqual(record.usage, {
+    status: 'available',
+    source: 'cli',
+    prompt_tokens: 120,
+    completion_tokens: 8,
+    prompt_cache_hit_tokens: 96,
+    prompt_cache_miss_tokens: 24,
+  });
+});
+
 test('Reasonix max_steps pauses are classified separately from bridge timeouts', async () => {
   const root = tempRoot();
   writeCliFiles(root);
