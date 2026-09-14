@@ -173,7 +173,7 @@ LOOP-01 是主 agent 的显式编排模板，不是 bridge 内的自动流水线
 
 当 `REASONIX_EXE` 指向 Windows 的 `.cmd` 或 `.bat` shim 时，桥接器以 `shell:false` 显式调用 `cmd.exe`。含 cmd 元字符的参数在创建进程前即被拒绝，从而在保持 shim 正常启动的同时，把任务文本挡在 shell 解释之外。
 
-设置 `BRIDGE_LOG` 可为每次 `reasonix_run` 输出一行 JSON。每条记录只含时间戳、模式、工作区根标签、步数/超时限额、结果、退出码、耗时、stdout 字节数与截断标记；任务正文、worker stdout/stderr、模型引用与绝对路径永不写入。未设置 `BRIDGE_LOG` 时桥接器不写任何日志。
+设置 `BRIDGE_LOG` 可为每次 `reasonix_run` 输出一行 JSON。每条记录只含时间戳、模式、工作区根标签、步数/超时限额、结果、退出码、耗时、stdout 字节数与截断标记；任务正文、worker stdout/stderr、模型引用与绝对路径永不写入。若 CLI 透传结构化 usage，记录中的 `usage` 仅包含 prompt/completion/cache hit/cache miss token 数；未透传时明确标记 `status=unavailable` 和原因（如 `cli_usage_not_forwarded`），不会猜测命中量。未设置 `BRIDGE_LOG` 时桥接器不写任何日志。
 
 桥接器有意保持**每次调用无状态**：把 `cwd` 限制在允许根内；写策略未启用时拒绝 `implement`；限制任务/预算/输出规模；超时或取消时终止进程树；写操作保持独占。超出 `OUTPUT_CHAR_CAP` 的输出在内存中有界，并作为**成功结果**返回且 `truncated=true`——输出超限本身不会杀死 worker。显式的只读并行任务各自独立启动并在完成后回收。这一切是为了避免把单一对话累积超过 Reasonix 的 128 MB 历史硬上限。
 

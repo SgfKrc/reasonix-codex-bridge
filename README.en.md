@@ -271,8 +271,11 @@ back automatically. Status exposes command names, prefixes, and bounded limits, 
 
 Set `BRIDGE_LOG` to opt into one JSON object per `reasonix_run` call. Each record contains only
 the timestamp, mode, workspace-root label, step/timeout limits, outcome, exit code, elapsed time,
-stdout byte count, and truncation flag. Task text, worker stdout/stderr, model refs, and absolute
-paths are never written. With `BRIDGE_LOG` unset, the bridge performs no log writes.
+stdout byte count, and truncation flag. When the CLI forwards structured usage, the `usage` object
+contains only prompt/completion/cache-hit/cache-miss token counts. When it does not, the bridge
+records `status=unavailable` with a reason such as `cli_usage_not_forwarded`; it never guesses
+cache usage. Task text, worker stdout/stderr, model refs, and absolute paths are never written.
+With `BRIDGE_LOG` unset, the bridge performs no log writes.
 
 The bridge is deliberately stateless per call. It confines `cwd` to allowed roots, rejects
 `implement` unless the write policy is enabled, limits task/budget/output sizes, terminates the
