@@ -1275,10 +1275,10 @@ process.exit(1);
     assert.equal(record.stepLimitRounds, 5);
   });
 
-  test('implement refuses an existing dirty tree by default', async () => {
+  test('implement refuses a dirty tree under cleanTreePolicy=strict', async () => {
     const root = tempRoot();
     writeCliFiles(root);
-    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'], cleanTreePolicy: 'strict' }), 'utf8');
     writeFileSync(path.join(root, 'allowed.txt'), 'before', 'utf8');
     const marker = path.join(root, 'worker-called');
     writeFileSync(path.join(root, 'subagent'), `
@@ -1296,19 +1296,67 @@ fs.writeFileSync(process.env.WORKER_MARKER, 'called');
     assert.equal(existsSync(marker), false);
   });
 
-  test('implement rejects the unsafe requireCleanTree opt-out before spawning the worker', async () => {
+  test('requireCleanTree=false maps to the snapshot policy, writes through a dirty tree, and rollback restores the user edit', async () => {
     const root = tempRoot();
     writeCliFiles(root);
     writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'], requireCleanTree: false }), 'utf8');
-    const marker = path.join(root, 'worker-called');
-    writeFileSync(path.join(root, 'subagent'), `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'must not run');`, 'utf8');
+    writeFileSync(path.join(root, 'allowed.txt'), 'before', 'utf8');
+    const artifactRoot = testArtifactRoot();
+    const marker = path.join(artifactRoot, `worker-called-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    tempArtifacts.add(marker);
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(marker)}, 'called');
+fs.writeFileSync(process.env.WRITE_TARGET, 'after');
+`, 'utf8');
+    commitFixture(root);
+    writeFileSync(path.join(root, 'allowed.txt'), 'user edit before worker', 'utf8');
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WRITE_TARGET: path.join(root, 'allowed.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    const writeResponse = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'snapshot policy write', mode: 'implement' } });
+    assert.equal(writeResponse.result.isError, false, writeResponse.result.content[0].text);
+    assert.equal(existsSync(marker), true);
+    assert.equal(readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'after');
+    const changeSet = JSON.parse(writeResponse.result.content[0].text);
+    const rollbackResponse = await client.request(2, 'tools/call', { name: 'reasonix_rollback', arguments: { rollback_id: changeSet.rollback_id } });
+    assert.equal(rollbackResponse.result.isError, false, rollbackResponse.result.content[0].text);
+    // The write baseline restores the user's uncommitted content, not HEAD.
+    assert.equal(readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'user edit before worker');
+    child.stdin.end();
+    await new Promise((resolve) => child.once('close', resolve));
+  });
+
+  test('snapshot policy allows a second implement call on an already dirty tree', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['first.txt', 'second.txt'] }), 'utf8');
+    writeFileSync(path.join(root, 'first.txt'), 'base-1', 'utf8');
+    writeFileSync(path.join(root, 'second.txt'), 'base-2', 'utf8');
+    writeFileSync(path.join(root, 'subagent'), `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.WRITE_TARGET, 'written by worker');
+`, 'utf8');
+    commitFixture(root);
+    const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write', WRITE_TARGET: path.join(root, 'first.txt') }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = mcpClient(child);
+    const first = await client.request(1, 'tools/call', { name: 'reasonix_run', arguments: { task: 'first write', mode: 'implement' } });
+    assert.equal(first.result.isError, false);
+    const second = await client.request(2, 'tools/call', { name: 'reasonix_run', arguments: { task: 'second write', mode: 'implement' } });
+    assert.equal(second.result.isError, false);
+    child.stdin.end();
+    await new Promise((resolve) => child.once('close', resolve));
+  });
+
+  test('status reports the clean-tree policy and its source', async () => {
+    const root = tempRoot();
+    writeCliFiles(root);
+    writeFileSync(path.join(root, 'bridge.config.json'), JSON.stringify({ modelRef: 'fixture/provider', allowWrite: true, allowedPaths: ['allowed.txt'] }), 'utf8');
     const child = spawn(process.execPath, [SERVER_PATH], { cwd: root, env: envFor(root, { REASONIX_SUBAGENT: 'deepseek-worker-write' }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_run', arguments: { task: 'unsafe opt-out', mode: 'implement' } } }]);
-    const exit = await new Promise((resolve) => child.once('close', resolve));
-    assert.equal(exit, 0);
-    assert.equal(responses[0].result.isError, true);
-    assert.match(responses[0].result.content[0].text, /requireCleanTree=false is unsupported/);
-    assert.equal(existsSync(marker), false);
+    const responses = await readMcpSession(child, [{ id: 1, method: 'tools/call', params: { name: 'reasonix_status', arguments: {} } }]);
+    const status = JSON.parse(responses[0].result.content[0].text);
+    assert.equal(status.writePolicy.cleanTreePolicy, 'snapshot');
+    assert.equal(status.writePolicy.cleanTreePolicySource, 'default');
+    await new Promise((resolve) => child.once('close', resolve));
   });
 
   test('rollback refuses to overwrite a later manual edit', async () => {
