@@ -5,6 +5,7 @@ import { appendFileSync, existsSync, readFileSync, realpathSync, rmSync, statSyn
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import { rollbackRecordSnapshot, restoreSnapshotEntries, snapshotWriteBaseline } from './snapshot.mjs';
 import {
   ConfigError,
   SERVER_NAME,
@@ -354,12 +355,17 @@ function pathMatchesAllowed(relativePath) {
   const candidate = relativePath.replaceAll('\\', '/').replace(/^\.\//, '');
   return WRITE_POLICY.allowedPaths.some((allowed) => candidate === allowed || candidate.startsWith(`${allowed}/`));
 }
-async function rollbackEntries(root, entries) {
-  const unique = [...new Map(entries.filter((entry) => entry?.path).map((entry) => [entry.path, entry])).values()];
-  if (!unique.length) return { ok: true, error: '' };
+async function rollbackEntries(root, entries, snapshotEntries = []) {
+  // Snapshot entries (pre-existing user edits under allowedPaths) are restored
+  // verbatim and excluded from the git-based path, which would reset them to HEAD.
+  const restored = restoreSnapshotEntries(root, snapshotEntries);
+  const handledPaths = restored.handled;
+  const normalize = (value) => String(value ?? '').replaceAll('\\', '/').replace(/^\.\//, '');
+  const unique = [...new Map(entries.filter((entry) => entry?.path && !handledPaths.has(normalize(entry.path))).map((entry) => [entry.path, entry])).values()];
+  if (!unique.length) return { ok: restored.errors.length === 0, error: restored.errors.join('; ') };
   const tracked = unique.filter((entry) => !entry.status.includes('?')).map((entry) => entry.path);
   const untracked = unique.filter((entry) => entry.status.includes('?')).map((entry) => entry.path);
-  const errors = [];
+  const errors = [...restored.errors];
   if (tracked.length) {
     await new Promise((resolve) => {
       const restore = spawn('git', ['-C', root, 'restore', '--worktree', '--staged', '--', ...tracked], cliSpawnOptions('git', { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }));
@@ -507,15 +513,28 @@ async function explicitRollback(rollbackId) {
   if (missing.length) return { isError: true, text: `rollback refused because files are missing: ${missing.join(', ')}` };
   if (conflicts.length) return { isError: true, text: `rollback refused because files changed after the implement call: ${conflicts.join(', ')}` };
   const entries = record.changes.map((change) => ({ path: change.path, status: change.kind === 'added' ? '??' : change.kind === 'deleted' ? ' D' : ' M' }));
-  const rollback = await rollbackEntries(record.root, entries);
+  const baselineEntries = rollbackRecordSnapshot(record.baseline);
+  const baselineByPath = new Map(baselineEntries.map((entry) => [entry.path, entry]));
+  const rollback = await rollbackEntries(record.root, entries, baselineEntries);
   if (!rollback.ok) return { isError: true, text: `rollback failed: ${rollback.error}` };
   const afterStatus = await gitStatus(record.root);
   if (!afterStatus.ok) return { isError: true, text: `rollback post-check failed: ${afterStatus.error}` };
-  const remaining = afterStatus.entries.filter((entry) => record.changes.some((change) => change.path === entry.path));
+  const remaining = afterStatus.entries.filter((entry) => record.changes.some((change) => change.path === entry.path) && !baselineByPath.has(entry.path));
   if (remaining.length) return { isError: true, text: `rollback post-check found changes still present: ${remaining.map((entry) => entry.path).join(', ')}` };
   const postHashConflicts = [];
   for (const change of record.changes) {
     const currentHash = await hashFile(path.resolve(record.root, change.path));
+    if (baselineByPath.has(change.path)) {
+      // Paths restored from the write baseline legitimately keep the user's
+      // pre-existing content, so compare against the baseline hash, not HEAD.
+      const baselineEntry = baselineByPath.get(change.path);
+      if (baselineEntry.kind === 'absent') {
+        if (currentHash.status !== 'missing') postHashConflicts.push(change.path);
+      } else if (currentHash.status !== 'readable' || currentHash.sha256 !== baselineEntry.sha256) {
+        postHashConflicts.push(change.path);
+      }
+      continue;
+    }
     if (change.kind === 'added') {
       if (currentHash.status !== 'missing') postHashConflicts.push(change.path);
       continue;
@@ -850,11 +869,14 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   if (!WRITE_POLICY.allowedPaths.length) return reject('mode=implement is disabled; allowedPaths must contain at least one repository-relative path.', startedAt);
   const beforeStatus = await gitStatus(WORKSPACE_ROOT);
   if (!beforeStatus.ok) return reject(`mode=implement requires a verifiable Git workspace: ${beforeStatus.error}`, startedAt);
-  if (WRITE_POLICY.requireCleanTree && beforeStatus.entries.length) {
-    return reject(`mode=implement requires a clean Git workspace (${beforeStatus.entries.length} existing change(s)); commit or stash them first.`, startedAt);
+  const cleanTreePolicy = WRITE_POLICY.cleanTreePolicy;
+  if (cleanTreePolicy === 'strict' && beforeStatus.entries.length) {
+    return reject(`mode=implement requires a clean Git workspace (${beforeStatus.entries.length} existing change(s)) under cleanTreePolicy=strict; commit or stash them first, or switch to cleanTreePolicy="snapshot".`, startedAt);
   }
-  if (!WRITE_POLICY.requireCleanTree && beforeStatus.entries.some((entry) => pathMatchesAllowed(entry.path))) {
-    return reject('mode=implement refuses to write an allowed path that is already dirty; restore or commit it first.', startedAt);
+  let baseline = { ok: true, entries: [], error: '' };
+  if (cleanTreePolicy === 'snapshot' && beforeStatus.entries.length) {
+    baseline = snapshotWriteBaseline(WORKSPACE_ROOT, beforeStatus.entries, pathMatchesAllowed);
+    if (!baseline.ok) return reject(`mode=implement refused to snapshot pre-existing changes: ${baseline.error}`, startedAt);
   }
   const result = await runWorker({ cwd, maxSteps, timeoutSeconds, outputCharCap, task, mode: 'implement', stage }, { record: false, cancelRef });
   const afterStatus = await gitStatus(WORKSPACE_ROOT);
@@ -863,10 +885,29 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
     return { isError: true, text: `mode=implement could not verify post-write Git state: ${afterStatus.error}`, meta: { ...result.meta, stage, outcome: 'write_rejected' } };
   }
   const changed = changedEntries(beforeStatus.entries, afterStatus.entries);
+  if (baseline.entries.length) {
+    // Status-code diffs miss edits to paths that were already dirty in the same
+    // way before the call; compare those against the write baseline content.
+    const changedPaths = new Set(changed.map((entry) => entry.path));
+    const baselineByPath = new Map(baseline.entries.map((entry) => [entry.path, entry]));
+    for (const entry of afterStatus.entries) {
+      if (changedPaths.has(entry.path)) continue;
+      const known = baselineByPath.get(entry.path);
+      if (!known) continue;
+      const current = await hashFile(path.join(WORKSPACE_ROOT, entry.path));
+      const differs = known.kind === 'absent'
+        ? current.status !== 'missing'
+        : current.status !== 'readable' || current.sha256 !== known.sha256;
+      if (differs) {
+        changed.push(entry);
+        changedPaths.add(entry.path);
+      }
+    }
+  }
   const disallowed = changed.filter((entry) => !pathMatchesAllowed(entry.path));
   const mustRollback = disallowed.length > 0 || result.isError;
   if (mustRollback && changed.length) {
-    const rollback = await rollbackEntries(WORKSPACE_ROOT, changed);
+    const rollback = await rollbackEntries(WORKSPACE_ROOT, changed, baseline.entries);
     const reason = disallowed.length
       ? `write touched paths outside allowedPaths: ${disallowed.map((entry) => entry.path).join(', ')}`
       : `worker failed: ${result.text}`;
@@ -888,6 +929,10 @@ async function runImplement({ cwd, maxSteps, timeoutSeconds, outputCharCap, task
   }
   const changeSet = await buildChangeSet(WORKSPACE_ROOT, changed);
   const rollbackId = rememberRollback(WORKSPACE_ROOT, changeSet.changes);
+  if (rollbackId && baseline.entries.length) {
+    const record = rollbackRecords.get(rollbackId);
+    if (record) record.baseline = rollbackRecordSnapshot(baseline.entries);
+  }
   changeSet.rollback_id = rollbackId;
   recordRun({ mode: 'implement', stage, cwdRoot: cwdRootLabel(cwd), maxSteps, timeoutSeconds, outcome: 'success', usage: result.meta?.usage, exitCode: 0, elapsedMs: Date.now() - startedAt, outputBytes: result.meta?.outputBytes ?? 0, truncated: result.meta?.truncated === true });
   return { isError: false, text: JSON.stringify(changeSet), meta: { ...result.meta, stage, outcome: 'success', rollbackId } };
@@ -1253,7 +1298,7 @@ async function callTool(name, args) {
     log(`exec command=${request.spec.name} cwd=${request.cwd} timeout=${request.timeoutSeconds}s`);
     return enqueue((cancelRef) => runExec({ ...request, stage: stageResult.stage }, cancelRef), meta, { exclusive: true });
   }
-  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, providerSearch: PROVIDER_SEARCH, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, workflow: workflowStatus(jobStatus(), lastRun), modes: Object.keys(MODES), modeDefaults: modeBudgetStatus(), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, errors: WRITE_POLICY.errors }, execPolicy: { configured: EXEC_POLICY.configured, enabled: EXEC_POLICY.enabled && EXEC_POLICY.errors.length === 0, allowedPaths: EXEC_POLICY.allowedPaths.map((entry) => entry || '.'), commands: EXEC_POLICY.commands.map((entry) => ({ name: entry.name, argsPrefix: entry.argsPrefix, maxArgs: entry.maxArgs })), requireCleanTree: EXEC_POLICY.requireCleanTree, timeoutSeconds: EXEC_POLICY.timeoutSeconds, outputCharCap: EXEC_POLICY.outputCharCap, errors: EXEC_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
+  if (name === 'reasonix_status') return { isError: false, text: JSON.stringify({ cli: CLI_PATH, cliExists: existsSync(CLI_PATH), version: VERSION_CHECK.version, versionCheck: VERSION_CHECK.status, versionMinimum: VERSION_CHECK.minimum, versionCheckError: VERSION_CHECK.error || null, versionCheckWarning: VERSION_CHECK.warning || null, workspaceRoot: WORKSPACE_ROOT, allowedRoots: allowedRoots(), subagent: SUBAGENT_NAME, subagentSource: SUBAGENT.source, subagentRole: SUBAGENT_ROLE.role, subagentRoleSource: SUBAGENT_ROLE.source, modelRef: MODEL_REF, modelRefSource: MODEL_REF_SOURCE, provider: MODEL_CAPABILITIES.provider, model: MODEL_CAPABILITIES.model, contextWindow: MODEL_CAPABILITIES.contextWindow, vision: MODEL_CAPABILITIES.vision, base_url_host: MODEL_CAPABILITIES.base_url_host, providerCapabilities: MODEL_CAPABILITIES, providerSearch: PROVIDER_SEARCH, bridgeConfig: bridgeConfig.path, workerReadOnlyAssumed: SUBAGENT_ROLE.role === 'read', historyMode: TRANSPORT.mode === 'acp' ? 'acp-opt-in-with-per-call-fallback' : 'stateless-per-call', historyHardCapBytes: HISTORY_HARD_CAP_BYTES, transport: { configured: TRANSPORT.mode, source: TRANSPORT.source, error: TRANSPORT.error || null, acp: ACP_TRANSPORT.status }, checkpoint: { enabled: CHECKPOINT_ENABLED, readyCount: CHECKPOINT_ENABLED ? countReadyCheckpoints(CHECKPOINT_DIR) : 0 }, workflow: workflowStatus(jobStatus(), lastRun), modes: Object.keys(MODES), modeDefaults: modeBudgetStatus(), writePolicy: { allowWrite: WRITE_POLICY.allowWrite, enabled: WRITE_POLICY.enabled, allowedPaths: WRITE_POLICY.allowedPaths, cleanTreePolicy: WRITE_POLICY.cleanTreePolicy, cleanTreePolicySource: WRITE_POLICY.cleanTreePolicySource, errors: WRITE_POLICY.errors }, execPolicy: { configured: EXEC_POLICY.configured, enabled: EXEC_POLICY.enabled && EXEC_POLICY.errors.length === 0, allowedPaths: EXEC_POLICY.allowedPaths.map((entry) => entry || '.'), commands: EXEC_POLICY.commands.map((entry) => ({ name: entry.name, argsPrefix: entry.argsPrefix, maxArgs: entry.maxArgs })), requireCleanTree: EXEC_POLICY.requireCleanTree, timeoutSeconds: EXEC_POLICY.timeoutSeconds, outputCharCap: EXEC_POLICY.outputCharCap, errors: EXEC_POLICY.errors }, pendingRollbackCount: rollbackRecords.size, queueDepth, inFlight, parallelActive, exclusiveActive, jobs: jobStatus(), lastRun, limits: { maxStepsCap: LIMITS.maxStepsCap, toolRoundsCap: Math.floor(LIMITS.maxStepsCap / REASONIX_STEPS_PER_TOOL_ROUND), taskCharCap: TASK_CHAR_CAP, timeoutSecondsCap: LIMITS.timeoutSecondsCap, outputCharCap: LIMITS.outputCharCap, queueCap: LIMITS.queueCap } }, null, 2) };
   if (name !== 'reasonix_run') throw new Error(`unknown tool: ${name}`);
   const startedAt = Date.now();
   const mode = args?.mode === undefined ? 'inspect' : String(args.mode);

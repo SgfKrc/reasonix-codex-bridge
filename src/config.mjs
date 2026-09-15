@@ -493,11 +493,38 @@ export function resolveWritePolicy(bridgeConfig) {
   const data = bridgeConfig?.data && typeof bridgeConfig.data === 'object' ? bridgeConfig.data : {};
   const allowWrite = data.allowWrite === true;
   const allowWriteTypeError = Object.hasOwn(data, 'allowWrite') && typeof data.allowWrite !== 'boolean';
-  const requireCleanTree = Object.hasOwn(data, 'requireCleanTree') ? data.requireCleanTree === true : true;
-  const requireCleanTreeTypeError = Object.hasOwn(data, 'requireCleanTree') && typeof data.requireCleanTree !== 'boolean';
   const rawPaths = data.allowedPaths;
   const allowedPaths = [];
   const errors = [];
+  // cleanTreePolicy controls the pre-write tree gate:
+  //   'snapshot' (default, dev-friendly): dirty trees are accepted; the pre-existing
+  //     dirty state of allowed paths is snapshotted so rollback restores it verbatim
+  //     instead of HEAD.
+  //   'strict' (production): the historical gate — the whole tree must be clean.
+  // requireCleanTree stays as a compatibility alias: true -> strict, false -> snapshot.
+  let cleanTreePolicy = 'snapshot';
+  let cleanTreePolicySource = 'default';
+  if (Object.hasOwn(data, 'cleanTreePolicy')) {
+    if (data.cleanTreePolicy === 'snapshot' || data.cleanTreePolicy === 'strict') {
+      cleanTreePolicy = data.cleanTreePolicy;
+      cleanTreePolicySource = 'config';
+    } else {
+      errors.push('cleanTreePolicy must be "snapshot" or "strict"');
+    }
+  }
+  if (Object.hasOwn(data, 'requireCleanTree')) {
+    if (typeof data.requireCleanTree !== 'boolean') {
+      errors.push('requireCleanTree must be boolean true or false');
+    } else {
+      const mapped = data.requireCleanTree ? 'strict' : 'snapshot';
+      if (cleanTreePolicySource === 'config') {
+        if (mapped !== cleanTreePolicy) errors.push('requireCleanTree conflicts with cleanTreePolicy');
+      } else {
+        cleanTreePolicy = mapped;
+        cleanTreePolicySource = 'requireCleanTree';
+      }
+    }
+  }
   if (rawPaths !== undefined && !Array.isArray(rawPaths)) errors.push('allowedPaths must be an array');
   if (Array.isArray(rawPaths)) {
     for (const value of rawPaths) {
@@ -507,12 +534,12 @@ export function resolveWritePolicy(bridgeConfig) {
     }
   }
   if (allowWriteTypeError) errors.push('allowWrite must be boolean true or false');
-  if (requireCleanTreeTypeError) errors.push('requireCleanTree must be boolean true or false');
-  if (data.requireCleanTree === false) errors.push('requireCleanTree=false is unsupported; set requireCleanTree=true');
   return Object.freeze({
     allowWrite,
     allowedPaths: Object.freeze(allowedPaths),
-    requireCleanTree,
+    cleanTreePolicy,
+    cleanTreePolicySource,
+    requireCleanTree: cleanTreePolicy === 'strict',
     errors: Object.freeze(errors),
     enabled: allowWrite && errors.length === 0 && allowedPaths.length > 0,
   });
