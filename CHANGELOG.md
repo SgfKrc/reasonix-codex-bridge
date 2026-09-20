@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- Documented the downstream vendor relationship: [`dsh-codex-bridge`](https://github.com/SgfKrc/dsh-codex-bridge) copies `src/`, `test/`, `scripts/check-readme-links.mjs`, `scripts/acp-acceptance.mjs`, `prompts/`, and `LICENSE` verbatim, and tracks this repository as the single source of truth for those files.
 - `reasonix_exec` controlled command runner: named executable profiles, argv-only invocation with `shell:false`, clean-tree/workspace guards, bounded output, cancellation, mutation detection, redacted structured results, and disabled-by-default policy.
 - Aligned the canonical read/write profile tool sets with Reasonix v1.38.7 by removing unknown `git_log`/`git_diff` identities; `configure verify` now fails on matching doctor warnings.
 - Delegated the optional native `web_fetch` capability to both Reasonix profiles without adding a bridge network stack or arbitrary-URL MCP tool.

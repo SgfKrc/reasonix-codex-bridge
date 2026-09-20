@@ -13,6 +13,18 @@ Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited rele
 - Lower Reasonix versions are intentionally unsupported. The bridge requires `1.38.6` or newer by default; `configure verify` reports a failure and the MCP server refuses to start when the installed CLI is older.
 - The CLI path is resolved at startup and never hard-coded: `REASONIX_EXE` wins when set, otherwise the bridge probes `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`, the newest `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`, `/usr/local/bin|/usr/bin/reasonix-cli`, then `reasonix-cli(.exe)` on `PATH`. If nothing is found (or `REASONIX_EXE` points to a missing file) the server logs the reason and exits with code 2.
 
+## Downstream consumers
+
+[`dsh-codex-bridge`](https://github.com/SgfKrc/dsh-codex-bridge) is the DSH-side bridge: it vendors this
+repository's `src/`, `test/`, `scripts/check-readme-links.mjs`, `scripts/acp-acceptance.mjs`, `prompts/`, and
+`LICENSE` verbatim, records the source commit and per-file sha256 in its `VENDOR.json`, and keeps them in sync
+with `scripts/sync-vendor.mjs`.
+
+**This repository is the single source of truth for those files.** After changing `src/` (especially
+`server.mjs`'s export surface or `config.mjs`'s configuration resolution) or `test/`, remind the downstream
+consumer to re-vendor; conversely, do not edit those files downstream — its `--check` reports them as
+`MODIFIED` and `--update` overwrites them.
+
 ## Pick the subagent model
 
 Every machine may use a different provider, so no model reference is hard-coded. `node src/configure.mjs` reads this machine's redacted inventory from `reasonix doctor --json`:

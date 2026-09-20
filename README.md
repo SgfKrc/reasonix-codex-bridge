@@ -13,6 +13,15 @@
 - 更低版本有意不支持：默认要求 `1.38.6+`；当安装的 CLI 更旧时，`configure verify` 报失败、MCP server 拒绝启动。
 - CLI 路径在启动时解析、从不硬编码：设置了 `REASONIX_EXE` 就用它，否则依次探测 `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`、最新的 `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`、`/usr/local/bin|/usr/bin/reasonix-cli`，最后是 `PATH` 上的 `reasonix-cli(.exe)`。全部落空（或 `REASONIX_EXE` 指向不存在的文件）时记录原因并以退出码 2 结束。
 
+## 下游消费者
+
+[`dsh-codex-bridge`](https://github.com/SgfKrc/dsh-codex-bridge) 是 DSH 侧的桥接器：它把本仓库的
+`src/`、`test/`、`scripts/check-readme-links.mjs`、`scripts/acp-acceptance.mjs`、`prompts/` 与 `LICENSE`
+原样 vendor 进自己的仓库，来源 commit 与逐文件 sha256 记在 `VENDOR.json`，并用 `scripts/sync-vendor.mjs` 同步。
+
+**本仓库是这些文件的唯一真源。** 改动 `src/`（尤其 `server.mjs` 的导出面、`config.mjs` 的配置解析）或 `test/` 之后，
+请提醒下游重新 vendor；反过来不要在下游改这些文件——下游的 `--check` 会把它报成 `MODIFIED`，`--update` 会直接覆盖。
+
 ## 选择子智能体模型
 
 每台机器可能使用不同的 provider，因此不硬编码任何模型引用。`node src/configure.mjs` 从 `reasonix doctor --json` 读取本机脱敏清单：
