@@ -297,26 +297,22 @@ process tree on timeout/cancel, and keeps write operations exclusive. Output bey
 jobs are independently spawned and reclaimed when they finish. This avoids accumulating one
 conversation beyond Reasonix's hard 128 MB history limit.
 
-`src/acp-client.mjs` now provides the ACP-01 newline JSON-RPC client: it performs capability-gated
-initialize/session creation, load/resume, prompt update aggregation, cancellation and clean process
-shutdown. It is transport-only and does not persist session ids or decide write policy. The server
-still defaults to stateless per-call execution and does not import the client until the later
-coexistence/switching ticket is accepted.
+### Optional persistent ACP sessions (ACP-01 … ACP-06)
 
-`src/acp-session.mjs` provides the ACP-02 opt-in session budget coordinator. It uses a bounded
-deterministic summarizer, connects the prototype's append/compact/rotate/per-call decisions to
-replacement sessions, records redacted decision telemetry, and leaves the old session untouched
-when replacement fails. Persistent ACP remains opt-in and the server remains stateless; see
-`ACP-TRANSPORT-DESIGN.md` for the lifecycle and failure contract. The fixed 128 MiB Reasonix
-history cap and 75% trigger are not configurable.
+The bridge is stateless per call by default; persistent ACP is layered and opt-in, and the default
+transport remains `per-call`. Current state per layer:
 
-`src/acp-registry.mjs` provides the ACP-03 opt-in session registry. It persists only session metadata,
-serializes prompts per session, marks crashed transports orphaned, supports capability-gated resume/
-load and delete, and closes live clients during explicit shutdown. It is not imported by the server
-until the lifecycle, security, and transport-switching tickets are accepted.
+| Module | Responsibility | Wiring status |
+|---|---|---|
+| `src/acp-client.mjs` | Newline JSON-RPC client: capability-gated initialize/session creation, load/resume, prompt update aggregation, cancellation, clean shutdown; transport-only — no persisted session ids, no write-policy decisions | not loaded by the server |
+| `src/acp-session.mjs` | Session budget coordinator: bounded deterministic summarizer wiring append/compact/rotate/per-call decisions to replacement sessions, with redacted telemetry; leaves the old session untouched when replacement fails | opt-in |
+| `src/acp-registry.mjs` | Session registry: metadata-only persistence, per-session prompt serialization, orphan detection for crashed transports, capability-gated resume/load/delete, closes live clients on explicit shutdown | not wired into production |
+| `src/acp-security.mjs` | Security gate: binds persistent calls to an opaque caller/task scope, keeps the session cwd inside the configured workspace roots, reuses the fail-closed write whitelist for implement preflight, redacts credential-like content before it enters continuation history | enabled only for explicit `transport: "acp"` |
+| `src/acp-transport.mjs` | Switching layer: `transport: "acp"` plus an opaque `session_id` reuses a read-only ACP session; missing ids, all implement calls, and explicit parallel jobs stay on the per-call path; startup/protocol/timeout failures fall back to it, status reports bounded counters only | default `per-call` |
+| `scripts/acp-acceptance.mjs` | Model-free offline acceptance: starts and strong-kills registry child processes under `build/bridge-test/`, verifying orphan/resume, metadata-only persistence, compact/rotate, serialized concurrency, cancellation, child cleanup, and artifact removal | offline regression `92 passed / 0 failed` |
 
-`src/acp-security.mjs` provides the ACP-04 opt-in security gate. It binds persistent calls to an
-opaque caller/task scope, keeps the session cwd inside the configured workspace roots, reuses the
-fail-closed write whitelist for implement preflight, and redacts credential-like content before it
-is retained in continuation history. The server remains stateless and does not import this module
-until ACP-05 transport coexistence is accepted.
+`npm run acceptance:acp:real` only probes the real Reasonix control plane and sends no model prompt; when
+the provider does not persist an empty session it reports a structured `status: "blocked"` with exit code 2,
+which must not be read as a cross-process recovery pass. Lifecycle and failure contract:
+`ACP-TRANSPORT-DESIGN.md`. The 128 MiB history cap and the 75% trigger are not configurable.
+
