@@ -6,4 +6,10 @@ bridge.config.json
 # Per-machine preset tables (copy presets.example.json to create one)
 presets.json
 
+# Local env reference file. The bridge itself is zero-dependency and only reads
+# process.env, so this file never has to be committed — and it holds machine
+# paths and a machine-bound model ref.
+.env
+.env.*
+
 node_modules/
