@@ -166,7 +166,7 @@ export function isFile(candidate) {
   try { return statSync(candidate).isFile(); } catch { return false; }
 }
 
-/** Explicit REASONIX_EXE wins; otherwise probe standard install locations and PATH. */
+/** Explicit REASONIX_EXE wins; otherwise probe REASONIX_HOME, the platform install root (including its versions dir), and PATH. */
 export function resolveCliPath() {
   const configured = (process.env.REASONIX_EXE ?? '').trim();
   if (configured) {
@@ -176,28 +176,45 @@ export function resolveCliPath() {
   }
   const candidates = cliCandidates();
   for (const candidate of candidates) if (isFile(candidate)) return candidate;
-  throw new ConfigError(`reasonix CLI not found and REASONIX_EXE is unset (probed ${candidates.length} standard location(s))`);
+  throw new ConfigError(`reasonix CLI not found and REASONIX_EXE is unset (probed ${candidates.length} standard location(s); set REASONIX_EXE or REASONIX_HOME)`);
+}
+
+/**
+ * 安装根下的入口候选：`<root>/<name>` 与 `<root>/versions/<version>/<name>`（新版本在前）。
+ * `REASONIX_HOME` 与平台默认根共用同一套布局，所以换安装位置、升级换版本目录都不用改代码。
+ */
+function installRootCandidates(root, names) {
+  const candidates = names.map((name) => path.join(root, name));
+  const versionsRoot = path.join(root, 'versions');
+  let entries = [];
+  try { entries = readdirSync(versionsRoot, { withFileTypes: true }); } catch { entries = []; }
+  const versions = entries
+    // 预发布目录（如 v1.39.0-rc.1）也是版本目录：这里只排除与版本无关的名字。
+    .filter((entry) => entry.isDirectory() && /^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort(compareVersions)
+    .reverse();
+  for (const version of versions) {
+    for (const name of names) candidates.push(path.join(versionsRoot, version, name));
+  }
+  return candidates;
 }
 
 function cliCandidates() {
+  const home = (process.env.REASONIX_HOME ?? '').trim();
   if (process.platform !== 'win32') {
-    return ['/usr/local/bin/reasonix-cli', '/usr/bin/reasonix-cli', '/opt/reasonix/reasonix-cli', ...pathCandidates(['reasonix-cli'])];
+    return [
+      ...(home ? installRootCandidates(home, ['reasonix-cli', 'reasonix']) : []),
+      '/usr/local/bin/reasonix-cli', '/usr/bin/reasonix-cli', '/opt/reasonix/reasonix-cli',
+      ...pathCandidates(['reasonix-cli', 'reasonix']),
+    ];
   }
-  const programs = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Reasonix') : '';
-  const candidates = [];
-  if (programs) {
-    candidates.push(path.join(programs, 'reasonix-cli.exe'));
-    const versionsRoot = path.join(programs, 'versions');
-    let entries = [];
-    try { entries = readdirSync(versionsRoot, { withFileTypes: true }); } catch { entries = []; }
-    const versions = entries
-      .filter((entry) => entry.isDirectory() && /^v?\d+(?:\.\d+)*$/.test(entry.name))
-      .map((entry) => entry.name)
-      .sort(compareVersions)
-      .reverse();
-    for (const version of versions) candidates.push(path.join(versionsRoot, version, 'reasonix-cli.exe'));
-  }
-  return [...candidates, ...pathCandidates(['reasonix-cli.exe'])];
+  // Windows 上安装器允许自选根目录，入口也可能被命名为 reasonix.exe /
+  // reasonix-launcher.exe，因此两种命名都探测；顺序未变：REASONIX_HOME → 平台默认根 → PATH。
+  const names = ['reasonix-cli.exe', 'reasonix.exe', 'reasonix-launcher.exe'];
+  const localAppData = (process.env.LOCALAPPDATA ?? '').trim();
+  const roots = [home, localAppData ? path.join(localAppData, 'Programs', 'Reasonix') : ''].filter(Boolean);
+  return [...roots.flatMap((root) => installRootCandidates(root, names)), ...pathCandidates(names)];
 }
 
 function pathCandidates(names) {

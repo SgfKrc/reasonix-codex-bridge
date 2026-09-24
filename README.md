@@ -11,7 +11,7 @@
 - Node.js 20 或更高。
 - Reasonix 1.38.6 或更高（使用重写后的 `reasonix subagent run` 接口）。
 - 更低版本有意不支持：默认要求 `1.38.6+`；当安装的 CLI 更旧时，`configure verify` 报失败、MCP server 拒绝启动。
-- CLI 路径在启动时解析、从不硬编码：设置了 `REASONIX_EXE` 就用它，否则依次探测 `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`、最新的 `%LOCALAPPDATA%\Programs\Reasonix\versions\v*\reasonix-cli.exe`、`/usr/local/bin|/usr/bin/reasonix-cli`，最后是 `PATH` 上的 `reasonix-cli(.exe)`。全部落空（或 `REASONIX_EXE` 指向不存在的文件）时记录原因并以退出码 2 结束。
+- CLI 路径在启动时解析、从不硬编码：设置了 `REASONIX_EXE` 就用它，否则依次探测 `REASONIX_HOME`、平台安装根 `%LOCALAPPDATA%\Programs\Reasonix`（两者布局相同：先看根下的 `reasonix-cli.exe`，再看其 `versions/v*` 目录、**新版本在前**，预发布目录如 `v1.39.0-rc.1` 同样参与），然后是 `/usr/local/bin|/usr/bin/reasonix-cli`，最后是 `PATH` 上的 `reasonix-cli(.exe)`（Windows 上同时接受 `reasonix.exe` / `reasonix-launcher.exe`）。全部落空（或 `REASONIX_EXE` 指向不存在的文件）时记录原因并以退出码 2 结束。
 
 ## 下游消费者
 

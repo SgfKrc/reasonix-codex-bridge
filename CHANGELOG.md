@@ -36,6 +36,20 @@ All notable changes to this project are documented here.
 - Test fixtures now prefer project-local `build/bridge-test/` (covered by `.gitignore`) and fall back to the system temp directory only when the project path cannot be created.
 - Added `AcpClient.abort()` for strong-kill lifecycle drills and single-flight ACP session creation plus per-session prompt serialization in the coexistence manager; failed registry creation now closes a started client before propagating the error.
 
+## [0.2.0] - 2026-09-24
+
+### Added
+
+- Anti-upgrade CLI resolution: `REASONIX_HOME` is now probed with the same layout as the platform
+  install root (`<root>/<exe>` and `<root>/versions/<version>/<exe>`, newest version first), so an
+  install whose root is not the default location is found without pinning a version.
+- Pre-release version directories such as `v1.39.0-rc.1` are no longer filtered out of the `versions/`
+  scan (only names unrelated to a version are skipped).
+- The Windows `PATH` probe now also accepts `reasonix.exe` and `reasonix-launcher.exe`, not just
+  `reasonix-cli.exe`; the POSIX probe likewise accepts both `reasonix-cli` and `reasonix`.
+- Candidate order is unchanged (`REASONIX_EXE` → `REASONIX_HOME` → platform install root → `PATH`)
+  and the not-found error now points at both `REASONIX_EXE` and `REASONIX_HOME`.
+
 ## [0.1.0] - 2026-09-12
 
 ### Added

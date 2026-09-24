@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { after, describe, test } from 'node:test';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
@@ -2916,4 +2916,58 @@ test('server keeps running with an unparseable CLI version and reports unknown',
   assert.equal(exit, 0);
   const status = JSON.parse(responses[0].result.content[0].text);
   assert.equal(status.versionCheck, 'unknown');
+});
+
+// ── CLI 入口解析的抗升级行为（REASONIX_HOME / 预发布目录 / PATH 备用名）──────
+//
+// 这些用例一律在**子进程**里调用 `resolveCliPath()`：它读 `process.env`，而同一文件里
+// 还有会 spawn 子进程的用例（如 reasonix_exec 的边界用例），在本进程改 env 会污染它们
+// （实测表现：exec 的超时用例拿到 nonzero 而不是 timeout）。
+
+const CONFIG_PATH = fileURLToPath(new URL('../src/config.mjs', import.meta.url));
+const EXE_NAME = process.platform === 'win32' ? 'reasonix-cli.exe' : 'reasonix-cli';
+
+/** 造一个安装根：`<root>/versions/<v>/<exe>`（空文件即可，探测只要求存在且是文件）。 */
+function makeReasonixHome(versions) {
+  const home = mkdtempSync(path.join(tmpdir(), 'reasonix-home-'));
+  for (const version of versions) {
+    const dir = path.join(home, 'versions', version);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, EXE_NAME), '', 'utf8');
+  }
+  return home;
+}
+
+/** 在隔离子进程里跑 resolveCliPath()，返回解析到的路径（env 只影响该子进程）。 */
+function resolveCliPathInChild(overrides) {
+  const code = 'const m = await import(process.argv[1]); process.stdout.write(m.resolveCliPath());';
+  const env = { ...process.env, REASONIX_HOME: '', REASONIX_EXE: '', LOCALAPPDATA: '', ...overrides };
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', code, pathToFileURL(CONFIG_PATH).href], {
+    env, encoding: 'utf8', windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+test('resolveCliPath honours REASONIX_HOME and picks the newest version directory', () => {
+  const home = makeReasonixHome(['v1.38.10', 'v1.38.12']);
+  try {
+    assert.equal(resolveCliPathInChild({ REASONIX_HOME: home }), path.join(home, 'versions', 'v1.38.12', EXE_NAME));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('resolveCliPath still considers pre-release version directories', () => {
+  const home = makeReasonixHome(['v1.38.12', 'v1.39.0-rc.1']);
+  try {
+    assert.equal(resolveCliPathInChild({ REASONIX_HOME: home }), path.join(home, 'versions', 'v1.39.0-rc.1', EXE_NAME));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('resolveCliPath falls back to the alternative executable name on PATH', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'reasonix-path-'));
+  const name = process.platform === 'win32' ? 'reasonix.exe' : 'reasonix';
+  try {
+    writeFileSync(path.join(dir, name), '', 'utf8');
+    assert.equal(resolveCliPathInChild({ PATH: dir }), path.join(dir, name));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
