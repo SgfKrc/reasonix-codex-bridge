@@ -15,15 +15,22 @@ Current release: `v0.1.0`. See [CHANGELOG.md](CHANGELOG.md) for the audited rele
 
 ## Downstream consumers
 
-[`dsh-codex-bridge`](https://github.com/SgfKrc/dsh-codex-bridge) is the DSH-side bridge: it vendors this
-repository's `src/`, `test/`, `scripts/check-readme-links.mjs`, `scripts/acp-acceptance.mjs`, `prompts/`, and
-`LICENSE` verbatim, records the source commit and per-file sha256 in its `VENDOR.json`, and keeps them in sync
-with `scripts/sync-vendor.mjs`.
+**There is currently no vendor consumer.** This repository's `src/`, `test/`,
+`scripts/check-readme-links.mjs`, `scripts/acp-acceptance.mjs`, `prompts/`, and `LICENSE` used to be vendored
+verbatim by [`dsh-codex-bridge`](https://github.com/SgfKrc/dsh-codex-bridge) (source commit and per-file
+sha256 recorded in that repository's `VENDOR.json`, kept in sync with `scripts/sync-vendor.mjs`).
 
-**This repository is the single source of truth for those files.** After changing `src/` (especially
-`server.mjs`'s export surface or `config.mjs`'s configuration resolution) or `test/`, remind the downstream
-consumer to re-vendor; conversely, do not edit those files downstream — its `--check` reports them as
-`MODIFIED` and `--update` overwrites them.
+⚠️ **That relationship has ended.** As of dsh-side **v0.2.0** (commit `16ef1ae feat!: 仓库改换用途 —— 由
+Reasonix vendor 副本改为 DSH 子 agent 桥接器`), that repository became a **DSH sub-agent bridge** in its own
+right: it no longer vendors any Reasonix code, and both `VENDOR.json` and the former vendor contents were
+removed. Consequently:
+
+- this repository **remains the historical source of truth** for `src/` and `test/`, but **no downstream
+  needs to sync from it**;
+- after changing `src/` (especially `server.mjs`'s export surface or `config.mjs`'s configuration
+  resolution) or `test/`, there is **no downstream to remind** about re-vendoring;
+- if a vendor relationship is ever re-established, update this section **and** `VENDOR.json` in both
+  repositories at the same time.
 
 ## Pick the subagent model
 

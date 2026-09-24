@@ -15,12 +15,19 @@
 
 ## 下游消费者
 
-[`dsh-codex-bridge`](https://github.com/SgfKrc/dsh-codex-bridge) 是 DSH 侧的桥接器：它把本仓库的
-`src/`、`test/`、`scripts/check-readme-links.mjs`、`scripts/acp-acceptance.mjs`、`prompts/` 与 `LICENSE`
-原样 vendor 进自己的仓库，来源 commit 与逐文件 sha256 记在 `VENDOR.json`，并用 `scripts/sync-vendor.mjs` 同步。
+**目前没有 vendor 消费者。** 本仓库的 `src/`、`test/`、`scripts/check-readme-links.mjs`、
+`scripts/acp-acceptance.mjs`、`prompts/` 与 `LICENSE` 曾由
+[`dsh-codex-bridge`](https://github.com/SgfKrc/dsh-codex-bridge) 原样 vendor（来源 commit 与逐文件
+sha256 记在那个仓库的 `VENDOR.json`，用 `scripts/sync-vendor.mjs` 同步）。
 
-**本仓库是这些文件的唯一真源。** 改动 `src/`（尤其 `server.mjs` 的导出面、`config.mjs` 的配置解析）或 `test/` 之后，
-请提醒下游重新 vendor；反过来不要在下游改这些文件——下游的 `--check` 会把它报成 `MODIFIED`，`--update` 会直接覆盖。
+⚠️ **该关系已终止**：自 dsh 侧 **v0.2.0**（commit `16ef1ae feat!: 仓库改换用途 —— 由 Reasonix vendor
+副本改为 DSH 子 agent 桥接器`）起，那个仓库改为 **DSH 子 agent 桥接器**本身，不再 vendor 任何 Reasonix
+代码，`VENDOR.json` 与旧 vendor 内容均已移除。因此：
+
+- 本仓库**仍是 `src/` 与 `test/` 的历史真源**，但**不再有下游需要同步**；
+- 改动 `src/`（尤其 `server.mjs` 的导出面、`config.mjs` 的配置解析）或 `test/` 时，**不需要**再提醒
+  任何下游重新 vendor；
+- 若将来重新建立 vendor 关系，请在两个仓库里**同时**更新本节与 `VENDOR.json`。
 
 ## 选择子智能体模型
 
